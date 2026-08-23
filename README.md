@@ -161,6 +161,13 @@ with no `task_id` returns every task that conductor dispatched in one call.
   A task older than 20 minutes is relabelled overdue, but that is a reporting
   signal only: nothing is terminated, the agent process keeps running, and a
   late result is still accepted.
+- A task whose target pane's process has exited is marked `abandoned`, which is
+  terminal and distinct from `cancelled`, which a human chose. Liveness is
+  checked when the roster is read, when work is dispatched, and when results are
+  collected, so a conductor is never offered a dead pane and never waits on one.
+  A pane that fails its liveness probe for any other reason is reported alive:
+  being slow to notice a death costs a wait, being wrong about one costs the
+  result.
 - A worktree branch is deleted only when it has no commits of its own, so
   committed agent work is never silently discarded. Cleanup also refuses to
   remove a dirty worktree, preserving uncommitted changes on disk.
@@ -185,8 +192,12 @@ with no `task_id` returns every task that conductor dispatched in one call.
   task sits pending indefinitely. Nothing times it out.
 - **A finished agent can leave its task open.** Completion is an explicit
   `complete_task` call, so a session that does the work and never makes that
-  call is indistinguishable, to the conductor, from one still thinking. There
-  is no terminal state for a pane that has died or gone quiet.
+  call is indistinguishable, to the conductor, from one still thinking. A pane
+  whose *process* has exited is now handled: its open tasks reach a terminal
+  `abandoned` status and `list_sessions` marks it `DEAD`, so nothing waits on
+  work nobody is doing. A pane that is alive but has quietly stopped answering
+  is still indistinguishable from one that is thinking hard, and deliberately
+  so: silence is not evidence, and guessing would discard real work.
 - **Dirty worktree recovery is manual.** Closing a session refuses to remove
   its dirty worktree, preserving uncommitted edits on disk, but the UI does
   not yet show the preserved path or offer a recovery workflow.

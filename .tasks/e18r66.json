@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "id": "e18r66",
-  "rev": 2,
+  "rev": 4,
   "title": "Detect dead panes and mark their tasks abandoned",
-  "status": "backlog",
+  "status": "done",
   "priority": "P1",
   "rank": 1000,
-  "done_when": "A task whose target session's process is gone reaches a terminal 'abandoned' status, distinct from cancelled (deliberate) and overdue (still working); list_sessions reports pane liveness so a conductor can avoid dispatching into a dead pane; tests cover the transition. Observed again 2026-08-19: three of five panes finished their work and never called complete_task, leaving the conductor unable to tell finished-but-silent from still-working.",
+  "done_when": "Shipped. Tasks whose target pane process has exited reach a terminal 'abandoned' status, distinct from cancelled and overdue (src-tauri/src/mcp.rs, abandon_lost and Shared::reconcile_abandoned). SessionManager::liveness probes each child with try_wait and reports a failed probe as alive, so a bad probe never discards work (src-tauri/src/lib.rs). Reconciliation runs on roster read, dispatch and task collection; list_sessions marks a dead pane DEAD and dispatch refuses it. 13 tests cover the transition, including that live-but-slow panes and already-terminal work are untouched. Verified 2026-08-22: 114 tests pass, fmt and clippy clean.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:55Z",
-  "updated": "2026-08-19T19:48:08Z",
-  "status_changed": "2026-08-13T09:18:55Z"
+  "updated": "2026-08-23T03:31:55Z",
+  "status_changed": "2026-08-23T03:31:55Z"
 }

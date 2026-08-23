@@ -154,11 +154,16 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "overdue" | "in_review" | "rework" | "done" | "cancelled" | "error".
+    /// "pending" | "overdue" | "in_review" | "rework" | "done" | "cancelled"
+    /// | "error" | "abandoned".
     /// "overdue" is non-terminal: still running, result still accepted.
     /// "in_review" and "rework" are also non-terminal: the work exists but has
     /// not been signed off, which is the whole point of them being distinct
     /// from "done".
+    /// "abandoned" is terminal and means the pane holding this work is gone. It
+    /// is deliberately distinct from "cancelled", which a human chose, and from
+    /// "overdue", which is still working. Collapsing the three loses the only
+    /// question a conductor actually has: is anyone still doing this.
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
@@ -197,9 +202,21 @@ pub struct Task {
 /// Terminal states â€” the ones that stamp `done_ms` and never accept a result
 /// afterwards. `in_review` and `rework` are deliberately absent: the work
 /// exists but has not been signed off, which is the whole point of them.
+///
+/// `abandoned` is terminal because the pane that held the work no longer
+/// exists. Its per-session MCP endpoint was shut down with it (see
+/// `release_session`), so there is no longer any caller that could report a
+/// result for the task. This is the one terminal state nobody chose.
 fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "cancelled" | "error")
+    matches!(status, "done" | "cancelled" | "error" | "abandoned")
 }
+
+/// The status a task reaches when the pane doing it is gone.
+///
+/// A named constant rather than a bare string because this value is compared in
+/// five places and written in three, and a typo in any of them produces a task
+/// that is silently neither open nor terminal.
+pub const STATUS_ABANDONED: &str = "abandoned";
 
 const STORE_FILE: &str = "brain.jsonl";
 
@@ -491,6 +508,11 @@ impl Shared {
         let identified = self.sessions_snapshot();
         let conductor = self.conductor();
         let now = Self::now_ms();
+        // Settle dead panes before reading the task list, not after. A roster
+        // that still counted an abandoned task as open would tell the conductor
+        // a pane is busy on work nobody is doing, which is the exact wrong
+        // answer at the exact moment it is choosing a target.
+        let live = self.reconcile_abandoned();
         // Presence is not readiness. A pane that took a task and went quiet is
         // listed exactly like an idle one, so a conductor picks it again and
         // waits on a result that is not coming. The open task and its age are
@@ -503,6 +525,10 @@ impl Shared {
                 .map(|t| (t.target.clone(), now.saturating_sub(t.ts_ms)))
                 .collect()
         };
+        // Held sessions, not live ones: a pane whose process has died is still
+        // worth a line, marked dead, because a conductor that simply stops
+        // seeing it cannot tell a pane that died from one that was never there,
+        // and will not understand why its task was abandoned.
         let mut ids = self.engine.ids();
         ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         ids.iter()
@@ -525,6 +551,15 @@ impl Shared {
                     .filter(|(target, _)| target == id)
                     .map(|(_, age_ms)| *age_ms)
                     .max();
+                // A dead pane says so instead of reporting how busy it is. Its
+                // tasks have just been abandoned, so any busy label would be
+                // describing work that no longer exists.
+                if !live.iter().any(|l| l == id) {
+                    return format!(
+                        "- {id} ({kind}) brain={room}{role} [DEAD, process exited, \
+                         do not dispatch]"
+                    );
+                }
                 format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
             })
             .collect()
@@ -624,6 +659,48 @@ impl Shared {
         self.app.emit("conductor-changed");
     }
 
+    /// Ids of panes whose agent process is still running.
+    ///
+    /// Everything that has to decide "is anyone there" goes through this rather
+    /// than `engine.ids()`, so the dead-pane answer is the same whether it is
+    /// reached from the roster, a dispatch, or a task collection.
+    fn live_ids(&self) -> Vec<String> {
+        self.engine
+            .liveness()
+            .into_iter()
+            .filter(|(_, alive)| *alive)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Settle any task whose pane has died, then report which panes are live.
+    ///
+    /// Called from the three places that ask about task state or pick a target:
+    /// the roster, task collection, and dispatch. Reconciling at the read rather
+    /// than on a timer means there is no background sweep to keep alive and no
+    /// window in which a caller sees a task the roster has already written off.
+    /// The cost is one non-blocking `try_wait` per pane per call, which is
+    /// cheaper than the poll it replaces.
+    fn reconcile_abandoned(&self) -> Vec<String> {
+        let live = self.live_ids();
+        let changed = {
+            let mut tasks = self.tasks.lock().unwrap();
+            abandon_lost(&mut tasks, &live, Self::now_ms())
+        };
+        if !changed.is_empty() {
+            let dir = self.dir.lock().unwrap().clone();
+            for task in &changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+                eprintln!(
+                    "[mosaic] task {} abandoned: target '{}' is gone",
+                    task.id, task.target
+                );
+            }
+            self.app.emit("conductor-changed");
+        }
+        live
+    }
+
     fn review_task(
         &self,
         caller: &str,
@@ -700,6 +777,9 @@ impl Shared {
 
     /// Look a task up, flipping it to "overdue" if it has aged out.
     fn task_status(&self, caller: &str, id: &str) -> Result<Task, TaskAccessError> {
+        // Same reason as `tasks_from`: asking after one task must be able to
+        // answer "its pane is gone", not just "still pending".
+        self.reconcile_abandoned();
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let t = task_for_dispatcher(&mut tasks, caller, id)?;
@@ -717,6 +797,11 @@ impl Shared {
     /// collect: without it a conductor holding six task ids has to make six
     /// round trips to find out that five are still running.
     fn tasks_from(&self, from: &str) -> Vec<Task> {
+        // Settle dead panes first, so a collection reports "abandoned" on the
+        // call where the pane is found gone rather than one call later. This is
+        // the call a conductor makes while waiting, so it is the one that has to
+        // stop it waiting. Done before the lock, because it takes the lock.
+        self.reconcile_abandoned();
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let mut changed = Vec::new();
@@ -758,7 +843,12 @@ impl Shared {
         task: &str,
         reviewer: &str,
     ) -> Result<DispatchOutcome, String> {
-        let live = self.engine.ids();
+        // Liveness, not membership, and it settles dead panes' tasks on the way
+        // past. Dispatching into a pane whose process has exited was the way
+        // this failure compounded: the work was never done, the task never
+        // closed, and the conductor re-dispatched the same brief to the same
+        // corpse. A reviewer is chosen from the same list for the same reason.
+        let live = self.reconcile_abandoned();
         let target_is_live = live.iter().any(|i| i == target);
 
         // Before the budget and before the task is recorded, like every other
@@ -848,6 +938,49 @@ fn age(t: &mut Task, now: u64) {
     if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_OVERDUE_MS {
         t.status = "overdue".to_string();
     }
+}
+
+/// Flip every open task whose target pane is gone to `abandoned`, returning the
+/// ones that changed so the caller can persist and announce them.
+///
+/// Pure over a task list and a roster, with no lock, no clock and no I/O, so
+/// the transition can be tested directly. `live` is the set of panes whose
+/// child process is still running, from `SessionManager::liveness`.
+///
+/// The rule is deliberately narrow. Only `is_open` tasks are touched, so a
+/// finished or cancelled task is never rewritten by a pane closing later. And
+/// only a target that is genuinely absent counts: a pane that is merely slow is
+/// still in `live`, and slowness is what `overdue` is for.
+///
+/// This is the fix for the failure that made "overdue" permanent. Before it, a
+/// task whose agent had died sat open forever, and the conductor could not tell
+/// that from an agent still thinking. The absence of a result meant both, so it
+/// meant nothing.
+fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
+    let mut changed = Vec::new();
+    for t in tasks.iter_mut() {
+        if !is_open(&t.status) || live.iter().any(|id| id == &t.target) {
+            continue;
+        }
+        t.status = STATUS_ABANDONED.to_string();
+        // Terminal, so it takes a finish time like any other terminal state.
+        // Without one the UI cannot tell an abandonment that just happened from
+        // one already in the store at startup, and announces the whole history.
+        t.done_ms = Some(now_ms);
+        // The result field is where a conductor looks for what happened, and it
+        // is empty precisely because nobody reported. Say so there rather than
+        // leaving a blank that reads like a result of no content.
+        if t.result.is_empty() {
+            t.result = format!(
+                "Abandoned: session '{}' is no longer running, so this task can \
+                 never report a result. Re-dispatch it to a live pane if the work \
+                 is still wanted.",
+                t.target
+            );
+        }
+        changed.push(t.clone());
+    }
+    changed
 }
 
 /// States a dispatched agent may still report a result from.
@@ -1278,8 +1411,8 @@ pub struct TaskQuery {
     /// are waiting on, which is the efficient way to gather parallel work.
     #[serde(default)]
     pub task_id: String,
-    /// Only tasks with this status: pending, overdue, done, error or
-    /// cancelled. Use "pending" or "overdue" to ask what is still running.
+    /// Only tasks with this status: pending, overdue, done, error, cancelled
+    /// or abandoned. Use "pending" or "overdue" to ask what is still running.
     #[serde(default)]
     pub status: String,
     /// Include the whole dispatch history rather than open tasks plus the
@@ -1401,7 +1534,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it."
+        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -1525,7 +1658,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1797,12 +1930,13 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, bearer_matches, busy_label, choose_reviewer, conductor_briefing,
-        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
-        load_brain, mark_pending_error, mint_session_token, oversize_refusal, render_task,
-        render_task_summary, review_pending, select_tasks, task_for_dispatcher,
-        validate_path_component, AgentSession, Entry, Notifier, Shared, StoreRecord, Task,
-        TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        abandon_lost, age, append_record, bearer_matches, busy_label, choose_reviewer,
+        conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
+        injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
+        mint_session_token, oversize_refusal, render_task, render_task_summary, review_pending,
+        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry, Notifier,
+        Shared, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED,
+        STATUS_ABANDONED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -2936,5 +3070,211 @@ mod tests {
         assert!(loaded.sessions.is_empty());
         assert!(loaded.tasks.is_empty());
         assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
+    }
+
+    // ---- dead panes and abandoned tasks ----
+
+    #[test]
+    fn an_abandoned_task_is_terminal_and_no_longer_open() {
+        // The whole point of the state. If it were open, a conductor would keep
+        // waiting; if it were not terminal, it would never stamp a finish time.
+        assert!(is_terminal(STATUS_ABANDONED));
+        assert!(!is_open(STATUS_ABANDONED));
+    }
+
+    #[test]
+    fn abandoned_is_distinct_from_cancelled_and_overdue() {
+        // Three different facts: nobody is doing this, a human stopped it, and
+        // it is taking a while. Collapsing any pair loses the question the
+        // conductor is actually asking.
+        assert!(is_terminal("cancelled"));
+        assert!(!is_open("cancelled"));
+        assert!(!is_terminal("overdue"));
+        assert!(is_open("overdue"));
+        assert_ne!(STATUS_ABANDONED, "cancelled");
+    }
+
+    #[test]
+    fn abandon_lost_settles_an_open_task_whose_pane_is_gone() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        let changed = abandon_lost(&mut tasks, &[], 5_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        // Terminal states carry a finish time, so the UI can tell an
+        // abandonment that just happened from one already in the store.
+        assert_eq!(tasks[0].done_ms, Some(5_000));
+    }
+
+    #[test]
+    fn abandon_lost_leaves_a_slow_but_live_pane_alone() {
+        // The failure this must not cause: an agent that is merely thinking is
+        // not an agent that is gone. Slowness is what "overdue" is for, and
+        // abandoning here would discard work still being done.
+        let mut tasks = vec![task_at("t1", "overdue", 0)];
+        let live = vec!["sess-2".to_string()];
+
+        let changed = abandon_lost(&mut tasks, &live, TASK_OVERDUE_MS * 10);
+
+        assert!(changed.is_empty());
+        assert_eq!(tasks[0].status, "overdue");
+        assert_eq!(tasks[0].done_ms, None);
+    }
+
+    #[test]
+    fn abandon_lost_covers_every_open_status_not_just_pending() {
+        // A pane can die while its work sits in review or rework just as easily
+        // as while it is running. Those are open too, so they are equally stuck.
+        let mut tasks = vec![
+            task_at("t1", "pending", 0),
+            task_at("t2", "overdue", 0),
+            task_at("t3", "in_review", 0),
+            task_at("t4", "rework", 0),
+        ];
+
+        let changed = abandon_lost(&mut tasks, &[], 1_000);
+
+        assert_eq!(changed.len(), 4);
+        assert!(tasks.iter().all(|t| t.status == STATUS_ABANDONED));
+    }
+
+    #[test]
+    fn abandon_lost_never_rewrites_work_that_already_finished() {
+        // A pane closing after its work landed must not erase the result. This
+        // is the regression that would quietly destroy history.
+        let mut tasks = vec![
+            task_at("t1", "done", 0),
+            task_at("t2", "cancelled", 0),
+            task_at("t3", "error", 0),
+        ];
+        tasks[0].result = "the parser is fine".into();
+
+        let changed = abandon_lost(&mut tasks, &[], 1_000);
+
+        assert!(changed.is_empty());
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].result, "the parser is fine");
+        assert_eq!(tasks[1].status, "cancelled");
+        assert_eq!(tasks[2].status, "error");
+    }
+
+    #[test]
+    fn abandon_lost_touches_only_the_dead_panes_tasks() {
+        let mut tasks = vec![task_at("t1", "pending", 0), task_at("t2", "pending", 0)];
+        tasks[1].target = "sess-3".into();
+        let live = vec!["sess-3".to_string()];
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "t1");
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        assert_eq!(tasks[1].status, "pending");
+    }
+
+    #[test]
+    fn an_abandoned_task_says_why_rather_than_leaving_an_empty_result() {
+        // An empty result reads like a result of no content. The conductor needs
+        // to know nobody is coming, and that re-dispatching is its move.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        assert!(tasks[0].result.contains("sess-2"));
+        assert!(tasks[0].result.contains("no longer running"));
+        assert!(tasks[0].result.contains("Re-dispatch"));
+    }
+
+    #[test]
+    fn abandoning_keeps_a_result_the_agent_already_reported() {
+        // Work submitted for review, then the pane died. The submission is the
+        // valuable part and overwriting it with the abandonment notice would
+        // throw away the only thing the task produced.
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].result = "found three bugs in the lexer".into();
+
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        assert_eq!(tasks[0].result, "found three bugs in the lexer");
+    }
+
+    #[test]
+    fn an_abandoned_task_refuses_a_late_result() {
+        // The pane is gone and its MCP endpoint went with it, so nothing should
+        // be able to report here. If something does, it is not the target.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        let outcome = finish_pending(&mut tasks, "sess-2", "t1", "done at last", 2_000);
+
+        assert_eq!(outcome, Err(TaskAccessError::NotPending));
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+    }
+
+    #[test]
+    fn reconcile_abandoned_settles_a_dead_panes_task_and_persists_it() {
+        // End to end over a real `Shared`. Its engine holds no sessions, so
+        // every target is gone by definition, which is exactly the dead-pane
+        // case. Proves the transition reaches the store, not just memory.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let live = shared.reconcile_abandoned();
+
+        assert!(live.is_empty());
+        assert_eq!(
+            shared.tasks.lock().unwrap()[0].status,
+            STATUS_ABANDONED,
+            "the in-memory task should be settled"
+        );
+
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks.len(), 1, "the change must survive a restart");
+        assert_eq!(reloaded.tasks[0].status, STATUS_ABANDONED);
+    }
+
+    #[test]
+    fn reconcile_abandoned_is_idempotent() {
+        // It runs on every roster read, dispatch and collection, so running it
+        // twice must not append a second record or move the finish time.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        shared.reconcile_abandoned();
+        let first_done_ms = shared.tasks.lock().unwrap()[0].done_ms;
+        shared.reconcile_abandoned();
+
+        assert_eq!(shared.tasks.lock().unwrap()[0].done_ms, first_done_ms);
+        assert_eq!(
+            load_brain(dir.path()).tasks.len(),
+            1,
+            "a settled task should not be written again"
+        );
+    }
+
+    #[test]
+    fn collecting_results_reports_a_dead_panes_task_as_abandoned() {
+        // The call a conductor makes while waiting is the one that has to stop
+        // it waiting. Before this, the answer here was "pending" forever.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let collected = shared.tasks_from("sess-1");
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].status, STATUS_ABANDONED);
     }
 }
