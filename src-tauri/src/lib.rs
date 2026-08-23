@@ -382,9 +382,39 @@ impl SessionManager {
         true
     }
 
-    /// Ids of every live session.
+    /// Ids of every session the manager still holds.
+    ///
+    /// Membership is not liveness. A session leaves this map when its reader
+    /// loop sees the PTY close, and on Windows that can lag the agent process
+    /// exiting, so an id here may name a pane whose child is already gone. Ask
+    /// `liveness` when the answer has to be true rather than merely current.
     pub fn ids(&self) -> Vec<String> {
         self.sessions.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Every held session paired with whether its child process is still
+    /// running.
+    ///
+    /// This exists because presence in the map was the only signal the MCP
+    /// server had, and presence answers the wrong question. A conductor asking
+    /// "who can take this work" was told about panes whose agent had already
+    /// died, dispatched into them, and then waited on a result that could never
+    /// arrive.
+    ///
+    /// `try_wait` reaps without blocking: `Ok(Some(_))` means the child has
+    /// exited, `Ok(None)` means it is still running. A probe that errors is
+    /// reported as alive on purpose. Declaring a pane dead is what abandons its
+    /// task, and doing that on the strength of a failed syscall would throw away
+    /// work that is still being done. Being slow to notice a death costs a wait;
+    /// being wrong about one costs the result.
+    pub fn liveness(&self) -> Vec<(String, bool)> {
+        let mut map = self.sessions.lock().unwrap();
+        map.iter_mut()
+            .map(|(id, handle)| {
+                let alive = !matches!(handle.child.try_wait(), Ok(Some(_)));
+                (id.clone(), alive)
+            })
+            .collect()
     }
 
     /// The program a live session launched, if it's still live — lets a
@@ -1220,6 +1250,61 @@ fn human_dispatch(
     shared.dispatch_task(&from, &target, &task, "")
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // The session engine is shared with the MCP server so the conductor's
+            // dispatch can write straight into a target session's terminal.
+            let sessions = Arc::new(SessionManager::default());
+            app.manage(sessions.clone());
+
+            // Start the in-process MCP "shared brain" on a random loopback port.
+            // Sessions each get their own endpoint; this one is the fallback and
+            // the address shown in the sidebar.
+            //
+            // No agent CLI is registered here. Wiring happens per session, at
+            // launch, through arguments and environment only — see
+            // agent_mcp_wiring.
+            let handle = app.handle().clone();
+            // Placeholder until the frontend reports its project. Deriving this
+            // from the working directory made the brain's files land wherever
+            // the app happened to be started from, which for a packaged build is
+            // wherever Explorer felt like.
+            let dir = default_context_dir();
+            let (port, shared) = mcp::start(handle, dir, sessions)?;
+            let url = format!("http://127.0.0.1:{port}/mcp");
+            app.manage(McpInfo { url, port });
+            app.manage(shared);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            spawn_session,
+            write_session,
+            resize_session,
+            kill_session,
+            mcp_info,
+            get_context,
+            set_agent_brain,
+            conductor_state,
+            set_conductor,
+            halt_conductor,
+            set_project,
+            project_is_repo,
+            init_project_repo,
+            human_dispatch
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                window.state::<Arc<SessionManager>>().kill_all();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1882,59 +1967,4 @@ mod tests {
         assert!(!args.join(" ").contains("bearer_token_env_var"));
         assert!(env.is_empty());
     }
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
-            // The session engine is shared with the MCP server so the conductor's
-            // dispatch can write straight into a target session's terminal.
-            let sessions = Arc::new(SessionManager::default());
-            app.manage(sessions.clone());
-
-            // Start the in-process MCP "shared brain" on a random loopback port.
-            // Sessions each get their own endpoint; this one is the fallback and
-            // the address shown in the sidebar.
-            //
-            // No agent CLI is registered here. Wiring happens per session, at
-            // launch, through arguments and environment only — see
-            // agent_mcp_wiring.
-            let handle = app.handle().clone();
-            // Placeholder until the frontend reports its project. Deriving this
-            // from the working directory made the brain's files land wherever
-            // the app happened to be started from, which for a packaged build is
-            // wherever Explorer felt like.
-            let dir = default_context_dir();
-            let (port, shared) = mcp::start(handle, dir, sessions)?;
-            let url = format!("http://127.0.0.1:{port}/mcp");
-            app.manage(McpInfo { url, port });
-            app.manage(shared);
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            spawn_session,
-            write_session,
-            resize_session,
-            kill_session,
-            mcp_info,
-            get_context,
-            set_agent_brain,
-            conductor_state,
-            set_conductor,
-            halt_conductor,
-            set_project,
-            project_is_repo,
-            init_project_repo,
-            human_dispatch
-        ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                window.state::<Arc<SessionManager>>().kill_all();
-            }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }

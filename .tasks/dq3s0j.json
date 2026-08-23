@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "id": "dq3s0j",
-  "rev": 3,
+  "rev": 6,
   "title": "Add wait_for_tasks so a conductor can block on results",
-  "status": "backlog",
+  "status": "done",
   "priority": "P1",
   "rank": 4000,
-  "done_when": "wait_for_tasks blocks on the given task ids until each reaches a terminal status or a timeout fires, returns the get_task_result payload, and tests prove both paths: early return on completion, and bounded return on a hung pane. NOTE: unmerged work exists on feat/wait-and-nudge (fb1f041); review it before writing new. Blocked on e18r66, or a wait will hang forever on a dead pane's task.",
+  "done_when": "Shipped. wait_for_tasks blocks until the named task ids reach a terminal status or the timeout fires, returning the same rendering get_task_result would (src-tauri/src/mcp.rs). Bounded: 600s default, 1800s ceiling. A timeout is worded distinctly from completion and cancels nothing. Ids are validated for existence and ownership before any blocking. Halt outranks the wait. Polls via tasks_from, which reconciles pane liveness, so a dead pane's task becomes abandoned and releases the wait rather than holding it to the ceiling. 9 tests. Design salvaged from feat/wait-and-nudge (fb1f041); that branch's idle-pane nudge was deliberately left for task q0h7c4.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:56Z",
-  "updated": "2026-08-19T19:47:55Z",
-  "status_changed": "2026-08-15T15:10:25Z"
+  "updated": "2026-08-23T03:37:41Z",
+  "status_changed": "2026-08-23T03:37:30Z"
 }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -154,11 +154,16 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "overdue" | "in_review" | "rework" | "done" | "cancelled" | "error".
+    /// "pending" | "overdue" | "in_review" | "rework" | "done" | "cancelled"
+    /// | "error" | "abandoned".
     /// "overdue" is non-terminal: still running, result still accepted.
     /// "in_review" and "rework" are also non-terminal: the work exists but has
     /// not been signed off, which is the whole point of them being distinct
     /// from "done".
+    /// "abandoned" is terminal and means the pane holding this work is gone. It
+    /// is deliberately distinct from "cancelled", which a human chose, and from
+    /// "overdue", which is still working. Collapsing the three loses the only
+    /// question a conductor actually has: is anyone still doing this.
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
@@ -192,14 +197,71 @@ pub struct Task {
     /// the honest answer for a task whose finish time was never recorded.
     #[serde(default)]
     pub done_ms: Option<u64>,
+    /// Questions this task's agent put to the conductor, with their answers.
+    ///
+    /// Kept on the task rather than thrown away after delivery because a
+    /// question answered and then lost is one the next agent asks again. This
+    /// is a decision made mid-task, and the reasoning behind a brief is exactly
+    /// what the brief had to compress out.
+    ///
+    /// The last entry with an empty `answer` is the open question; there is at
+    /// most one, because asking blocks. `serde(default)` for the same reason as
+    /// the fields above: older records predate it and load as empty.
+    #[serde(default)]
+    pub exchanges: Vec<Exchange>,
+}
+
+/// One question from a working agent and the conductor's answer to it.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+pub struct Exchange {
+    pub question: String,
+    /// Empty while the question is still open.
+    pub answer: String,
+    pub asked_ms: u64,
 }
 
 /// Terminal states â€” the ones that stamp `done_ms` and never accept a result
 /// afterwards. `in_review` and `rework` are deliberately absent: the work
 /// exists but has not been signed off, which is the whole point of them.
+///
+/// `abandoned` is terminal because the pane that held the work no longer
+/// exists. Its per-session MCP endpoint was shut down with it (see
+/// `release_session`), so there is no longer any caller that could report a
+/// result for the task. This is the one terminal state nobody chose.
 fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "cancelled" | "error")
+    matches!(status, "done" | "cancelled" | "error" | "abandoned")
 }
+
+/// The status a task reaches when the pane doing it is gone.
+///
+/// A named constant rather than a bare string because this value is compared in
+/// five places and written in three, and a typo in any of them produces a task
+/// that is silently neither open nor terminal.
+pub const STATUS_ABANDONED: &str = "abandoned";
+
+/// The status a task holds while its agent waits on an answer from the
+/// conductor. Open, not terminal: the agent is alive and the work is unfinished.
+pub const STATUS_BLOCKED: &str = "blocked";
+
+/// How many questions one task may put to the conductor.
+///
+/// A pane that can interrupt the conductor can do so in a loop, and the
+/// conductor's context is the scarce resource in a long session. Same reasoning
+/// as `MAX_DISPATCHES`, and the same shape of answer: a hard ceiling that
+/// refuses rather than a heuristic that hopes.
+const MAX_QUESTIONS_PER_TASK: usize = 5;
+
+/// How long a blocked agent waits for its answer before giving up and deciding
+/// for itself.
+///
+/// Bounded for the same reason `wait_for_tasks` is: a conductor that never
+/// answers must not strand a pane forever. On expiry the agent is told to use
+/// its own judgement and say what it assumed, which is strictly better than
+/// stalling, and the question stays on the task so the record is not lost.
+const ASK_TIMEOUT_SECS: u64 = 900;
+
+/// How often a blocked agent re-checks for its answer.
+const ASK_POLL_MS: u64 = 1500;
 
 const STORE_FILE: &str = "brain.jsonl";
 
@@ -270,6 +332,30 @@ const MAX_DISPATCHES: u32 = 40;
 /// Twenty minutes because real dispatched work routinely runs past ten. A
 /// threshold most tasks trip is noise, and noise gets ignored.
 const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
+
+/// How long `wait_for_tasks` waits when the caller does not say.
+///
+/// Ten minutes is under the overdue threshold on purpose. A default that ran
+/// past it would routinely return "still running" for work the roster has
+/// already flagged as slow, which tells the conductor nothing it did not know.
+const WAIT_DEFAULT_SECS: u64 = 600;
+
+/// The longest any single wait may last, whatever the caller asks for.
+///
+/// A wait that could be unbounded is a wait that can hang a conductor forever
+/// on a pane that will never answer. Dead panes are settled by
+/// `reconcile_abandoned`, which ends a wait properly, but a live pane that has
+/// simply stopped is not detectable, and this is the backstop for that case.
+const WAIT_MAX_SECS: u64 = 1800;
+
+/// How often a wait re-reads task state.
+///
+/// Polling rather than a condvar because the wait has to re-run liveness
+/// reconciliation on each pass, not merely observe a status write: a pane can
+/// die without anything writing a task record, and that death is exactly what
+/// has to end the wait. Two seconds is far below any realistic task duration
+/// and costs one non-blocking probe per pane per pass.
+const WAIT_POLL_MS: u64 = 2000;
 
 /// A task record was created and delivery was attempted. `delivered` is false
 /// when the prompt could not be written to the target's terminal â€” the task
@@ -491,6 +577,11 @@ impl Shared {
         let identified = self.sessions_snapshot();
         let conductor = self.conductor();
         let now = Self::now_ms();
+        // Settle dead panes before reading the task list, not after. A roster
+        // that still counted an abandoned task as open would tell the conductor
+        // a pane is busy on work nobody is doing, which is the exact wrong
+        // answer at the exact moment it is choosing a target.
+        let live = self.reconcile_abandoned();
         // Presence is not readiness. A pane that took a task and went quiet is
         // listed exactly like an idle one, so a conductor picks it again and
         // waits on a result that is not coming. The open task and its age are
@@ -503,6 +594,10 @@ impl Shared {
                 .map(|t| (t.target.clone(), now.saturating_sub(t.ts_ms)))
                 .collect()
         };
+        // Held sessions, not live ones: a pane whose process has died is still
+        // worth a line, marked dead, because a conductor that simply stops
+        // seeing it cannot tell a pane that died from one that was never there,
+        // and will not understand why its task was abandoned.
         let mut ids = self.engine.ids();
         ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         ids.iter()
@@ -525,6 +620,15 @@ impl Shared {
                     .filter(|(target, _)| target == id)
                     .map(|(_, age_ms)| *age_ms)
                     .max();
+                // A dead pane says so instead of reporting how busy it is. Its
+                // tasks have just been abandoned, so any busy label would be
+                // describing work that no longer exists.
+                if !live.iter().any(|l| l == id) {
+                    return format!(
+                        "- {id} ({kind}) brain={room}{role} [DEAD, process exited, \
+                         do not dispatch]"
+                    );
+                }
                 format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
             })
             .collect()
@@ -624,6 +728,48 @@ impl Shared {
         self.app.emit("conductor-changed");
     }
 
+    /// Ids of panes whose agent process is still running.
+    ///
+    /// Everything that has to decide "is anyone there" goes through this rather
+    /// than `engine.ids()`, so the dead-pane answer is the same whether it is
+    /// reached from the roster, a dispatch, or a task collection.
+    fn live_ids(&self) -> Vec<String> {
+        self.engine
+            .liveness()
+            .into_iter()
+            .filter(|(_, alive)| *alive)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Settle any task whose pane has died, then report which panes are live.
+    ///
+    /// Called from the three places that ask about task state or pick a target:
+    /// the roster, task collection, and dispatch. Reconciling at the read rather
+    /// than on a timer means there is no background sweep to keep alive and no
+    /// window in which a caller sees a task the roster has already written off.
+    /// The cost is one non-blocking `try_wait` per pane per call, which is
+    /// cheaper than the poll it replaces.
+    fn reconcile_abandoned(&self) -> Vec<String> {
+        let live = self.live_ids();
+        let changed = {
+            let mut tasks = self.tasks.lock().unwrap();
+            abandon_lost(&mut tasks, &live, Self::now_ms())
+        };
+        if !changed.is_empty() {
+            let dir = self.dir.lock().unwrap().clone();
+            for task in &changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+                eprintln!(
+                    "[mosaic] task {} abandoned: target '{}' is gone",
+                    task.id, task.target
+                );
+            }
+            self.app.emit("conductor-changed");
+        }
+        live
+    }
+
     fn review_task(
         &self,
         caller: &str,
@@ -651,6 +797,66 @@ impl Shared {
         let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
         self.app.emit("context-changed");
         Ok(task)
+    }
+
+    /// Block a task on a question for its conductor.
+    fn ask_task_question(&self, caller: &str, id: &str, question: &str) -> Result<(), AskError> {
+        ask_pending(
+            &mut self.tasks.lock().unwrap(),
+            caller,
+            id,
+            question,
+            Self::now_ms(),
+        )?;
+        self.persist_task(id);
+        self.app.emit("conductor-changed");
+        Ok(())
+    }
+
+    /// Answer a blocked task's open question and set it working again.
+    fn answer_task_question(
+        &self,
+        caller: &str,
+        id: &str,
+        answer: &str,
+    ) -> Result<String, AskError> {
+        let conductor = self.conductor();
+        let question = answer_pending(
+            &mut self.tasks.lock().unwrap(),
+            caller,
+            conductor.as_deref(),
+            id,
+            answer,
+        )?;
+        self.persist_task(id);
+        self.app.emit("conductor-changed");
+        Ok(question)
+    }
+
+    /// Append one task's current state to the store. Factored out because the
+    /// look-up-then-append dance was repeated at every mutation and drifted.
+    fn persist_task(&self, id: &str) {
+        let task = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned();
+        if let Some(task) = task {
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Task(task));
+        }
+    }
+
+    /// The open question on a task, for the agent that is waiting on it.
+    fn task_answer(&self, id: &str) -> Option<Exchange> {
+        self.tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.exchanges.last().cloned())
     }
 
     /// Returns the task, so the caller can tell the agent what actually
@@ -700,6 +906,9 @@ impl Shared {
 
     /// Look a task up, flipping it to "overdue" if it has aged out.
     fn task_status(&self, caller: &str, id: &str) -> Result<Task, TaskAccessError> {
+        // Same reason as `tasks_from`: asking after one task must be able to
+        // answer "its pane is gone", not just "still pending".
+        self.reconcile_abandoned();
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let t = task_for_dispatcher(&mut tasks, caller, id)?;
@@ -717,6 +926,11 @@ impl Shared {
     /// collect: without it a conductor holding six task ids has to make six
     /// round trips to find out that five are still running.
     fn tasks_from(&self, from: &str) -> Vec<Task> {
+        // Settle dead panes first, so a collection reports "abandoned" on the
+        // call where the pane is found gone rather than one call later. This is
+        // the call a conductor makes while waiting, so it is the one that has to
+        // stop it waiting. Done before the lock, because it takes the lock.
+        self.reconcile_abandoned();
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let mut changed = Vec::new();
@@ -758,7 +972,12 @@ impl Shared {
         task: &str,
         reviewer: &str,
     ) -> Result<DispatchOutcome, String> {
-        let live = self.engine.ids();
+        // Liveness, not membership, and it settles dead panes' tasks on the way
+        // past. Dispatching into a pane whose process has exited was the way
+        // this failure compounded: the work was never done, the task never
+        // closed, and the conductor re-dispatched the same brief to the same
+        // corpse. A reviewer is chosen from the same list for the same reason.
+        let live = self.reconcile_abandoned();
         let target_is_live = live.iter().any(|i| i == target);
 
         // Before the budget and before the task is recorded, like every other
@@ -789,6 +1008,7 @@ impl Shared {
             ts_ms: Self::now_ms(),
             reviewer: reviewer.clone(),
             findings: String::new(),
+            exchanges: Vec::new(),
             done_ms: None,
         });
 
@@ -850,6 +1070,137 @@ fn age(t: &mut Task, now: u64) {
     }
 }
 
+/// Flip every open task whose target pane is gone to `abandoned`, returning the
+/// ones that changed so the caller can persist and announce them.
+///
+/// Pure over a task list and a roster, with no lock, no clock and no I/O, so
+/// the transition can be tested directly. `live` is the set of panes whose
+/// child process is still running, from `SessionManager::liveness`.
+///
+/// The rule is deliberately narrow. Only `is_open` tasks are touched, so a
+/// finished or cancelled task is never rewritten by a pane closing later. And
+/// only a target that is genuinely absent counts: a pane that is merely slow is
+/// still in `live`, and slowness is what `overdue` is for.
+///
+/// This is the fix for the failure that made "overdue" permanent. Before it, a
+/// task whose agent had died sat open forever, and the conductor could not tell
+/// that from an agent still thinking. The absence of a result meant both, so it
+/// meant nothing.
+fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
+    let mut changed = Vec::new();
+    for t in tasks.iter_mut() {
+        if !is_open(&t.status) || live.iter().any(|id| id == &t.target) {
+            continue;
+        }
+        t.status = STATUS_ABANDONED.to_string();
+        // Terminal, so it takes a finish time like any other terminal state.
+        // Without one the UI cannot tell an abandonment that just happened from
+        // one already in the store at startup, and announces the whole history.
+        t.done_ms = Some(now_ms);
+        // The result field is where a conductor looks for what happened, and it
+        // is empty precisely because nobody reported. Say so there rather than
+        // leaving a blank that reads like a result of no content.
+        if t.result.is_empty() {
+            t.result = format!(
+                "Abandoned: session '{}' is no longer running, so this task can \
+                 never report a result. Re-dispatch it to a live pane if the work \
+                 is still wanted.",
+                t.target
+            );
+        }
+        changed.push(t.clone());
+    }
+    changed
+}
+
+/// Record a question from a working agent and block its task on the answer.
+///
+/// Pure over a task list so the policy is testable without a live `Shared`.
+/// Only the task's own target may ask, for the same reason only the target may
+/// complete: a bystander posing questions against someone else's task would let
+/// any pane spend the conductor's attention.
+fn ask_pending(
+    tasks: &mut [Task],
+    caller: &str,
+    id: &str,
+    question: &str,
+    now_ms: u64,
+) -> Result<(), AskError> {
+    match tasks.iter_mut().find(|t| t.id == id) {
+        None => Err(AskError::Access(TaskAccessError::NotFound)),
+        Some(t) if t.target != caller => Err(AskError::Access(TaskAccessError::Forbidden)),
+        // Asking about work that is over is not a question, it is a leak. The
+        // agent should have finished, and answering would imply the task is
+        // live again when nothing will act on the answer.
+        Some(t) if !is_open(&t.status) => Err(AskError::Access(TaskAccessError::NotPending)),
+        Some(t) if t.status == STATUS_BLOCKED => Err(AskError::AlreadyAsking),
+        Some(t) if t.exchanges.len() >= MAX_QUESTIONS_PER_TASK => Err(AskError::TooMany),
+        Some(t) => {
+            t.exchanges.push(Exchange {
+                question: question.to_string(),
+                answer: String::new(),
+                asked_ms: now_ms,
+            });
+            t.status = STATUS_BLOCKED.to_string();
+            Ok(())
+        }
+    }
+}
+
+/// Answer the open question on a task and set it working again.
+///
+/// Returns the question that was answered, so the conductor can be told what it
+/// just resolved rather than only that something was resolved.
+fn answer_pending(
+    tasks: &mut [Task],
+    caller: &str,
+    conductor: Option<&str>,
+    id: &str,
+    answer: &str,
+) -> Result<String, AskError> {
+    // Only the conductor answers. The whole point is that questions stop going
+    // to whoever happens to be nearest.
+    if conductor != Some(caller) {
+        return Err(AskError::Access(TaskAccessError::Forbidden));
+    }
+    match tasks.iter_mut().find(|t| t.id == id) {
+        None => Err(AskError::Access(TaskAccessError::NotFound)),
+        Some(t) if t.status != STATUS_BLOCKED => Err(AskError::NotAsking),
+        Some(t) => match t.exchanges.iter_mut().rev().find(|e| e.answer.is_empty()) {
+            None => Err(AskError::NotAsking),
+            Some(open) => {
+                open.answer = answer.to_string();
+                let question = open.question.clone();
+                // Back to pending, not overdue: the clock that matters for
+                // "is this slow" is dispatch time, and `age` recomputes that on
+                // the next read anyway.
+                t.status = "pending".to_string();
+                Ok(question)
+            }
+        },
+    }
+}
+
+/// The open question on a task, if it has one.
+fn open_question(t: &Task) -> Option<&Exchange> {
+    t.exchanges.iter().rev().find(|e| e.answer.is_empty())
+}
+
+/// Why an ask or an answer was refused. Wraps `TaskAccessError` rather than
+/// extending it, because the existing variants already carry meanings that
+/// `complete_task` and `review_task` depend on.
+#[derive(Debug, PartialEq)]
+enum AskError {
+    Access(TaskAccessError),
+    /// A second question while the first is still open. Asking blocks, so this
+    /// means the agent did not wait, and answering both would be ambiguous.
+    AlreadyAsking,
+    /// Answering a task that has no open question.
+    NotAsking,
+    /// The per-task ceiling. A pane in a question loop is bounded here.
+    TooMany,
+}
+
 /// States a dispatched agent may still report a result from.
 ///
 /// "overdue" belongs here and its absence was a real bug: a task that aged out
@@ -860,7 +1211,11 @@ fn accepts_result(status: &str) -> bool {
     // "rework" is here because a rejected review has to be answerable. Without
     // it the implementer is told what is wrong and given no way to say it is
     // fixed, so the review round trip dead-ends on its first rejection.
-    matches!(status, "pending" | "overdue" | "rework")
+    // "blocked" is here because an agent whose question timed out, or that
+    // worked out the answer for itself while waiting, must be able to report
+    // what it did. Refusing would discard finished work over an unanswered
+    // question, which is the same mistake the overdue bug made.
+    matches!(status, "pending" | "overdue" | "rework" | STATUS_BLOCKED)
 }
 
 /// The core of `finish_task`: flip a task to "done" if it is still awaiting a
@@ -1066,12 +1421,26 @@ fn render_task(t: &Task) -> String {
         format!("\n--- review by {} ---\n{}", t.reviewer, t.findings)
     };
 
+    // A blocked task is the one status where the reader is the one who has to
+    // act, so the question goes in the line itself rather than behind another
+    // call. A conductor that has to go looking for the question will not.
+    let asked = match open_question(t) {
+        Some(e) => format!(
+            "\n--- waiting on you ---\n{}\nAnswer with answer_question(\"{}\", ...)",
+            e.question, t.id
+        ),
+        None => String::new(),
+    };
+
     if t.result.is_empty() {
-        format!("[{}]{} {} â†’ {}", t.status, sign_off, t.target, t.task)
+        format!(
+            "[{}]{} {} â†’ {}{}",
+            t.status, sign_off, t.target, t.task, asked
+        )
     } else {
         format!(
-            "[{}]{} {} â†’ {}\n{}{}",
-            t.status, sign_off, t.target, t.task, t.result, findings
+            "[{}]{} {} â†’ {}\n{}{}{}",
+            t.status, sign_off, t.target, t.task, t.result, findings, asked
         )
     }
 }
@@ -1087,7 +1456,14 @@ fn is_open(status: &str) -> bool {
     // "in_review" and "rework" are open for a different reason: the work is
     // submitted but unsigned. Counting either as finished would hide exactly
     // the debt this gate exists to surface.
-    matches!(status, "pending" | "overdue" | "in_review" | "rework")
+    // "blocked" is open in a third way: the agent is alive and waiting on an
+    // answer, so the work is neither progressing nor finished. A conductor
+    // collecting results needs to see the difference, because this is the one
+    // open state where it is the conductor that has to act.
+    matches!(
+        status,
+        "pending" | "overdue" | "in_review" | "rework" | STATUS_BLOCKED
+    )
 }
 
 fn truncate_chars(s: &str, limit: usize) -> String {
@@ -1096,6 +1472,51 @@ fn truncate_chars(s: &str, limit: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+/// Task ids however a conductor happened to separate them.
+///
+/// Commas, spaces, tabs and newlines all work, because a model asked for "the
+/// ids" produces any of them and refusing the wrong separator turns a wait into
+/// a syntax puzzle.
+fn parse_task_ids(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How long to wait: the caller's request, clamped.
+///
+/// Zero means "did not say" and takes the default rather than returning
+/// instantly, because a wait that returns at once is a poll, and polling is the
+/// thing this call exists to replace.
+fn wait_timeout(requested_secs: u64) -> Duration {
+    let secs = if requested_secs == 0 {
+        WAIT_DEFAULT_SECS
+    } else {
+        requested_secs.min(WAIT_MAX_SECS)
+    };
+    Duration::from_secs(secs)
+}
+
+/// Which of the wanted ids are still running.
+///
+/// Anything `is_open` counts as still running, so a wait covers `in_review` and
+/// `rework` too: work submitted but unsigned is not finished, and returning
+/// then would hand the conductor a result the gate has not passed.
+///
+/// An id that matches no task is treated as finished rather than held open. A
+/// task that vanished cannot complete, and waiting on it forever is the failure
+/// this whole call exists to prevent. `abandoned` is not open, so a dead pane's
+/// task ends the wait as soon as `reconcile_abandoned` settles it.
+fn still_open(tasks: &[Task], wanted: &[String]) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|id| tasks.iter().any(|t| &&t.id == id && is_open(&t.status)))
+        .cloned()
+        .collect()
 }
 
 /// One task in a listing.
@@ -1273,13 +1694,43 @@ pub struct CompleteArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct AskArgs {
+    /// The task_id you were given when this work was dispatched to you.
+    pub task_id: String,
+    /// What you need to know. Ask the specific thing that is blocking you, and
+    /// say what you would do by default, so the answer can be a correction
+    /// rather than a decision made from scratch.
+    pub question: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AnswerArgs {
+    /// The blocked task to answer.
+    pub task_id: String,
+    /// The answer. The agent acts on this, so decide rather than deliberate.
+    pub answer: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// Task ids to wait for, separated by commas or spaces. Leave this out to
+    /// wait on every task you have dispatched that is still running.
+    #[serde(default)]
+    pub task_ids: String,
+    /// Give up after this many seconds and report what is still running.
+    /// Defaults to 600 and is capped at 1800. A timeout cancels nothing.
+    #[serde(default)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct TaskQuery {
     /// A single task_id to check. Leave this out to collect the fan-out you
     /// are waiting on, which is the efficient way to gather parallel work.
     #[serde(default)]
     pub task_id: String,
-    /// Only tasks with this status: pending, overdue, done, error or
-    /// cancelled. Use "pending" or "overdue" to ask what is still running.
+    /// Only tasks with this status: pending, overdue, done, error, cancelled
+    /// or abandoned. Use "pending" or "overdue" to ask what is still running.
     #[serde(default)]
     pub status: String,
     /// Include the whole dispatch history rather than open tasks plus the
@@ -1401,7 +1852,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it."
+        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -1432,7 +1883,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -1525,7 +1976,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1584,17 +2035,486 @@ impl BrainHandler {
         }
         out
     }
+
+    #[tool(
+        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, or at the timeout with a note of what is still running. A timeout does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so waiting again is fine. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open."
+    )]
+    async fn wait_for_tasks(&self, Parameters(p): Parameters<WaitArgs>) -> String {
+        let me = self.author();
+        let requested = parse_task_ids(&p.task_ids);
+
+        // Existence and ownership are settled before any blocking. Waiting ten
+        // minutes to be told an id was mistyped is the worst available answer,
+        // and it is the answer a naive poll loop gives.
+        for id in &requested {
+            match self.shared.task_status(&me, id) {
+                Ok(_) => {}
+                Err(TaskAccessError::Forbidden) => {
+                    return format!("Refused: task '{id}' was dispatched by a different session.");
+                }
+                Err(_) => {
+                    return format!(
+                        "No task '{id}'. Nothing was waited on: check the id against \
+                         get_task_result before waiting again."
+                    );
+                }
+            }
+        }
+
+        let wanted = if requested.is_empty() {
+            let open: Vec<String> = self
+                .shared
+                .tasks_from(&me)
+                .into_iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| t.id)
+                .collect();
+            if open.is_empty() {
+                return "Nothing to wait for: none of your dispatched tasks are still running."
+                    .to_string();
+            }
+            open
+        } else {
+            requested
+        };
+
+        let deadline = Instant::now() + wait_timeout(p.timeout_seconds);
+        let waited_on = wanted.len();
+        loop {
+            // Stop is a user pressing a button, so it outranks the wait. A
+            // conductor blocked here would otherwise hold the workspace for the
+            // full timeout after the user had asked it to stop.
+            if self.shared.is_halted() {
+                return "Stopped: dispatch was halted by the user while waiting. \
+                        Collect what landed with get_task_result."
+                    .to_string();
+            }
+
+            // Goes through `tasks_from`, which reconciles pane liveness on the
+            // way past. That is what stops a dead pane holding this open: the
+            // task becomes "abandoned", which is not open, so the wait ends with
+            // a truthful answer instead of running to the timeout.
+            let mine = self.shared.tasks_from(&me);
+
+            // A blocked task ends the wait immediately. It is the one open state
+            // that needs the conductor rather than the agent, so continuing to
+            // wait would be waiting on itself: the agent is stopped until this
+            // caller answers, and this caller is stopped until the agent moves.
+            let blocked: Vec<&Task> = mine
+                .iter()
+                .filter(|t| wanted.contains(&t.id) && t.status == STATUS_BLOCKED)
+                .collect();
+            if !blocked.is_empty() {
+                let mut out = format!(
+                    "# {} task(s) are BLOCKED and waiting on you\n\nAnswer with \
+                     answer_question(task_id, answer). Each agent is stopped until you do, \
+                     and the rest of your wait is still running.\n",
+                    blocked.len()
+                );
+                for t in &blocked {
+                    let question = open_question(t)
+                        .map(|e| e.question.as_str())
+                        .unwrap_or("(question missing)");
+                    out.push_str(&format!("\n## {} from {}\n{question}\n", t.id, t.target));
+                }
+                return out;
+            }
+
+            let open = still_open(&mine, &wanted);
+            if open.is_empty() {
+                let finished: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id))
+                    .collect();
+                let mut out = format!("# {waited_on} task(s) finished\n");
+                for t in &finished {
+                    out.push_str(&format!(
+                        "\n## {} to {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                return out;
+            }
+
+            if Instant::now() >= deadline {
+                // Timing out and finishing must not look alike. A conductor that
+                // cannot tell them apart will report work as done that is still
+                // running, which is worse than not waiting at all.
+                let mut out = format!(
+                    "Timed out with {} of {waited_on} task(s) still running: {}.\n\
+                     They have NOT been cancelled: the agents are still working and their \
+                     results are still accepted. Wait again, or collect what landed with \
+                     get_task_result.\n",
+                    open.len(),
+                    open.join(", ")
+                );
+                let done: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id) && !is_open(&t.status))
+                    .collect();
+                for t in &done {
+                    out.push_str(&format!(
+                        "\n## {} to {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                return out;
+            }
+
+            tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
+        }
+    }
+
+    #[tool(
+        description = "Ask the conductor that dispatched your task a question, and wait for the answer. Use this the moment a brief turns out to be ambiguous, instead of guessing or asking the human in your terminal. The conductor wrote the brief, holds the reasoning it compressed away, and can see the other work in flight, so it is usually the better answerer as well as the right one. Your task shows as 'blocked' while you wait, which is what tells the conductor to answer rather than keep waiting on you. Returns the answer, or tells you to use your own judgement if nobody answers in time; either way say in your result what you assumed. Bounded: at most 5 questions per task."
+    )]
+    async fn ask_conductor(&self, Parameters(p): Parameters<AskArgs>) -> String {
+        let me = self.author();
+        let question = p.question.trim();
+        if question.is_empty() {
+            return "Refused: ask a question. An empty one costs the conductor a turn and \
+                    tells it nothing."
+                .to_string();
+        }
+
+        // No conductor, or a halted workspace, means nobody is going to answer.
+        // Falling back to the human is right here, but it has to be a stated
+        // fallback rather than the silent default it used to be.
+        let Some(conductor) = self.shared.conductor() else {
+            return "No conductor is set, so there is nobody to ask. Decide with your own \
+                    judgement and state the assumption in your result, or ask the human in \
+                    your terminal if the decision is theirs to make."
+                .to_string();
+        };
+        if self.shared.is_halted() {
+            return "Dispatch is halted, so the conductor will not answer. Stop and wait for \
+                    the human."
+                .to_string();
+        }
+
+        match self.shared.ask_task_question(&me, &p.task_id, question) {
+            Ok(()) => {}
+            Err(AskError::Access(TaskAccessError::NotFound)) => {
+                return format!("No task '{}'.", p.task_id);
+            }
+            Err(AskError::Access(TaskAccessError::Forbidden)) => {
+                return "Refused: you can only ask about a task dispatched to you.".to_string();
+            }
+            Err(AskError::Access(TaskAccessError::NotPending)) => {
+                return "That task is already finished, so there is nothing to unblock. If you \
+                        have more to say, say it in a new task or record it as a decision."
+                    .to_string();
+            }
+            Err(AskError::AlreadyAsking) => {
+                return "You already have a question open on that task. Wait for it rather than \
+                        stacking another."
+                    .to_string();
+            }
+            Err(AskError::NotAsking) => {
+                return "That task has no open question.".to_string();
+            }
+            Err(AskError::TooMany) => {
+                return format!(
+                    "Refused: {MAX_QUESTIONS_PER_TASK} questions is the ceiling for one task, \
+                     and it has been reached. Decide with your own judgement and state the \
+                     assumption in your result."
+                );
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(ASK_TIMEOUT_SECS);
+        loop {
+            if let Some(exchange) = self.shared.task_answer(&p.task_id) {
+                if !exchange.answer.is_empty() {
+                    return format!(
+                        "{conductor} answered:\n\n{}\n\nYour task is running again. Carry on.",
+                        exchange.answer
+                    );
+                }
+            }
+
+            // A stop while blocked releases the agent rather than holding it to
+            // the ceiling, for the same reason it releases a wait.
+            if self.shared.is_halted() {
+                return "Dispatch was halted while you waited. Stop and wait for the human."
+                    .to_string();
+            }
+
+            if Instant::now() >= deadline {
+                return format!(
+                    "No answer from {conductor} within {}s. The question stays recorded on the \
+                     task. Decide with your own judgement and say in your result what you \
+                     assumed, so the conductor can correct it if the assumption was wrong.",
+                    ASK_TIMEOUT_SECS
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(ASK_POLL_MS)).await;
+        }
+    }
+
+    #[tool(
+        description = "Conductor only: answer a question a working agent asked you. The task is blocked until you do, so answering is what starts it moving again. Questions show up on any task listed as 'blocked' by get_task_result or wait_for_tasks, and a wait returns early when one arrives precisely so you can answer it. The exchange is kept on the task, so an answer given once is not asked again."
+    )]
+    fn answer_question(&self, Parameters(p): Parameters<AnswerArgs>) -> String {
+        let me = self.author();
+        let answer = p.answer.trim();
+        if answer.is_empty() {
+            return "Refused: an empty answer leaves the agent exactly as stuck, but tells it \
+                    the question was considered and dismissed."
+                .to_string();
+        }
+        match self.shared.answer_task_question(&me, &p.task_id, answer) {
+            Ok(question) => format!(
+                "Answered. '{}' is running again.\n\nThe question was: {question}",
+                p.task_id
+            ),
+            Err(AskError::Access(TaskAccessError::NotFound)) => {
+                format!("No task '{}'.", p.task_id)
+            }
+            Err(AskError::Access(TaskAccessError::Forbidden)) => {
+                "Refused: only the conductor answers questions.".to_string()
+            }
+            Err(AskError::Access(TaskAccessError::NotPending)) | Err(AskError::NotAsking) => {
+                format!(
+                    "Task '{}' is not waiting on an answer. Call get_task_result to see what \
+                     is actually blocked.",
+                    p.task_id
+                )
+            }
+            Err(AskError::AlreadyAsking) | Err(AskError::TooMany) => "Refused.".to_string(),
+        }
+    }
+}
+
+/// What every connecting agent is told about the workspace it just joined.
+///
+/// Exposing well-described tools is not enough on its own: an agent that is not
+/// told to consult shared context simply won't, and the brain stays empty while
+/// two agents build incompatible halves of the same thing. MCP carries these
+/// instructions on the connection itself, which is why this lives here rather
+/// than in each project's AGENTS.md â€” it reaches every session automatically,
+/// in whichever repo it was launched against.
+///
+/// The workspace section exists for a second, distinct failure: an agent that
+/// treats Mosaic as a nicer terminal and never notices the other panes are
+/// usable capacity. Because MCP delivers this text once, at connect time, it can
+/// only describe the role an agent *might* be given â€” the conductor briefing
+/// injected by `set_conductor` is what covers the role it actually has.
+const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
+
+Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
+
+## The workspace
+
+The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
+
+Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
+
+If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
+- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
+- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
+- wait_for_tasks blocks until the ids you name are finished, so you do not have to guess an interval and poll. Dispatch the whole fan-out, then wait on it once. "I will report when it lands" is only true if you actually wait; otherwise nothing brings you back.
+- Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
+- A task reported as blocked is waiting on YOU, not on the agent. Answer it with answer_question(task_id, answer) and the agent starts moving again. wait_for_tasks returns early when one appears, precisely so you can answer without watching for it.
+- A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
+- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
+
+If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+
+If that brief turns out to be ambiguous, call ask_conductor with your task_id and the specific question rather than guessing or asking the human in your terminal. The conductor wrote the brief and holds the reasoning it compressed away, so it is usually the better answerer as well as the right one; the human often lacks the context and did not ask to be the routing point for five panes. Your task shows as blocked while you wait, and you get the answer back in the same call. If nobody answers in time you are told to use your own judgement, and then you should say in your result what you assumed.
+
+## Shared context
+
+- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
+- Use search_context to check one specific topic before you spend effort researching it.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
+- Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
+- Use broadcast for blockers, or anything the others need to know immediately."#;
+
+#[tool_handler]
+impl ServerHandler for BrainHandler {
+    // Supplying get_info suppresses the macro's generated one, so both the tools
+    // capability and our own name/version have to be restated here â€” otherwise
+    // no tools are advertised, and the server introduces itself to agents as
+    // "rmcp" (the default is resolved inside that crate, not ours).
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
+            .with_instructions(BRAIN_INSTRUCTIONS)
+    }
+}
+
+/// Bind the MCP server on a random loopback port and spawn it. Returns the port
+/// and the shared store (also used by the frontend `get_context` command).
+/// Bind a loopback endpoint dedicated to ONE session. Because only that session
+/// is registered against this port, every request on it is provably from that
+/// session â€” identity without a handshake.
+/// The caller owns the returned handle: dropping it does NOT stop the server, so
+/// it must be aborted explicitly when the session ends, or the listener outlives
+/// the session it was bound to.
+pub struct SessionServer {
+    pub port: u16,
+    /// Secret this session must present as `Authorization: Bearer <token>`.
+    /// Handed to the caller so it can be written into that one session's agent
+    /// config; it is never logged and never leaves the machine.
+    pub token: String,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SessionServer {
+    /// Stop serving. Called when the session is killed or exits on its own.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+/// Mint a secret for one session's endpoint.
+///
+/// Two v4 UUIDs, whose randomness comes from the OS CSPRNG via `getrandom`,
+/// give 244 bits with no new dependency. Far past brute force, which matters
+/// because the endpoint sits on loopback where anything local can reach it and
+/// retry without limit.
+fn mint_session_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Whether an `Authorization` header carries exactly the expected bearer token.
+///
+/// Compared in constant time over the whole candidate so a caller cannot learn
+/// the secret one byte at a time from response latency. Localhost makes that
+/// attack awkward rather than impossible, and the cost of not leaking is a
+/// single XOR per byte. Split out from the middleware so it is directly
+/// testable without standing up a server.
+fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
+    let Some(value) = header else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in presented.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+pub fn start_session_server(
+    shared: Arc<Shared>,
+    session_id: String,
+) -> std::io::Result<SessionServer> {
+    validate_path_component("session_id", &session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+    let token = mint_session_token();
+    let expected = token.clone();
+
+    let task = tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        // The port still identifies WHICH session this is; the token proves the
+        // caller is that session rather than any other local process that
+        // guessed the port. Both checks, not one instead of the other.
+        let router =
+            axum::Router::new()
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let expected = expected.clone();
+                        async move {
+                            let header = req
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok());
+                            if bearer_matches(header, &expected) {
+                                next.run(req).await
+                            } else {
+                                axum::http::StatusCode::UNAUTHORIZED.into_response()
+                            }
+                        }
+                    },
+                ));
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok(SessionServer { port, token, task })
+}
+
+pub fn start(
+    app: AppHandle,
+    dir: PathBuf,
+    engine: Arc<crate::SessionManager>,
+) -> std::io::Result<(u16, Arc<Shared>)> {
+    let brain = load_brain(&dir);
+    let shared = Arc::new(Shared {
+        app: Notifier::to_app(app),
+        dir: Mutex::new(dir),
+        entries: Mutex::new(brain.entries),
+        sessions: Mutex::new(brain.sessions),
+        name_to_room: Mutex::new(HashMap::new()),
+        engine,
+        conductor: Mutex::new(None),
+        halted: Mutex::new(false),
+        tasks: Mutex::new(brain.tasks),
+        dispatches: Mutex::new(0),
+    });
+
+    // Bind synchronously so we can hand the port back before the server task runs.
+    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+
+    let shared_for_server = shared.clone();
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(BrainHandler::new(shared_for_server.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok((port, shared))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, bearer_matches, busy_label, choose_reviewer, conductor_briefing,
-        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
-        load_brain, mark_pending_error, mint_session_token, oversize_refusal, render_task,
-        render_task_summary, review_pending, select_tasks, task_for_dispatcher,
-        validate_path_component, AgentSession, Entry, Notifier, Shared, StoreRecord, Task,
-        TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        abandon_lost, age, answer_pending, append_record, ask_pending, bearer_matches, busy_label,
+        choose_reviewer, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
+        human_ms, injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
+        mint_session_token, open_question, oversize_refusal, parse_task_ids, render_task,
+        render_task_summary, review_pending, select_tasks, still_open, task_for_dispatcher,
+        validate_path_component, wait_timeout, AgentSession, AskError, Entry, Notifier, Shared,
+        StoreRecord, Task, TaskAccessError, MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED,
+        STATUS_ABANDONED, STATUS_BLOCKED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS,
+        WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1627,6 +2547,7 @@ mod tests {
             ts_ms: DISPATCHED_AT,
             reviewer: reviewer.into(),
             findings: String::new(),
+            exchanges: Vec::new(),
             done_ms: None,
         }]
     }
@@ -1754,6 +2675,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }
     }
 
@@ -2020,6 +2942,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -2044,6 +2967,7 @@ mod tests {
             result: String::new(),
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
             ts_ms: 0,
             done_ms: None,
         };
@@ -2091,6 +3015,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
@@ -2122,6 +3047,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }];
 
         assert_eq!(
@@ -2145,6 +3071,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }];
 
         assert_eq!(
@@ -2223,6 +3150,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }];
         assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
@@ -2242,6 +3170,7 @@ mod tests {
             result: String::new(),
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
             ts_ms: 0,
             done_ms: None,
         }];
@@ -2262,6 +3191,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         };
 
         let mut pending = base.clone();
@@ -2293,6 +3223,7 @@ mod tests {
             done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -2320,6 +3251,7 @@ mod tests {
                 result: "original".into(),
                 reviewer: String::new(),
                 findings: String::new(),
+                exchanges: Vec::new(),
                 ts_ms: 0,
                 done_ms: None,
             }];
@@ -2344,6 +3276,7 @@ mod tests {
             result: String::new(),
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
             ts_ms: 0,
             done_ms: None,
         }];
@@ -2379,6 +3312,7 @@ mod tests {
             result: String::new(),
             reviewer: String::new(),
             findings: String::new(),
+            exchanges: Vec::new(),
             ts_ms: 2,
             done_ms: None,
         };
@@ -2415,6 +3349,7 @@ mod tests {
             done_ms: None,
             reviewer: "sess-3".into(),
             findings: String::new(),
+            exchanges: Vec::new(),
         }
     }
 
@@ -2729,212 +3664,467 @@ mod tests {
         assert!(loaded.tasks.is_empty());
         assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
     }
-}
 
-/// What every connecting agent is told about the workspace it just joined.
-///
-/// Exposing well-described tools is not enough on its own: an agent that is not
-/// told to consult shared context simply won't, and the brain stays empty while
-/// two agents build incompatible halves of the same thing. MCP carries these
-/// instructions on the connection itself, which is why this lives here rather
-/// than in each project's AGENTS.md â€” it reaches every session automatically,
-/// in whichever repo it was launched against.
-///
-/// The workspace section exists for a second, distinct failure: an agent that
-/// treats Mosaic as a nicer terminal and never notices the other panes are
-/// usable capacity. Because MCP delivers this text once, at connect time, it can
-/// only describe the role an agent *might* be given â€” the conductor briefing
-/// injected by `set_conductor` is what covers the role it actually has.
-const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
+    // ---- dead panes and abandoned tasks ----
 
-Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
-
-## The workspace
-
-The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
-
-Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
-
-If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
-- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
-- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
-- Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
-- A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
-- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
-
-If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
-
-## Shared context
-
-- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
-- Use search_context to check one specific topic before you spend effort researching it.
-- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
-- Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
-- Use broadcast for blockers, or anything the others need to know immediately."#;
-
-#[tool_handler]
-impl ServerHandler for BrainHandler {
-    // Supplying get_info suppresses the macro's generated one, so both the tools
-    // capability and our own name/version have to be restated here â€” otherwise
-    // no tools are advertised, and the server introduces itself to agents as
-    // "rmcp" (the default is resolved inside that crate, not ours).
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
-            .with_instructions(BRAIN_INSTRUCTIONS)
+    #[test]
+    fn an_abandoned_task_is_terminal_and_no_longer_open() {
+        // The whole point of the state. If it were open, a conductor would keep
+        // waiting; if it were not terminal, it would never stamp a finish time.
+        assert!(is_terminal(STATUS_ABANDONED));
+        assert!(!is_open(STATUS_ABANDONED));
     }
-}
 
-/// Bind the MCP server on a random loopback port and spawn it. Returns the port
-/// and the shared store (also used by the frontend `get_context` command).
-/// Bind a loopback endpoint dedicated to ONE session. Because only that session
-/// is registered against this port, every request on it is provably from that
-/// session â€” identity without a handshake.
-/// The caller owns the returned handle: dropping it does NOT stop the server, so
-/// it must be aborted explicitly when the session ends, or the listener outlives
-/// the session it was bound to.
-pub struct SessionServer {
-    pub port: u16,
-    /// Secret this session must present as `Authorization: Bearer <token>`.
-    /// Handed to the caller so it can be written into that one session's agent
-    /// config; it is never logged and never leaves the machine.
-    pub token: String,
-    task: tauri::async_runtime::JoinHandle<()>,
-}
-
-impl SessionServer {
-    /// Stop serving. Called when the session is killed or exits on its own.
-    pub fn shutdown(self) {
-        self.task.abort();
+    #[test]
+    fn abandoned_is_distinct_from_cancelled_and_overdue() {
+        // Three different facts: nobody is doing this, a human stopped it, and
+        // it is taking a while. Collapsing any pair loses the question the
+        // conductor is actually asking.
+        assert!(is_terminal("cancelled"));
+        assert!(!is_open("cancelled"));
+        assert!(!is_terminal("overdue"));
+        assert!(is_open("overdue"));
+        assert_ne!(STATUS_ABANDONED, "cancelled");
     }
-}
 
-/// Mint a secret for one session's endpoint.
-///
-/// Two v4 UUIDs, whose randomness comes from the OS CSPRNG via `getrandom`,
-/// give 244 bits with no new dependency. Far past brute force, which matters
-/// because the endpoint sits on loopback where anything local can reach it and
-/// retry without limit.
-fn mint_session_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
+    #[test]
+    fn abandon_lost_settles_an_open_task_whose_pane_is_gone() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        let changed = abandon_lost(&mut tasks, &[], 5_000);
 
-/// Whether an `Authorization` header carries exactly the expected bearer token.
-///
-/// Compared in constant time over the whole candidate so a caller cannot learn
-/// the secret one byte at a time from response latency. Localhost makes that
-/// attack awkward rather than impossible, and the cost of not leaking is a
-/// single XOR per byte. Split out from the middleware so it is directly
-/// testable without standing up a server.
-fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
-    let Some(value) = header else {
-        return false;
-    };
-    let Some(presented) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    if presented.len() != expected.len() {
-        return false;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        // Terminal states carry a finish time, so the UI can tell an
+        // abandonment that just happened from one already in the store.
+        assert_eq!(tasks[0].done_ms, Some(5_000));
     }
-    let mut diff = 0u8;
-    for (a, b) in presented.bytes().zip(expected.bytes()) {
-        diff |= a ^ b;
+
+    #[test]
+    fn abandon_lost_leaves_a_slow_but_live_pane_alone() {
+        // The failure this must not cause: an agent that is merely thinking is
+        // not an agent that is gone. Slowness is what "overdue" is for, and
+        // abandoning here would discard work still being done.
+        let mut tasks = vec![task_at("t1", "overdue", 0)];
+        let live = vec!["sess-2".to_string()];
+
+        let changed = abandon_lost(&mut tasks, &live, TASK_OVERDUE_MS * 10);
+
+        assert!(changed.is_empty());
+        assert_eq!(tasks[0].status, "overdue");
+        assert_eq!(tasks[0].done_ms, None);
     }
-    diff == 0
-}
 
-pub fn start_session_server(
-    shared: Arc<Shared>,
-    session_id: String,
-) -> std::io::Result<SessionServer> {
-    validate_path_component("session_id", &session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    std_listener.set_nonblocking(true)?;
-    let port = std_listener.local_addr()?.port();
-    let token = mint_session_token();
-    let expected = token.clone();
+    #[test]
+    fn abandon_lost_covers_every_open_status_not_just_pending() {
+        // A pane can die while its work sits in review or rework just as easily
+        // as while it is running. Those are open too, so they are equally stuck.
+        let mut tasks = vec![
+            task_at("t1", "pending", 0),
+            task_at("t2", "overdue", 0),
+            task_at("t3", "in_review", 0),
+            task_at("t4", "rework", 0),
+        ];
 
-    let task = tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+        let changed = abandon_lost(&mut tasks, &[], 1_000);
+
+        assert_eq!(changed.len(), 4);
+        assert!(tasks.iter().all(|t| t.status == STATUS_ABANDONED));
+    }
+
+    #[test]
+    fn abandon_lost_never_rewrites_work_that_already_finished() {
+        // A pane closing after its work landed must not erase the result. This
+        // is the regression that would quietly destroy history.
+        let mut tasks = vec![
+            task_at("t1", "done", 0),
+            task_at("t2", "cancelled", 0),
+            task_at("t3", "error", 0),
+        ];
+        tasks[0].result = "the parser is fine".into();
+
+        let changed = abandon_lost(&mut tasks, &[], 1_000);
+
+        assert!(changed.is_empty());
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].result, "the parser is fine");
+        assert_eq!(tasks[1].status, "cancelled");
+        assert_eq!(tasks[2].status, "error");
+    }
+
+    #[test]
+    fn abandon_lost_touches_only_the_dead_panes_tasks() {
+        let mut tasks = vec![task_at("t1", "pending", 0), task_at("t2", "pending", 0)];
+        tasks[1].target = "sess-3".into();
+        let live = vec!["sess-3".to_string()];
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "t1");
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        assert_eq!(tasks[1].status, "pending");
+    }
+
+    #[test]
+    fn an_abandoned_task_says_why_rather_than_leaving_an_empty_result() {
+        // An empty result reads like a result of no content. The conductor needs
+        // to know nobody is coming, and that re-dispatching is its move.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        assert!(tasks[0].result.contains("sess-2"));
+        assert!(tasks[0].result.contains("no longer running"));
+        assert!(tasks[0].result.contains("Re-dispatch"));
+    }
+
+    #[test]
+    fn abandoning_keeps_a_result_the_agent_already_reported() {
+        // Work submitted for review, then the pane died. The submission is the
+        // valuable part and overwriting it with the abandonment notice would
+        // throw away the only thing the task produced.
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].result = "found three bugs in the lexer".into();
+
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+        assert_eq!(tasks[0].result, "found three bugs in the lexer");
+    }
+
+    #[test]
+    fn an_abandoned_task_refuses_a_late_result() {
+        // The pane is gone and its MCP endpoint went with it, so nothing should
+        // be able to report here. If something does, it is not the target.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        abandon_lost(&mut tasks, &[], 1_000);
+
+        let outcome = finish_pending(&mut tasks, "sess-2", "t1", "done at last", 2_000);
+
+        assert_eq!(outcome, Err(TaskAccessError::NotPending));
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+    }
+
+    #[test]
+    fn reconcile_abandoned_settles_a_dead_panes_task_and_persists_it() {
+        // End to end over a real `Shared`. Its engine holds no sessions, so
+        // every target is gone by definition, which is exactly the dead-pane
+        // case. Proves the transition reaches the store, not just memory.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let live = shared.reconcile_abandoned();
+
+        assert!(live.is_empty());
+        assert_eq!(
+            shared.tasks.lock().unwrap()[0].status,
+            STATUS_ABANDONED,
+            "the in-memory task should be settled"
         );
-        // The port still identifies WHICH session this is; the token proves the
-        // caller is that session rather than any other local process that
-        // guessed the port. Both checks, not one instead of the other.
-        let router =
-            axum::Router::new()
-                .nest_service("/mcp", service)
-                .layer(axum::middleware::from_fn(
-                    move |req: axum::extract::Request, next: axum::middleware::Next| {
-                        let expected = expected.clone();
-                        async move {
-                            let header = req
-                                .headers()
-                                .get(axum::http::header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok());
-                            if bearer_matches(header, &expected) {
-                                next.run(req).await
-                            } else {
-                                axum::http::StatusCode::UNAUTHORIZED.into_response()
-                            }
-                        }
-                    },
-                ));
-        let _ = axum::serve(listener, router).await;
-    });
 
-    Ok(SessionServer { port, token, task })
-}
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks.len(), 1, "the change must survive a restart");
+        assert_eq!(reloaded.tasks[0].status, STATUS_ABANDONED);
+    }
 
-pub fn start(
-    app: AppHandle,
-    dir: PathBuf,
-    engine: Arc<crate::SessionManager>,
-) -> std::io::Result<(u16, Arc<Shared>)> {
-    let brain = load_brain(&dir);
-    let shared = Arc::new(Shared {
-        app: Notifier::to_app(app),
-        dir: Mutex::new(dir),
-        entries: Mutex::new(brain.entries),
-        sessions: Mutex::new(brain.sessions),
-        name_to_room: Mutex::new(HashMap::new()),
-        engine,
-        conductor: Mutex::new(None),
-        halted: Mutex::new(false),
-        tasks: Mutex::new(brain.tasks),
-        dispatches: Mutex::new(0),
-    });
+    #[test]
+    fn reconcile_abandoned_is_idempotent() {
+        // It runs on every roster read, dispatch and collection, so running it
+        // twice must not append a second record or move the finish time.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
 
-    // Bind synchronously so we can hand the port back before the server task runs.
-    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    std_listener.set_nonblocking(true)?;
-    let port = std_listener.local_addr()?.port();
+        shared.reconcile_abandoned();
+        let first_done_ms = shared.tasks.lock().unwrap()[0].done_ms;
+        shared.reconcile_abandoned();
 
-    let shared_for_server = shared.clone();
-    tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::new(shared_for_server.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+        assert_eq!(shared.tasks.lock().unwrap()[0].done_ms, first_done_ms);
+        assert_eq!(
+            load_brain(dir.path()).tasks.len(),
+            1,
+            "a settled task should not be written again"
         );
-        let router = axum::Router::new().nest_service("/mcp", service);
-        let _ = axum::serve(listener, router).await;
-    });
+    }
 
-    Ok((port, shared))
+    #[test]
+    fn collecting_results_reports_a_dead_panes_task_as_abandoned() {
+        // The call a conductor makes while waiting is the one that has to stop
+        // it waiting. Before this, the answer here was "pending" forever.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let collected = shared.tasks_from("sess-1");
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].status, STATUS_ABANDONED);
+    }
+
+    // ---- waiting for a dispatch ----
+
+    fn task_with(id: &str, status: &str) -> Task {
+        let mut t = task_at(id, status, 0);
+        t.id = id.into();
+        t
+    }
+
+    #[test]
+    fn an_omitted_timeout_waits_rather_than_returning_at_once() {
+        // Zero means "did not say". Treating it as zero seconds would turn the
+        // one call that blocks back into the poll it exists to replace.
+        assert_eq!(wait_timeout(0).as_secs(), WAIT_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn a_wait_cannot_be_asked_to_last_forever() {
+        // The backstop for a live pane that has quietly stopped. Dead panes end
+        // a wait properly; a pane that is up but silent is not detectable, so
+        // the ceiling is the only thing that returns control to the conductor.
+        assert_eq!(wait_timeout(u64::MAX).as_secs(), WAIT_MAX_SECS);
+        assert_eq!(wait_timeout(30).as_secs(), 30);
+    }
+
+    #[test]
+    fn task_ids_arrive_however_a_conductor_happens_to_separate_them() {
+        let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(parse_task_ids("a,b,c"), expected);
+        assert_eq!(parse_task_ids("a b c"), expected);
+        assert_eq!(parse_task_ids("a, b\tc\n"), expected);
+        assert!(parse_task_ids("   ").is_empty());
+    }
+
+    #[test]
+    fn an_overdue_task_is_still_waited_for_rather_than_given_up_on() {
+        // Overdue is slow, not finished. Returning here would report work as
+        // complete while the agent is still doing it.
+        let tasks = vec![task_with("t1", "overdue")];
+        assert_eq!(still_open(&tasks, &["t1".to_string()]), vec!["t1"]);
+    }
+
+    #[test]
+    fn work_submitted_but_unsigned_is_still_worth_waiting_for() {
+        // in_review and rework are open on purpose: the gate has not passed, so
+        // handing the result back now would defeat the review it is waiting on.
+        let tasks = vec![task_with("t1", "in_review"), task_with("t2", "rework")];
+        let wanted = vec!["t1".to_string(), "t2".to_string()];
+        assert_eq!(still_open(&tasks, &wanted), wanted);
+    }
+
+    #[test]
+    fn a_wait_ends_when_every_task_reaches_a_terminal_state() {
+        let tasks = vec![
+            task_with("t1", "done"),
+            task_with("t2", "cancelled"),
+            task_with("t3", "error"),
+        ];
+        let wanted = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+        assert!(still_open(&tasks, &wanted).is_empty());
+    }
+
+    #[test]
+    fn a_dead_panes_task_releases_the_wait_instead_of_holding_it_to_the_timeout() {
+        // The reason dq3s0j was blocked on e18r66. Without a terminal state for
+        // a dead pane, this wait would run the full ceiling and then report the
+        // task as still running, forever, on every retry.
+        let tasks = vec![task_with("t1", STATUS_ABANDONED)];
+        assert!(still_open(&tasks, &["t1".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_task_that_vanished_does_not_hold_the_wait_open_forever() {
+        // An id matching nothing cannot ever complete. Treating it as open is
+        // the exact hang this call exists to prevent.
+        let tasks: Vec<Task> = Vec::new();
+        assert!(still_open(&tasks, &["ghost".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn waiting_only_reports_the_tasks_that_were_asked_for() {
+        // A conductor waiting on one slice must not be held by an unrelated
+        // long-running task it dispatched earlier.
+        let tasks = vec![task_with("t1", "pending"), task_with("t2", "pending")];
+        assert_eq!(still_open(&tasks, &["t2".to_string()]), vec!["t2"]);
+    }
+
+    // ---- a blocked agent asking the conductor ----
+
+    #[test]
+    fn a_blocked_task_is_open_but_not_finished() {
+        // The agent is alive and the work is unfinished, so a conductor
+        // collecting results must still see it. If it were terminal, the
+        // question would never be answered and the task would silently die.
+        assert!(is_open(STATUS_BLOCKED));
+        assert!(!is_terminal(STATUS_BLOCKED));
+    }
+
+    #[test]
+    fn asking_blocks_the_task_and_records_the_question() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let outcome = ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 500);
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(tasks[0].status, STATUS_BLOCKED);
+        assert_eq!(tasks[0].exchanges.len(), 1);
+        assert_eq!(tasks[0].exchanges[0].question, "which parser?");
+        assert_eq!(tasks[0].exchanges[0].asked_ms, 500);
+        assert!(tasks[0].exchanges[0].answer.is_empty());
+    }
+
+    #[test]
+    fn only_the_agent_doing_the_work_may_ask_about_it() {
+        // Otherwise any pane could spend the conductor's attention on a task it
+        // has nothing to do with.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let outcome = ask_pending(&mut tasks, "sess-9", "t1", "which parser?", 0);
+
+        assert_eq!(outcome, Err(AskError::Access(TaskAccessError::Forbidden)));
+        assert_eq!(tasks[0].status, "pending");
+    }
+
+    #[test]
+    fn a_finished_task_cannot_be_reopened_with_a_question() {
+        let mut tasks = vec![task_at("t1", "done", 0)];
+
+        let outcome = ask_pending(&mut tasks, "sess-2", "t1", "one more thing?", 0);
+
+        assert_eq!(outcome, Err(AskError::Access(TaskAccessError::NotPending)));
+        assert_eq!(tasks[0].status, "done");
+    }
+
+    #[test]
+    fn a_second_question_while_the_first_is_open_is_refused() {
+        // Asking blocks, so a second question means the agent did not wait, and
+        // one answer could not be matched to one question.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "first", 0).unwrap();
+
+        let outcome = ask_pending(&mut tasks, "sess-2", "t1", "second", 0);
+
+        assert_eq!(outcome, Err(AskError::AlreadyAsking));
+        assert_eq!(tasks[0].exchanges.len(), 1);
+    }
+
+    #[test]
+    fn a_pane_cannot_interrogate_the_conductor_in_a_loop() {
+        // The MAX_DISPATCHES precedent: a hard ceiling, because the conductor's
+        // context is the scarce resource in a long session.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        for i in 0..MAX_QUESTIONS_PER_TASK {
+            ask_pending(&mut tasks, "sess-2", "t1", &format!("q{i}"), 0).unwrap();
+            answer_pending(&mut tasks, "sess-1", Some("sess-1"), "t1", &format!("a{i}")).unwrap();
+        }
+
+        let outcome = ask_pending(&mut tasks, "sess-2", "t1", "one more", 0);
+
+        assert_eq!(outcome, Err(AskError::TooMany));
+    }
+
+    #[test]
+    fn answering_unblocks_the_task_and_keeps_the_exchange() {
+        // A question answered and then lost is one the next agent asks again.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 0).unwrap();
+
+        let question = answer_pending(&mut tasks, "sess-1", Some("sess-1"), "t1", "the new one");
+
+        assert_eq!(question, Ok("which parser?".to_string()));
+        assert_eq!(tasks[0].status, "pending");
+        assert_eq!(tasks[0].exchanges[0].answer, "the new one");
+    }
+
+    #[test]
+    fn only_the_conductor_answers() {
+        // The whole point is that questions stop going to whoever is nearest.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 0).unwrap();
+
+        let outcome = answer_pending(&mut tasks, "sess-9", Some("sess-1"), "t1", "mine");
+
+        assert_eq!(outcome, Err(AskError::Access(TaskAccessError::Forbidden)));
+        assert_eq!(tasks[0].status, STATUS_BLOCKED);
+    }
+
+    #[test]
+    fn answering_a_task_that_asked_nothing_is_refused() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let outcome = answer_pending(&mut tasks, "sess-1", Some("sess-1"), "t1", "unprompted");
+
+        assert_eq!(outcome, Err(AskError::NotAsking));
+    }
+
+    #[test]
+    fn a_blocked_agent_can_still_report_what_it_managed_to_do() {
+        // Its question may have timed out, or it may have worked the answer out
+        // for itself. Refusing here would discard finished work over an
+        // unanswered question, which is the overdue bug in another costume.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 0).unwrap();
+
+        let outcome = finish_pending(&mut tasks, "sess-2", "t1", "assumed the new one", 9_000);
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(tasks[0].result, "assumed the new one");
+    }
+
+    #[test]
+    fn a_dead_pane_abandons_its_blocked_task_too() {
+        // Otherwise a pane that died while waiting on an answer would leave the
+        // conductor holding a question nobody is left to receive the answer to.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 0).unwrap();
+
+        let changed = abandon_lost(&mut tasks, &[], 5_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(tasks[0].status, STATUS_ABANDONED);
+    }
+
+    #[test]
+    fn open_question_finds_the_unanswered_one_and_nothing_else() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "first", 0).unwrap();
+        answer_pending(&mut tasks, "sess-1", Some("sess-1"), "t1", "answered").unwrap();
+        assert!(open_question(&tasks[0]).is_none());
+
+        ask_pending(&mut tasks, "sess-2", "t1", "second", 0).unwrap();
+
+        assert_eq!(
+            open_question(&tasks[0]).map(|e| e.question.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn a_listing_puts_the_question_where_the_conductor_will_see_it() {
+        // Behind another call is behind a call the conductor will not make.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        ask_pending(&mut tasks, "sess-2", "t1", "which parser?", 0).unwrap();
+
+        let rendered = render_task(&tasks[0]);
+
+        assert!(rendered.contains("which parser?"), "{rendered}");
+        assert!(rendered.contains("answer_question"), "{rendered}");
+    }
+
+    #[test]
+    fn a_blocked_task_keeps_a_conductor_waiting_rather_than_finishing_it() {
+        // still_open must not treat blocked as done. wait_for_tasks returns
+        // early on it by a separate path, because the conductor has to act.
+        let tasks = vec![task_with("t1", STATUS_BLOCKED)];
+        assert_eq!(still_open(&tasks, &["t1".to_string()]), vec!["t1"]);
+    }
 }
