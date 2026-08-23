@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -287,6 +287,30 @@ const MAX_DISPATCHES: u32 = 40;
 /// Twenty minutes because real dispatched work routinely runs past ten. A
 /// threshold most tasks trip is noise, and noise gets ignored.
 const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
+
+/// How long `wait_for_tasks` waits when the caller does not say.
+///
+/// Ten minutes is under the overdue threshold on purpose. A default that ran
+/// past it would routinely return "still running" for work the roster has
+/// already flagged as slow, which tells the conductor nothing it did not know.
+const WAIT_DEFAULT_SECS: u64 = 600;
+
+/// The longest any single wait may last, whatever the caller asks for.
+///
+/// A wait that could be unbounded is a wait that can hang a conductor forever
+/// on a pane that will never answer. Dead panes are settled by
+/// `reconcile_abandoned`, which ends a wait properly, but a live pane that has
+/// simply stopped is not detectable, and this is the backstop for that case.
+const WAIT_MAX_SECS: u64 = 1800;
+
+/// How often a wait re-reads task state.
+///
+/// Polling rather than a condvar because the wait has to re-run liveness
+/// reconciliation on each pass, not merely observe a status write: a pane can
+/// die without anything writing a task record, and that death is exactly what
+/// has to end the wait. Two seconds is far below any realistic task duration
+/// and costs one non-blocking probe per pane per pass.
+const WAIT_POLL_MS: u64 = 2000;
 
 /// A task record was created and delivery was attempted. `delivered` is false
 /// when the prompt could not be written to the target's terminal â€” the task
@@ -1231,6 +1255,51 @@ fn truncate_chars(s: &str, limit: usize) -> String {
     out
 }
 
+/// Task ids however a conductor happened to separate them.
+///
+/// Commas, spaces, tabs and newlines all work, because a model asked for "the
+/// ids" produces any of them and refusing the wrong separator turns a wait into
+/// a syntax puzzle.
+fn parse_task_ids(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How long to wait: the caller's request, clamped.
+///
+/// Zero means "did not say" and takes the default rather than returning
+/// instantly, because a wait that returns at once is a poll, and polling is the
+/// thing this call exists to replace.
+fn wait_timeout(requested_secs: u64) -> Duration {
+    let secs = if requested_secs == 0 {
+        WAIT_DEFAULT_SECS
+    } else {
+        requested_secs.min(WAIT_MAX_SECS)
+    };
+    Duration::from_secs(secs)
+}
+
+/// Which of the wanted ids are still running.
+///
+/// Anything `is_open` counts as still running, so a wait covers `in_review` and
+/// `rework` too: work submitted but unsigned is not finished, and returning
+/// then would hand the conductor a result the gate has not passed.
+///
+/// An id that matches no task is treated as finished rather than held open. A
+/// task that vanished cannot complete, and waiting on it forever is the failure
+/// this whole call exists to prevent. `abandoned` is not open, so a dead pane's
+/// task ends the wait as soon as `reconcile_abandoned` settles it.
+fn still_open(tasks: &[Task], wanted: &[String]) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|id| tasks.iter().any(|t| &&t.id == id && is_open(&t.status)))
+        .cloned()
+        .collect()
+}
+
 /// One task in a listing.
 ///
 /// Deliberately does NOT echo the whole brief. The conductor wrote it and
@@ -1406,6 +1475,18 @@ pub struct CompleteArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// Task ids to wait for, separated by commas or spaces. Leave this out to
+    /// wait on every task you have dispatched that is still running.
+    #[serde(default)]
+    pub task_ids: String,
+    /// Give up after this many seconds and report what is still running.
+    /// Defaults to 600 and is capped at 1800. A timeout cancels nothing.
+    #[serde(default)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct TaskQuery {
     /// A single task_id to check. Leave this out to collect the fan-out you
     /// are waiting on, which is the efficient way to gather parallel work.
@@ -1565,7 +1646,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -1717,6 +1798,114 @@ impl BrainHandler {
         }
         out
     }
+
+    #[tool(
+        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, or at the timeout with a note of what is still running. A timeout does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so waiting again is fine. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open."
+    )]
+    async fn wait_for_tasks(&self, Parameters(p): Parameters<WaitArgs>) -> String {
+        let me = self.author();
+        let requested = parse_task_ids(&p.task_ids);
+
+        // Existence and ownership are settled before any blocking. Waiting ten
+        // minutes to be told an id was mistyped is the worst available answer,
+        // and it is the answer a naive poll loop gives.
+        for id in &requested {
+            match self.shared.task_status(&me, id) {
+                Ok(_) => {}
+                Err(TaskAccessError::Forbidden) => {
+                    return format!("Refused: task '{id}' was dispatched by a different session.");
+                }
+                Err(_) => {
+                    return format!(
+                        "No task '{id}'. Nothing was waited on: check the id against \
+                         get_task_result before waiting again."
+                    );
+                }
+            }
+        }
+
+        let wanted = if requested.is_empty() {
+            let open: Vec<String> = self
+                .shared
+                .tasks_from(&me)
+                .into_iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| t.id)
+                .collect();
+            if open.is_empty() {
+                return "Nothing to wait for: none of your dispatched tasks are still running."
+                    .to_string();
+            }
+            open
+        } else {
+            requested
+        };
+
+        let deadline = Instant::now() + wait_timeout(p.timeout_seconds);
+        let waited_on = wanted.len();
+        loop {
+            // Stop is a user pressing a button, so it outranks the wait. A
+            // conductor blocked here would otherwise hold the workspace for the
+            // full timeout after the user had asked it to stop.
+            if self.shared.is_halted() {
+                return "Stopped: dispatch was halted by the user while waiting. \
+                        Collect what landed with get_task_result."
+                    .to_string();
+            }
+
+            // Goes through `tasks_from`, which reconciles pane liveness on the
+            // way past. That is what stops a dead pane holding this open: the
+            // task becomes "abandoned", which is not open, so the wait ends with
+            // a truthful answer instead of running to the timeout.
+            let mine = self.shared.tasks_from(&me);
+            let open = still_open(&mine, &wanted);
+            if open.is_empty() {
+                let finished: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id))
+                    .collect();
+                let mut out = format!("# {waited_on} task(s) finished\n");
+                for t in &finished {
+                    out.push_str(&format!(
+                        "\n## {} to {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                return out;
+            }
+
+            if Instant::now() >= deadline {
+                // Timing out and finishing must not look alike. A conductor that
+                // cannot tell them apart will report work as done that is still
+                // running, which is worse than not waiting at all.
+                let mut out = format!(
+                    "Timed out with {} of {waited_on} task(s) still running: {}.\n\
+                     They have NOT been cancelled: the agents are still working and their \
+                     results are still accepted. Wait again, or collect what landed with \
+                     get_task_result.\n",
+                    open.len(),
+                    open.join(", ")
+                );
+                let done: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id) && !is_open(&t.status))
+                    .collect();
+                for t in &done {
+                    out.push_str(&format!(
+                        "\n## {} to {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                return out;
+            }
+
+            tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
+        }
+    }
 }
 
 /// What every connecting agent is told about the workspace it just joined.
@@ -1746,6 +1935,7 @@ Mosaic gives exactly one session the conductor role, and the user assigns it; yo
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
 - Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
 - dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
+- wait_for_tasks blocks until the ids you name are finished, so you do not have to guess an interval and poll. Dispatch the whole fan-out, then wait on it once. "I will report when it lands" is only true if you actually wait; otherwise nothing brings you back.
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
@@ -1933,10 +2123,11 @@ mod tests {
         abandon_lost, age, append_record, bearer_matches, busy_label, choose_reviewer,
         conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
         injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
-        mint_session_token, oversize_refusal, render_task, render_task_summary, review_pending,
-        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry, Notifier,
-        Shared, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED,
-        STATUS_ABANDONED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        mint_session_token, oversize_refusal, parse_task_ids, render_task, render_task_summary,
+        review_pending, select_tasks, still_open, task_for_dispatcher, validate_path_component,
+        wait_timeout, AgentSession, Entry, Notifier, Shared, StoreRecord, Task, TaskAccessError,
+        RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -3276,5 +3467,91 @@ mod tests {
 
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].status, STATUS_ABANDONED);
+    }
+
+    // ---- waiting for a dispatch ----
+
+    fn task_with(id: &str, status: &str) -> Task {
+        let mut t = task_at(id, status, 0);
+        t.id = id.into();
+        t
+    }
+
+    #[test]
+    fn an_omitted_timeout_waits_rather_than_returning_at_once() {
+        // Zero means "did not say". Treating it as zero seconds would turn the
+        // one call that blocks back into the poll it exists to replace.
+        assert_eq!(wait_timeout(0).as_secs(), WAIT_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn a_wait_cannot_be_asked_to_last_forever() {
+        // The backstop for a live pane that has quietly stopped. Dead panes end
+        // a wait properly; a pane that is up but silent is not detectable, so
+        // the ceiling is the only thing that returns control to the conductor.
+        assert_eq!(wait_timeout(u64::MAX).as_secs(), WAIT_MAX_SECS);
+        assert_eq!(wait_timeout(30).as_secs(), 30);
+    }
+
+    #[test]
+    fn task_ids_arrive_however_a_conductor_happens_to_separate_them() {
+        let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(parse_task_ids("a,b,c"), expected);
+        assert_eq!(parse_task_ids("a b c"), expected);
+        assert_eq!(parse_task_ids("a, b\tc\n"), expected);
+        assert!(parse_task_ids("   ").is_empty());
+    }
+
+    #[test]
+    fn an_overdue_task_is_still_waited_for_rather_than_given_up_on() {
+        // Overdue is slow, not finished. Returning here would report work as
+        // complete while the agent is still doing it.
+        let tasks = vec![task_with("t1", "overdue")];
+        assert_eq!(still_open(&tasks, &["t1".to_string()]), vec!["t1"]);
+    }
+
+    #[test]
+    fn work_submitted_but_unsigned_is_still_worth_waiting_for() {
+        // in_review and rework are open on purpose: the gate has not passed, so
+        // handing the result back now would defeat the review it is waiting on.
+        let tasks = vec![task_with("t1", "in_review"), task_with("t2", "rework")];
+        let wanted = vec!["t1".to_string(), "t2".to_string()];
+        assert_eq!(still_open(&tasks, &wanted), wanted);
+    }
+
+    #[test]
+    fn a_wait_ends_when_every_task_reaches_a_terminal_state() {
+        let tasks = vec![
+            task_with("t1", "done"),
+            task_with("t2", "cancelled"),
+            task_with("t3", "error"),
+        ];
+        let wanted = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+        assert!(still_open(&tasks, &wanted).is_empty());
+    }
+
+    #[test]
+    fn a_dead_panes_task_releases_the_wait_instead_of_holding_it_to_the_timeout() {
+        // The reason dq3s0j was blocked on e18r66. Without a terminal state for
+        // a dead pane, this wait would run the full ceiling and then report the
+        // task as still running, forever, on every retry.
+        let tasks = vec![task_with("t1", STATUS_ABANDONED)];
+        assert!(still_open(&tasks, &["t1".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_task_that_vanished_does_not_hold_the_wait_open_forever() {
+        // An id matching nothing cannot ever complete. Treating it as open is
+        // the exact hang this call exists to prevent.
+        let tasks: Vec<Task> = Vec::new();
+        assert!(still_open(&tasks, &["ghost".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn waiting_only_reports_the_tasks_that_were_asked_for() {
+        // A conductor waiting on one slice must not be held by an unrelated
+        // long-running task it dispatched earlier.
+        let tasks = vec![task_with("t1", "pending"), task_with("t2", "pending")];
+        assert_eq!(still_open(&tasks, &["t2".to_string()]), vec!["t2"]);
     }
 }

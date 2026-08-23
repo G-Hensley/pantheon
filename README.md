@@ -120,7 +120,8 @@ alone: the agent never declares a name and cannot claim another's.
 
 Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
 `get_shared_context`, `search_context`, `list_sessions`, `dispatch` (conductor
-only), `complete_task`, `get_task_result`, `set_session_identity`.
+only), `complete_task`, `get_task_result`, `wait_for_tasks`,
+`set_session_identity`.
 
 ## How agents are briefed
 
@@ -151,6 +152,14 @@ happens; it is the only channel that reaches an already-running agent.
 Dispatch returns a `task_id` immediately rather than blocking, so a conductor
 is meant to fan several tasks out and then collect them; `get_task_result`
 with no `task_id` returns every task that conductor dispatched in one call.
+
+`wait_for_tasks` is the other half. It blocks until the ids it is given reach a
+terminal state, then returns the same results, so a conductor with nothing else
+queued does not have to guess a polling interval. It defaults to a ten minute
+wait and is capped at thirty minutes. A timeout says so explicitly and cancels
+nothing: the agents keep working and their results are still accepted, so
+waiting again is fine. A pane that dies mid-wait ends the wait rather than
+holding it open, because its task becomes `abandoned`.
 
 ## Guardrails
 

@@ -1,0 +1,16 @@
+{
+  "schema": 2,
+  "id": "q0h7c4",
+  "rev": 2,
+  "title": "Tell a conductor when panes are sitting idle",
+  "status": "backlog",
+  "priority": "P3",
+  "rank": 16000,
+  "done_when": "A conductor that has panes sitting idle is told so, on a call it already makes, naming the idle panes rather than repeating generic advice. It stays quiet below a minimum idle count, below a minimum quiet period, and repeats no more often than a fixed interval, so it does not become wallpaper. Unmerged prior art exists on feat/wait-and-nudge (fb1f041): idle_pane_nudge and nudge_is_due are written and tested there and can be lifted; only the wait_for_tasks half of that branch was taken.",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-23T03:37:30Z",
+  "updated": "2026-08-23T03:37:40Z",
+  "status_changed": "2026-08-23T03:37:30Z"
+}
