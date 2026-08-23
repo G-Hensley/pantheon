@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "id": "6v3ebz",
-  "rev": 3,
+  "rev": 5,
   "title": "Let a blocked agent ask the conductor, not the human",
-  "status": "backlog",
+  "status": "done",
   "priority": "P1",
   "rank": 13000,
-  "done_when": "A dispatched agent can pose a question against its task_id, the task moves to a distinct blocked state that a conductor collecting results can see, the answer is delivered back to the waiting agent, and the exchange is recorded on the task rather than lost. A bounded ceiling prevents a pane interrupting in a loop, and the fallback to the human when no conductor is live or it is halted is deliberate rather than silent. Shares one mechanism with dq3s0j rather than growing a second (BACKLOG.md:400-446).",
+  "done_when": "Shipped. ask_conductor lets a dispatched agent put a question against its task_id and wait for the answer; the task holds a distinct open 'blocked' status, and answer_question (conductor only) delivers the answer and sets it running again (src-tauri/src/mcp.rs: ask_pending, answer_pending, open_question). Exchanges are kept on the task, so an answer is not lost. Bounded at MAX_QUESTIONS_PER_TASK=5 and a 900s ask timeout that tells the agent to use its judgement rather than stall. No conductor or a halted workspace is an explicit stated fallback to the human, not a silent default. wait_for_tasks returns early on a blocked task so the conductor is not waiting on a pane that is waiting on it, which is the shared mechanism dq3s0j called for. 14 tests. Verified 2026-08-22: 137 pass, fmt and clippy clean.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-22T03:52:39Z",
-  "updated": "2026-08-22T03:53:10Z",
-  "status_changed": "2026-08-22T03:52:39Z"
+  "updated": "2026-08-23T03:44:07Z",
+  "status_changed": "2026-08-23T03:44:07Z"
 }

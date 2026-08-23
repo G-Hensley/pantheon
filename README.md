@@ -120,8 +120,8 @@ alone: the agent never declares a name and cannot claim another's.
 
 Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
 `get_shared_context`, `search_context`, `list_sessions`, `dispatch` (conductor
-only), `complete_task`, `get_task_result`, `wait_for_tasks`,
-`set_session_identity`.
+only), `complete_task`, `get_task_result`, `wait_for_tasks`, `ask_conductor`,
+`answer_question` (conductor only), `set_session_identity`.
 
 ## How agents are briefed
 
@@ -160,6 +160,18 @@ wait and is capped at thirty minutes. A timeout says so explicitly and cancels
 nothing: the agents keep working and their results are still accepted, so
 waiting again is fine. A pane that dies mid-wait ends the wait rather than
 holding it open, because its task becomes `abandoned`.
+
+Dispatch used to be one-way, so an agent that hit a genuine ambiguity mid-task
+could only guess, stall, or ask the human in its own terminal. With five panes
+working at once, that made the human the synchronisation point for questions
+they had not asked and lacked the context to answer, which is the exact cost
+conducting was supposed to remove. `ask_conductor` routes the question to the
+agent that wrote the brief instead. The task shows as `blocked`, which is open
+but not progressing, and `wait_for_tasks` returns early when one appears so the
+conductor answers rather than waiting on a pane that is waiting on it. Bounded
+at five questions per task, and a question that goes unanswered tells the agent
+to use its own judgement and state the assumption rather than stalling. The
+exchange is kept on the task, so an answer given once is not asked again.
 
 ## Guardrails
 

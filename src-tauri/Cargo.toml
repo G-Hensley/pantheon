@@ -25,7 +25,12 @@ serde_json = "1"
 # Live PTY sessions (ConPTY on Windows via wezterm's crate).
 portable-pty = "0.9"
 # Only the sync mpsc — Tauri's runtime drives the futures, so we skip tokio's runtime.
-tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync"] }
+# "time" is declared because `wait_for_tasks` and `ask_conductor` sleep between
+# polls. It already resolved through feature unification from a transitive
+# dependency, so the build was green without it, but relying on that means the
+# day axum or tauri stops requesting it this crate stops compiling for a reason
+# that has nothing to do with the change that triggered it.
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 rmcp = { version = "3.1.1", features = ["schemars", "server", "transport-streamable-http-server"] }
 axum = "0.8.9"
 uuid = { version = "1.24.0", features = ["v4"] }
