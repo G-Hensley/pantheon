@@ -50,6 +50,37 @@ body {
   user-select: none;
 }
 
+/* ---- The top chrome must never scroll ----
+   `.bar`, `.restore-problem` and `.condbar` are fixed-height strips stacked
+   across the top of the window. Two things go wrong if one of them is allowed
+   to overflow. Content wider than the strip drags the page sideways; and a
+   scroll container anywhere inside paints a classic 15px scrollbar directly
+   under the title bar, because Windows WebView2 scrollbars take space rather
+   than overlaying. That is the regression the old `.cond-feed
+   { overflow-x: auto }` shipped: measured at 1477x427 it put a 15px scrollbar
+   at y=82 and grew the conductor bar from 43px to 49px.
+
+   `clip` rather than `hidden`: it clips without making the strip itself a
+   scroll container, so the strip can never acquire a scrollbar of its own.
+
+   Clipping here does NOT protect against a descendant. A child that declares
+   its own `overflow-x: auto` still paints its own scrollbar inside a clipped
+   parent (measured, not assumed). Nothing inside these strips may declare
+   `overflow-x: auto` or `scroll`; `src/App.css.test.ts` enforces that. */
+.bar,
+.restore-problem,
+.condbar {
+  overflow-x: clip;
+}
+
+/* Buttons keep their labels on one line. A wrapped label does not widen the
+   bar, it makes it taller, which costs terminal rows: the same regression in
+   the other axis. Pressure is absorbed by `.cond-title` instead, below. */
+.bar button,
+.condbar button {
+  white-space: nowrap;
+}
+
 .bar h1 {
   margin: 0;
   font-size: 14px;
@@ -845,9 +876,15 @@ button.ghost.on {
   background: color-mix(in srgb, var(--danger) 14%, var(--panel2));
 }
 
+/* The conductor's name is the only unbounded string in the strip, so it is the
+   one that gives way when the bar runs out of room: it shrinks and ellipsises
+   instead of pushing the buttons past the window edge. */
 .cond-title {
   color: var(--acc);
   white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cond-title b {
@@ -1067,6 +1104,37 @@ button.ghost.on {
   padding: 2px 8px;
   border: 1px solid;
   white-space: nowrap;
+}
+
+/* ---- Delivery states: queued -> submitted -> accepted ----
+   These three say how much Mosaic actually knows about a dispatch, so the
+   difference has to survive on a monochrome screen and for a red/green
+   colour-blind reader. Fill carries it, colour only reinforces it:
+
+     queued     dashed outline, no fill   nothing has been sent
+     submitted  solid outline, faint fill sent, nobody has acknowledged it
+     accepted   solid, fully filled       a named agent said it is working
+
+   Each pill also carries its own word from statusLabel() in src/lib/tasks.ts,
+   so the state is legible with styling off entirely. */
+.taskitem-status[data-status="queued"] {
+  color: var(--dim);
+  border-color: var(--dim);
+  border-style: dashed;
+}
+
+.taskitem-status[data-status="submitted"] {
+  color: var(--acc);
+  border-color: var(--acc);
+  background: color-mix(in srgb, var(--acc) 16%, transparent);
+}
+
+/* Accepted is the only open state Mosaic has positive confirmation of, and the
+   only one filled solid. */
+.taskitem-status[data-status="accepted"] {
+  color: var(--acc-ink);
+  background: var(--acc);
+  border-color: var(--acc);
 }
 
 .taskitem-status[data-status="pending"] {

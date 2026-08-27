@@ -9,6 +9,11 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["./src/setupTests.ts"],
-    css: false,
+    // src/App.css.test.ts imports App.css as text to guard the stylesheet
+    // against the top-of-window scrollbar regression. `css: false` stubs every
+    // CSS id, including the `?raw` query, so that import would come back as an
+    // empty string and the whole guard would pass while checking nothing. No
+    // component under test imports a stylesheet, so this costs one file.
+    css: true,
   },
 });
