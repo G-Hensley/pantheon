@@ -7,6 +7,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { ContextSidebar } from "./components/ContextSidebar";
 import { ConductorBar } from "./components/ConductorBar";
 import { DispatchDialog } from "./components/DispatchDialog";
+import { TaskDrawer } from "./components/TaskDrawer";
 import { ToastContainer } from "./components/Toast";
 import {
   LayoutPanel,
@@ -99,6 +100,7 @@ function App() {
   const [conductorTasks, setConductorTasks] = useState<import("./lib/ipc").ConductorTask[]>([]);
   const [conductorHalted, setConductorHalted] = useState(false);
   const [dispatchOpen, setDispatchOpen] = useState(false);
+  const [tasksOpen, setTasksOpen] = useState(false);
   const [toasts, setToasts] = useState<string[]>([]); // dismissed task ids
   // Toasts announce results as they arrive, so anything that finished before
   // this launch is history rather than news. Without this the restored task
@@ -345,6 +347,10 @@ function App() {
         e.preventDefault();
         e.stopPropagation();
         setSidebarOpen((o) => !o);
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        e.stopPropagation();
+        setTasksOpen((o) => !o);
       } else if (mod && e.shiftKey && /^[1-9]$/.test(e.key)) {
         e.preventDefault();
         e.stopPropagation();
@@ -431,6 +437,7 @@ function App() {
           onDemote={() => toggleConductor(conductor)}
           onHaltChange={haltConductor}
           onOpenDispatch={() => setDispatchOpen(true)}
+          onOpenTasks={() => setTasksOpen(true)}
           panes={panes}
         />
       )}
@@ -593,6 +600,17 @@ function App() {
           conductorId={conductor}
           onClose={() => setDispatchOpen(false)}
           onDispatch={handleDispatch}
+        />
+      )}
+      {tasksOpen && (
+        <TaskDrawer
+          tasks={conductorTasks}
+          panes={panes}
+          onClose={() => setTasksOpen(false)}
+          onFocusPane={(id) => {
+            setFocusedPane(id);
+            setTasksOpen(false);
+          }}
         />
       )}
       <ToastContainer

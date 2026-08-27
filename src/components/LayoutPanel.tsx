@@ -87,7 +87,8 @@ export function LayoutPanel({
         </div>
         <p className="layout-help layout-shortcuts">
           Ctrl+Shift+1…9 focuses a pane. Ctrl+Shift+Enter maximizes or restores
-          the terminal you are using.
+          the terminal you are using. Ctrl+Shift+T opens the conductor's task
+          list.
         </p>
       </div>
     </div>
