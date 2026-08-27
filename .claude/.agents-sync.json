@@ -1,12 +1,31 @@
 {
-    "entries":  [
-                    ".claude/skills/create-skill",
-                    ".claude/skills/create-subagent",
-                    ".claude/skills/research",
-                    ".claude/skills/shape-ideas",
-                    ".claude/agents/toolsmith.md",
-                    ".codex/agents/toolsmith.toml",
-                    ".opencode/agents/toolsmith.md",
-                    "CLAUDE.md"
-                ]
+  "entries": [
+    ".claude/agents/toolsmith.md",
+    ".claude/skills/create-skill/SKILL.md",
+    ".claude/skills/create-skill/references/anti-patterns.md",
+    ".claude/skills/create-skill/references/bulletproofing-discipline-skills.md",
+    ".claude/skills/create-skill/references/description-discipline.md",
+    ".claude/skills/create-skill/references/skill-template.md",
+    ".claude/skills/create-skill/references/testing-skills.md",
+    ".claude/skills/create-subagent/SKILL.md",
+    ".claude/skills/create-subagent/references/agy-template.md",
+    ".claude/skills/create-subagent/references/best-practices.md",
+    ".claude/skills/create-subagent/references/claude-template.md",
+    ".claude/skills/create-subagent/references/codex-template.md",
+    ".claude/skills/create-subagent/references/memory-template.md",
+    ".claude/skills/create-subagent/references/opencode-template.md",
+    ".claude/skills/research/SKILL.md",
+    ".claude/skills/research/references/evidence-schema.md",
+    ".claude/skills/research/references/source-policy.md",
+    ".claude/skills/resolve-pr-feedback/SKILL.md",
+    ".claude/skills/resolve-pr-feedback/scripts/pr_feedback.py",
+    ".claude/skills/shape-ideas/SKILL.md",
+    ".claude/skills/shape-ideas/assets/increment.md",
+    ".claude/skills/shape-ideas/assets/north-star.md",
+    ".claude/skills/shape-ideas/references/definition-of-good.md",
+    ".claude/skills/shape-ideas/references/increment-slicing.md",
+    ".claude/skills/shape-ideas/references/interview-passes.md",
+    ".codex/agents/toolsmith.toml",
+    ".opencode/agents/toolsmith.md"
+  ]
 }

@@ -47,11 +47,18 @@
     },
     "skill:research": {
       "files": {
-        ".agents/skills/research/SKILL.md": "affb9d3effa63ff210d951e8e1f9033f615d39d38e1fe4a6a1747dca21e8e294",
-        ".agents/skills/research/references/evidence-schema.md": "ca0b18cbc2fb5c61a23d17b4d9fe7902a585777ae1413aa9be008260db580874",
+        ".agents/skills/research/SKILL.md": "0a6f1550bcfb273e76a8c777a692cacbf863ee398de8532d2969c27cff791f39",
+        ".agents/skills/research/references/evidence-schema.md": "f100326c399521943bf963665483e614e672635b56e06c9577d37de2f7eac73e",
         ".agents/skills/research/references/source-policy.md": "18cb2688c101bcf878a74c6913a8bff5bf22466e794f5ead9d869dc022566c41"
       },
       "source": "skill-library/research"
+    },
+    "skill:resolve-pr-feedback": {
+      "files": {
+        ".agents/skills/resolve-pr-feedback/SKILL.md": "c078ccd48b10ce3838eac165358a87bda3947fb838c07fff0ad8673ccedb166d",
+        ".agents/skills/resolve-pr-feedback/scripts/pr_feedback.py": "97d8d455feb24f7b5af27ad1878df2ee5ab28a3862aadbc1f19fa21ecc7a47e0"
+      },
+      "source": "skill-library/resolve-pr-feedback"
     },
     "skill:shape-ideas": {
       "files": {

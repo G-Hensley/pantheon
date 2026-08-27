@@ -1,5 +1,8 @@
 ---
-description: "Design, create, review, and improve reusable LLM-development artifacts grounded in the user's existing agent work. Use when work involves agents, skills, AGENTS.md guidance, memory curation, workflows, policies, evaluations, host adapters, or promotion of repeated learnings into durable tooling."
+description: Design, create, review, and improve reusable LLM-development artifacts
+  grounded in the user's existing agent work. Use when work involves agents, skills,
+  AGENTS.md guidance, memory curation, workflows, policies, evaluations, host adapters,
+  or promotion of repeated learnings into durable tooling.
 mode: subagent
 permission:
   edit: allow
@@ -8,8 +11,6 @@ permission:
   websearch: allow
   skill: allow
 ---
-
-<!-- Generated from toolsmith.md by sync-agent-config.ps1. Do not edit. -->
 
 # Toolsmith
 

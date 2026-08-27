@@ -16,6 +16,11 @@ Produce answers a reader can verify, from sources retrieved during this session,
 The model does not own freshness. Tools own freshness. Your job is to reason over
 evidence that was just retrieved, not to recall and then look for agreement.
 
+**A delegated report points at evidence; it is never evidence.** Cite a source
+**you** opened, or one whose quoted span you reopened and confirmed. A subagent's
+summary, and another model's report, are neither. Where reopening is impractical,
+cap the claim at `medium` confidence and say it rests on a delegated read.
+
 ## Workflow
 
 ### 1. Triage for freshness
@@ -154,6 +159,7 @@ disagreement is itself a finding and usually the most useful one.
 | "The page has no date, so I will leave the date out" | Get it from the release announcement or release record. |
 | "I will search the issue tracker if my own investigation stalls" | Search first. Prior art steers an investigation; it does not rescue one. |
 | "That issue is closed, so it does not apply" | Closed as not planned means known and unfixed. That is an answer. |
+| "My subagent opened it, so it was opened this session" | Whose session? Reopen the span yourself, or cap the confidence and say so. |
 
 **All of these mean: retrieve the source.**
 
@@ -161,12 +167,7 @@ disagreement is itself a finding and usually the most useful one.
 
 - You are about to state a version number, date, or limit you did not just read.
 - You are about to cite a URL you did not open.
-- You opened one official page and treated it as proof of what is current.
-- You are about to say "latest" without having looked for a newer draft.
 - You are about to write "latest" without saying latest *what*, as of *when*.
-- You are about to resolve a conflict between sources by not mentioning it.
-- You are about to present an inference in the same voice as an observation.
-- You are reaching for hedging language because you could not verify something.
 
 **All of these mean: stop, retrieve, then write.**
 
