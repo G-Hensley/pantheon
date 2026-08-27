@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { type ConductorTask } from "../lib/ipc";
+import { groupTasks } from "../lib/tasks";
 
 type ConductorBarProps = {
   conductor: string;
@@ -8,12 +9,16 @@ type ConductorBarProps = {
   onDemote: () => void;
   onHaltChange: (halted: boolean) => void;
   onOpenDispatch: () => void;
+  onOpenTasks: () => void;
   panes: { id: string; type: import("../lib/ipc").SessionType; status: string }[];
 };
 
 // Live view of what the conductor is doing, plus the global kill-switch.
 // Every dispatch also lands visibly in its target's terminal — this bar is the
-// at-a-glance version.
+// at-a-glance version. The full picture (every open task, untruncated, with
+// review/blocked state) lives behind the "Tasks" button in <TaskDrawer>; a
+// five-pill feed used to try to fit that here and dropped a sixth task
+// entirely (BACKLOG.md).
 export function ConductorBar({
   conductor,
   tasks,
@@ -21,6 +26,7 @@ export function ConductorBar({
   onDemote,
   onHaltChange,
   onOpenDispatch,
+  onOpenTasks,
   panes,
 }: ConductorBarProps) {
   const availableTargets = useMemo(
@@ -28,7 +34,14 @@ export function ConductorBar({
     [panes, conductor]
   );
 
+  const groups = useMemo(() => groupTasks(tasks), [tasks]);
   const pending = tasks.filter((t) => t.status === "pending").length;
+  // Blocked tasks are the ones a human is most likely to need to act on (nudge
+  // the conductor pane to answer). Never derived from silence — see
+  // src/lib/tasks.ts — only ever true because the backend already set
+  // status === "blocked".
+  const needsAttention = groups.open.some((t) => t.status === "blocked");
+  const openCount = groups.open.length + groups.review.length;
 
   return (
     <div className="condbar" data-halted={halted}>
@@ -39,27 +52,14 @@ export function ConductorBar({
         {pending} pending · {tasks.length} dispatched
       </span>
 
-      <div className="cond-feed">
-        {tasks.length === 0 ? (
-          <span className="cond-empty">No dispatches yet</span>
-        ) : (
-          tasks
-            .slice()
-            .reverse()
-            .slice(0, 5)
-            .map((t) => (
-              <span
-                className="cond-task"
-                key={t.id}
-                data-status={t.status}
-                title={t.result || t.task}
-              >
-                <b>{t.target}</b> {t.task.length > 38 ? t.task.slice(0, 38) + "…" : t.task}
-                <i>{t.status}</i>
-              </span>
-            ))
-        )}
-      </div>
+      <button
+        className={"ghost cond-tasks" + (needsAttention ? " attention" : "")}
+        onClick={onOpenTasks}
+        title="Open every task — pending, in review, rework, blocked, and recent (Ctrl+Shift+T)"
+      >
+        {needsAttention && <span className="cond-tasks-dot" aria-hidden="true" />}
+        Tasks{openCount > 0 ? ` · ${openCount}` : ""}
+      </button>
 
       <div className="spacer" />
       {availableTargets.length > 0 && (

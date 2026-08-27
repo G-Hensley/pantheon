@@ -104,14 +104,29 @@ export const initProjectRepo = (dir: string): Promise<void> =>
   invoke("init_project_repo", { dir });
 
 // ---- Conductor ----
+// One question a working agent put to the conductor, and the answer (empty
+// while still open). Mirrors `Exchange` in src-tauri/src/mcp.rs.
+export type Exchange = {
+  question: string;
+  answer: string;
+  asked_ms: number;
+};
+
 export type ConductorTask = {
   id: string;
   from: string;
   target: string;
   task: string;
-  // pending | overdue | done | error | cancelled.
+  // pending | overdue | in_review | rework | blocked | done | error |
+  // cancelled | abandoned — mirrors the `status` doc comment on `Task` in
+  // src-tauri/src/mcp.rs.
   // "overdue" is still running: past the reporting threshold but not
-  // cancelled, and its result is still accepted.
+  // cancelled, and its result is still accepted. "in_review" and "rework" are
+  // open too: the work exists but has not been signed off. "blocked" means
+  // the agent asked the conductor a question and is waiting on the answer —
+  // set only by an explicit ask_conductor/answer_question exchange, never
+  // inferred from silence (see src/lib/tasks.ts). "abandoned" is terminal:
+  // the pane holding the work is gone.
   status: string;
   result: string;
   // Stamped once at dispatch and never moved. This is not when the task
@@ -120,6 +135,14 @@ export type ConductorTask = {
   // When the task reached a terminal state, or null while it is still live
   // (including in_review and rework, neither of which is finished).
   done_ms: number | null;
+  // Session that must sign off before this counts as done. Empty means
+  // review was waived.
+  reviewer: string;
+  // What the reviewer said, whether approved or rejected.
+  findings: string;
+  // Questions this task's agent asked the conductor, in order. The last entry
+  // with an empty `answer` is the open question, if any.
+  exchanges: Exchange[];
 };
 export type ConductorState = {
   conductor: string | null;
