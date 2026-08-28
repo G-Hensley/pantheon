@@ -1,4 +1,4 @@
-# Mosaic
+# Pantheon
 
 A desktop cockpit for running several AI coding agents side by side, coordinated
 rather than siloed. Each agent gets a live terminal pane; panes can share a
@@ -18,7 +18,7 @@ the delivery policy, both of which are already loaded from the parent tree.
   agents talk to, `worktree.rs` is the git worktree isolation, `lib.rs` and
   `main.rs` are the app.
 - `ui-gallery/` : component previews.
-- `README.md` : what Mosaic is and what it cannot yet do.
+- `README.md` : what Pantheon is and what it cannot yet do.
 - `CONTRIBUTING.md` : setup, building, testing, branching, review, and pull
   requests. It is the authority on all of those; do not duplicate it here.
 - `BACKLOG.md` : the reasoning behind the open work. Entries record what was

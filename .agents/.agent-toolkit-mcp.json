@@ -1,6 +1,6 @@
 {
   "entries": {
-    "claude|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json|context7": {
+    "claude|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.mcp.json|context7": {
       "entry": {
         "headers": {
           "Authorization": "Bearer ${CONTEXT7_API_KEY}"
@@ -12,9 +12,9 @@
       "host": "claude",
       "scope": "project",
       "server": "context7",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/.mcp.json"
     },
-    "claude|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json|github": {
+    "claude|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.mcp.json|github": {
       "entry": {
         "headers": {
           "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
@@ -26,9 +26,9 @@
       "host": "claude",
       "scope": "project",
       "server": "github",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/.mcp.json"
     },
-    "codex|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml|context7": {
+    "codex|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml|context7": {
       "entry": {
         "bearer_token_env_var": "CONTEXT7_API_KEY",
         "enabled": true,
@@ -42,9 +42,9 @@
       "host": "codex",
       "scope": "project",
       "server": "context7",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml"
     },
-    "codex|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml|github": {
+    "codex|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml|github": {
       "entry": {
         "bearer_token_env_var": "GITHUB_PERSONAL_ACCESS_TOKEN",
         "enabled": true,
@@ -54,9 +54,9 @@
       "host": "codex",
       "scope": "project",
       "server": "github",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml"
     },
-    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json|context7": {
+    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/opencode.json|context7": {
       "entry": {
         "enabled": true,
         "headers": {
@@ -69,9 +69,9 @@
       "host": "opencode",
       "scope": "project",
       "server": "context7",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/opencode.json"
     },
-    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json|github": {
+    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/opencode.json|github": {
       "entry": {
         "enabled": true,
         "headers": {
@@ -84,7 +84,7 @@
       "host": "opencode",
       "scope": "project",
       "server": "github",
-      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json"
+      "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/opencode.json"
     }
   },
   "schema_version": 1

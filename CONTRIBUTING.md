@@ -1,12 +1,12 @@
-# Contributing to Mosaic
+# Contributing to Pantheon
 
-Mosaic is a working prototype (see the README's "Known gaps" section), so
+Pantheon is a working prototype (see the README's "Known gaps" section), so
 expect some rough edges. Contributions, bug reports, and design feedback are
 welcome.
 
 ## Prerequisites
 
-Mosaic is Windows-only; the terminal layer is ConPTY. You will need:
+Pantheon is Windows-only; the terminal layer is ConPTY. You will need:
 
 - [pnpm](https://pnpm.io)
 - The [Rust toolchain](https://rustup.rs) (stable)
@@ -25,7 +25,7 @@ pnpm install
 .\build.cmd
 ```
 
-Artifacts land in `src-tauri/target/release/` (`mosaic.exe` and the NSIS
+Artifacts land in `src-tauri/target/release/` (`pantheon.exe` and the NSIS
 installer under `bundle/nsis/`).
 
 ## Testing
@@ -53,7 +53,7 @@ commits scoped to one change so the history stays readable.
 
 ## Review before you commit
 
-If a change was made with the help of a Mosaic session, or any AI coding
+If a change was made with the help of a Pantheon session, or any AI coding
 agent, it needs a second pair of eyes from a different model before it lands,
 not a rubber stamp from the model that wrote it. The workflow:
 
@@ -61,7 +61,7 @@ not a rubber stamp from the model that wrote it. The workflow:
    working: tests passing, `pnpm build` clean, no unrelated files touched.
 2. **Route to a different-model reviewer.** Hand the diff to a session
    running a different model than the implementer, for example Claude Code
-   implemented and Codex or opencode reviews. If Mosaic is not available, any
+   implemented and Codex or opencode reviews. If Pantheon is not available, any
    second reviewer works, but the model actually has to differ, not just be a
    fresh prompt to the same one.
 3. **Reviewer reports findings.** The reviewer reads the diff against the

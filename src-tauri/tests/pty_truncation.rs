@@ -65,7 +65,7 @@ fn read_line_through_conpty(payload: &[u8], delay_reader: bool) -> (bool, Vec<u8
     });
 
     // ConPTY asks the terminal emulator for the cursor position during startup.
-    // The real Mosaic terminal answers this; this headless test must do so too.
+    // The real Pantheon terminal answers this; this headless test must do so too.
     thread::sleep(Duration::from_millis(50));
     writer.write_all(b"\x1b[1;1R").expect("answer cursor query");
     let mut input = payload.to_vec();

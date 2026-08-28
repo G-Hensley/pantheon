@@ -3,7 +3,7 @@
 Ideas are not commitments. Promote an item only once its trigger, ownership,
 security boundary, and validation method are understood.
 
-This file holds capabilities Mosaic does not have yet. Findings from
+This file holds capabilities Pantheon does not have yet. Findings from
 point-in-time reviews of existing code go to `IMPROVEMENT-AUDIT.md`, which is
 deliberately untracked (see `.gitignore`), so a fresh clone will not have it.
 
@@ -60,7 +60,7 @@ Measured both ways against a deliberately cold 20 GB model, which needs about
 
 | Path | Ollama request | Outcome |
 |---|---:|---|
-| Mosaic pane (interactive TUI) | 30.4s, 30.5s | **cancelled both times** |
+| Pantheon pane (interactive TUI) | 30.4s, 30.5s | **cancelled both times** |
 | `opencode run` (headless) | 33.2s, 32.7s | **completed both times** |
 
 Two headless runs comfortably exceeded the limit that kills every pane request.
@@ -73,7 +73,7 @@ shows why: the fetch wrapper collects abort signals and calls
 upstream (`t.signal`) before `timeout` / `headerTimeout` / `chunkTimeout` are
 appended, so a longer value can never win.
 
-So Mosaic has an architectural option worth weighing. It currently drives agents
+So Pantheon has an architectural option worth weighing. It currently drives agents
 by typing into an interactive CLI, which is what makes dispatch fragile in two
 separate ways already documented here: the 1024-byte head truncation and this
 30s ceiling. Running non-interactive work through `opencode run -m
@@ -82,7 +82,7 @@ usable, since laguna answers in 1.1s warm and only ever fails on a cold start it
 is not allowed to finish.
 
 The tradeoff is real and should not be waved away: the interactive pane is the
-product. A user watching an agent work in a terminal is the point of Mosaic, and
+product. A user watching an agent work in a terminal is the point of Pantheon, and
 a headless dispatch is invisible. A hybrid, where interactive panes stay as they
 are and dispatched tasks run headlessly against the same session, is the shape
 worth exploring, not a wholesale change.
@@ -146,7 +146,7 @@ never arrive.
 
 Observed directly: three OpenCode panes, only two `opencode` processes alive,
 and the third pane's task stuck at "overdue" with `complete_task` never called.
-Nothing in Mosaic noticed the process was gone.
+Nothing in Pantheon noticed the process was gone.
 
 That pane was running **Laguna XS 2.1 locally through Ollama**, not a hosted
 model, and the operator reports local models stopping like this is recurring
@@ -164,7 +164,7 @@ Two consequences worth separating:
   are. Cost is not the only axis; delivery probability is one too.
 
 "overdue" is honest about not knowing, which is better than a false "timeout".
-But Mosaic does know something it is not using: it spawned the process and can
+But Pantheon does know something it is not using: it spawned the process and can
 see whether it is still running.
 
 - Mark a task `abandoned` when its target session's process is gone. That is a
@@ -262,7 +262,7 @@ returns `Ok` and every byte arrives. Supporting reads: portable-pty's
 its own, and `filedescriptor` calls synchronous `WriteFile` and reports the real
 byte count, which `write_all` loops on.
 
-So Mosaic's one-call write, portable-pty's writer, the ConPTY input buffer, and
+So Pantheon's one-call write, portable-pty's writer, the ConPTY input buffer, and
 a child that is not yet reading are all eliminated as causes.
 
 **What is left** is the target application's own terminal input handling. The
@@ -376,7 +376,7 @@ review had in fact completed. The only reason it was ever read is that the user
 asked why nothing was waiting on it.
 
 The workaround that does work, and what it shows: the task store is append-only
-JSONL at `<project>/.mosaic/context/brain.jsonl`, so a shell loop can poll the
+JSONL at `<project>/.pantheon/context/brain.jsonl`, so a shell loop can poll the
 last record for a task id until its status leaves `pending`, and the harness
 notifies on exit. That works, and needing to reach around the MCP server into
 its own storage to find out whether a task finished is the argument for putting
@@ -457,7 +457,7 @@ optional: `mcp.rs`, `worktree.rs`, session identity, dispatch, anything in
 checklist, including "Reviewer: model and session, different from the
 implementer".
 
-**Nothing in Mosaic implements any of it.** `complete_task` takes a result
+**Nothing in Pantheon implements any of it.** `complete_task` takes a result
 string, writes `status = "done"`, and that is the end of the task's life. There
 is no reviewer field, no review state between pending and done, and no way for
 the conductor to ask "who checked this?" because the answer was never recorded.
@@ -503,12 +503,12 @@ guesses have been wrong in practice: broad web research kept going to OpenCode
 sessions on a free-tier model, which is close to the worst available match for
 it.
 
-**Mosaic does not merely omit the model, it never learns it.** `SESSION_TYPES`
+**Pantheon does not merely omit the model, it never learns it.** `SESSION_TYPES`
 in `src/lib/ipc.ts` launches each agent CLI bare — `{ id: "opencode", program:
 "opencode", args: [] }`, and the same for `claude` and `codex`. No model flag is
-passed, so the model is whatever that CLI's own config selects, and Mosaic has
+passed, so the model is whatever that CLI's own config selects, and Pantheon has
 no channel to find out. Any fix here starts by *acquiring* the fact, not by
-plumbing one Mosaic already holds.
+plumbing one Pantheon already holds.
 
 Two places currently overstate what is known, which is worth correcting whether
 or not the larger item is built. The `list_sessions` tool description advertises
@@ -537,7 +537,7 @@ only "who is here".
 
 Open questions before building:
 
-- **Do not vendor a copy.** A snapshot of `MODEL-GUIDE.md` inside Mosaic is
+- **Do not vendor a copy.** A snapshot of `MODEL-GUIDE.md` inside Pantheon is
   stale the day it is written, and the guide already carries `last_verified`
   and a 14-day cadence. Read it from a configured path, or import it through
   the agent-toolkit catalog, rather than duplicating it.
@@ -572,7 +572,7 @@ This is a privilege escalation and needs treating as such:
 ## Guardrail: OpenCode sessions must stay on free OpenRouter models
 
 OpenRouter is configured with a real account, so an OpenCode pane can select a
-paid model and silently spend money. Nothing in Mosaic currently constrains
+paid model and silently spend money. Nothing in Pantheon currently constrains
 this, and the conductor cannot see what a pane costs.
 
 The naive implementation is wrong in a specific way worth writing down:
@@ -602,10 +602,10 @@ Also account for:
   work over private code or credentials to this tier without checking the
   selected provider's data policy.
 
-Enforcement point is undecided and matters: Mosaic can only realistically
+Enforcement point is undecided and matters: Pantheon can only realistically
 constrain what it launches, so this may belong in OpenCode's own config
-(generated from `.agents/`, per the toolkit's sync) rather than in Mosaic. If
-Mosaic enforces it, it needs a way to observe the model actually in use, which
+(generated from `.agents/`, per the toolkit's sync) rather than in Pantheon. If
+Pantheon enforces it, it needs a way to observe the model actually in use, which
 it does not have today.
 
 **Partly done, 2026-08-11.** `~/.config/opencode/opencode.json` now pins both
@@ -652,12 +652,12 @@ may stay silent while it buffers input, and an output gap may mean "has not
 started yet" rather than "has finished". Once a prompt is submitted, the same
 silence can be a model thinking, a tool waiting for approval, a cold local model,
 or a dead process. Naming any of those `blocked` from timing alone produces a
-confident state Mosaic did not observe.
+confident state Pantheon did not observe.
 
 That does not make the scaling problem less real. It separates two pieces that
 should not be coupled:
 
-- The task surface can show every recorded state Mosaic actually knows today,
+- The task surface can show every recorded state Pantheon actually knows today,
   grouped into open, awaiting review, and terminal work without inventing a
   diagnosis.
 - A future blocked state needs an explicit signal from the agent or tool
@@ -704,7 +704,7 @@ reasoning is not exposed through MCP, terminal scrollback belonged to the old
 frontend and PTY, and in-flight requests cannot cross a server restart. A
 restored pane is therefore a fresh agent wearing an old pane id. UI and
 documentation should say "restore pane layout" or "reopen panes", never imply
-that Mosaic resumed an agent's context.
+that Pantheon resumed an agent's context.
 
 Worktree identity is the exception because it is durable state outside the
 process. The frontend records the worktree reported by the backend so the next
@@ -716,10 +716,10 @@ reattached. It may contain uncommitted agent work. Restore must refuse or surfac
 that condition, never silently create a replacement that strands the old work,
 and never delete a dirty worktree as cleanup.
 
-**The proposed project `.mosaic/layout.json` is not the path forward.** It was a
+**The proposed project `.pantheon/layout.json` is not the path forward.** It was a
 design for a system that did not yet restore panes. The implementation now owns
 roster and layout state end to end in the frontend:
-`src/lib/panes.ts:105-120` reads and writes `mosaic.panes`, while
+`src/lib/panes.ts:105-120` reads and writes `pantheon.panes`, while
 `src/App.tsx:62-95` reads layout settings and the selected project from
 `localStorage`. Adding a second layout file now would create two authorities for
 the same pane order, brain assignment, isolation flag, and layout settings.
@@ -727,7 +727,7 @@ Conflict-resolution rules between them would be complexity caused by the new
 store, not by the product.
 
 The tradeoff that motivated project-scoped storage is still real.
-`localStorage` is machine-local and `mosaic.panes` is one global key
+`localStorage` is machine-local and `pantheon.panes` is one global key
 (`src/lib/panes.ts:17`). A roster created for one repository can therefore be
 read after the selected project changes, even though its brain assignments and
 worktree references belong to the earlier repository. Project movement and
@@ -744,7 +744,7 @@ to `null` at `src/App.tsx:97-100`. The Tauri command at
 `src-tauri/src/mcp.rs:551-576` keeps it in memory. Reopened panes retain their
 ids and brains, but the user must promote the conductor again. Persisting the id
 is truthful because it restores a role assignment, not agent state. If that
-pane fails to restore, Mosaic must clear the saved conductor and say why rather
+pane fails to restore, Pantheon must clear the saved conductor and say why rather
 than transferring authority to another pane.
 
 **The shape to aim for.** Keep the existing frontend-owned restore path, key
@@ -767,7 +767,7 @@ Open questions worth settling before building:
   explicit prompt gives the user a way to start fresh when a saved roster is
   large or stale.
 - **Conductor failure.** The role must be restored only to the recorded pane.
-  A missing or failed pane clears it; Mosaic must never silently promote a
+  A missing or failed pane clears it; Pantheon must never silently promote a
   substitute.
 - **What layout belongs to the project.** Pane membership and worktrees clearly
   do. Window height and column preference may be user and machine preferences

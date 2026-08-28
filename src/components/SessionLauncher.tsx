@@ -5,6 +5,7 @@ import {
   SESSION_TYPES,
   type SessionType,
 } from "../lib/ipc";
+import { readStored, writeStored } from "../lib/storage";
 
 // ⌘K-style launcher: pick which agent/CLI to open in a new pane. (Atelier's
 // command-palette feel; keyboard-first with Escape to dismiss.)
@@ -21,7 +22,7 @@ export function SessionLauncher({
   // turn it off, and that choice is remembered.
   const [isolate, setIsolate] = useState(() => {
     try {
-      return localStorage.getItem("mosaic.isolate") !== "0";
+      return readStored("isolate") !== "0";
     } catch {
       return true;
     }
@@ -62,7 +63,7 @@ export function SessionLauncher({
 
   useEffect(() => {
     try {
-      localStorage.setItem("mosaic.isolate", isolate ? "1" : "0");
+      writeStored("isolate", isolate ? "1" : "0");
     } catch {
       /* ignore */
     }

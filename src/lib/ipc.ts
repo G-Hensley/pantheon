@@ -93,7 +93,7 @@ export const setAgentBrain = (name: string, brain: string): Promise<void> =>
   invoke("set_agent_brain", { name, brain });
 
 // Tell the backend which project is active, so the shared brain writes its
-// markdown into that project's .mosaic/context instead of a global pile.
+// markdown into that project's .pantheon/context instead of a global pile.
 export const setProject = (path: string | null): Promise<void> =>
   invoke("set_project", { path });
 
