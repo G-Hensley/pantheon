@@ -556,9 +556,11 @@ fn compatible_app_data_dir(root: PathBuf) -> PathBuf {
     }
 }
 
-/// Move a pre-rename data directory when possible, and keep using it when the
-/// filesystem will not permit the move. Existing sessions and context are more
-/// important than making the new path appear immediately.
+/// Move a pre-rename project context directory when possible, and keep using
+/// the legacy path when the filesystem will not permit the move. If both
+/// identities exist, prefer the legacy one so existing decisions never silently
+/// disappear: preserved sessions and context matter more than making the new
+/// path appear immediately.
 fn migrate_legacy_dir(current: PathBuf, legacy: PathBuf) -> PathBuf {
     if !legacy.exists() {
         return current;
