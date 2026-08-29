@@ -2149,25 +2149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosaic"
-version = "0.1.0"
-dependencies = [
- "axum",
- "portable-pty",
- "rmcp",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "muda"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2519,6 +2500,25 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "pantheon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "portable-pty",
+ "rmcp",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

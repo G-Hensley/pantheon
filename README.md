@@ -1,4 +1,4 @@
-# Mosaic
+# Pantheon
 
 **A desktop cockpit for running several AI coding agents side by side, coordinated instead of siloed.**
 
@@ -9,7 +9,10 @@ work out to the rest and collect the results.
 
 **Status:** working prototype. The session engine, shared context, worktree
 isolation, and conductor all function, but see [Known gaps and limitations](#known-gaps-and-limitations)
-before relying on it. Windows only: the terminal layer is ConPTY.
+before relying on it. Runs on Windows and Linux: the terminal layer is
+`portable-pty`, which is ConPTY on Windows and a Unix PTY elsewhere. macOS is
+unexercised rather than ruled out; nothing in the code targets Windows or Linux
+specifically, but nobody has run it there.
 
 ## Why it exists
 
@@ -17,15 +20,15 @@ Running Claude Code, Codex, and opencode in parallel panes is easy. Getting
 them to act like a team instead of three strangers duplicating each other's
 work is the actual problem: nothing tells one agent what another just
 decided, and nothing lets a person hand out tasks without babysitting every
-pane. Mosaic answers both. A shared MCP server lets agents record decisions
+pane. Pantheon answers both. A shared MCP server lets agents record decisions
 and read each other's, git worktree isolation lets them edit the same repo
 without clashing, and a conductor role lets one pane fan tasks out to the
 others and collect what comes back.
 
 ## Capabilities
 
-- Runs Claude Code, Codex, opencode, or a plain PowerShell in parallel panes,
-  each on its own pseudo-terminal.
+- Runs Claude Code, Codex, opencode, or a plain shell (PowerShell on Windows,
+  bash on Linux) in parallel panes, each on its own pseudo-terminal.
 - Connects agents to a **shared brain**, an in-process MCP server they use to
   record decisions and facts, broadcast, and read what the others have
   decided.
@@ -38,7 +41,7 @@ others and collect what comes back.
 
 ## 60-second demo
 
-1. Open Mosaic and pick the git repo you want agents working in.
+1. Open Pantheon and pick the git repo you want agents working in.
 2. Press **Ctrl+Shift+K** and launch two or three sessions (a mix of Claude
    Code, Codex, or opencode). Isolate is on by default, so each gets its own
    worktree and branch.
@@ -53,36 +56,52 @@ others and collect what comes back.
 
 ## Quick start
 
-Install `Mosaic_0.1.0_x64-setup.exe` and launch from the Start Menu, or run
-from a checkout:
+On Windows, install `Pantheon_0.1.0_x64-setup.exe` and launch from the Start
+Menu, or run from a checkout:
 
 ```powershell
 pnpm install
 .\dev.cmd        # sets up the MSVC environment, then `pnpm tauri dev`
 ```
 
-To build the installer:
+On Linux, run from a checkout:
 
-```powershell
-.\build.cmd
+```bash
+pnpm install
+./dev.sh         # thin wrapper for `pnpm tauri dev`
 ```
 
-Artifacts land in `src-tauri/target/release/`:
+To build and register Pantheon in the Linux app grid:
+
+```bash
+./install-desktop.sh
+```
+
+When upgrading from Mosaic, the installer safely adopts the latest packaged
+UI state, retires the old launcher, and preserves legacy worktree and context
+data. Quit Mosaic or Pantheon before running it so WebKit can close its state
+database cleanly.
+
+To build the bundles, use `.\build.cmd` on Windows or `./build.sh` on Linux.
+Artifacts land under `src-tauri/target/release/`:
 
 | Path | What it is |
 |---|---|
-| `mosaic.exe` | Standalone, no install needed |
-| `bundle/nsis/Mosaic_0.1.0_x64-setup.exe` | Installer with a Start Menu entry |
+| `pantheon.exe` | Windows standalone, no install needed |
+| `bundle/nsis/Pantheon_0.1.0_x64-setup.exe` | Windows installer with a Start Menu entry |
+| `pantheon` | Linux standalone |
+| `bundle/deb/`, `bundle/appimage/` | Linux packages |
 
-Requires the Visual Studio 2022 Build Tools (both scripts call `vcvars64.bat`),
-Rust, and pnpm. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup and
-test workflow.
+Requires Rust and pnpm on both platforms, plus the Visual Studio 2022 Build
+Tools on Windows (both `.cmd` scripts call `vcvars64.bat`) or the GTK and
+WebKitGTK development packages on Linux. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full setup and test workflow.
 
 ## Usage
 
 1. **Pick project** in the title bar: the git repo agents work in. It is
    remembered between runs, and the shared brain writes its notes to that
-   project's `.mosaic/context/`.
+   project's `.pantheon/context/`.
 2. **Ctrl+Shift+K** opens the launcher. Pick a session type. *Isolate* is on
    by default, giving that session its own worktree and branch.
 3. **Drag a pane header** onto another pane, or onto a brain in the sidebar,
@@ -114,12 +133,12 @@ launch through arguments and environment only:
 | Session | Mechanism |
 |---|---|
 | Claude Code | `--mcp-config <per-session file>` (additive; your other MCP servers still load) |
-| Codex | `-c mcp_servers.mosaic.url=…` |
+| Codex | `-c mcp_servers.pantheon.url=…` |
 | opencode | `OPENCODE_CONFIG=<per-session file>` (merged over your global config) |
 | Shell | none |
 
-Mosaic never writes to your global agent config. Because a port is only ever
-handed to one session, Mosaic knows which agent is calling from the connection
+Pantheon never writes to your global agent config. Because a port is only ever
+handed to one session, Pantheon knows which agent is calling from the connection
 alone: the agent never declares a name and cannot claim another's.
 
 Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
@@ -130,12 +149,12 @@ only), `complete_task`, `get_task_result`, `wait_for_tasks`, `ask_conductor`,
 ## How agents are briefed
 
 Tools alone don't change behaviour. An agent that isn't told the other panes
-are usable capacity will quietly do everything itself. Mosaic briefs agents on
+are usable capacity will quietly do everything itself. Pantheon briefs agents on
 two channels, because they answer different questions:
 
 | Channel | Delivered | Says |
 |---|---|---|
-| MCP server instructions | Once, on connect | You are in Mosaic, here is the shared brain, here is what the conductor role means if you're given it |
+| MCP server instructions | Once, on connect | You are in Pantheon, here is the shared brain, here is what the conductor role means if you're given it |
 | Composer prefill | On promotion to conductor | You are the conductor *now*, here are the live sessions by name and model |
 
 The prefill is typed into the pane's input but **not sent**. Add your first
@@ -209,7 +228,7 @@ exchange is kept on the task, so an answer given once is not asked again.
 
 ## Known gaps and limitations
 
-- **Isolated work has no merge path.** A session's branch (`mosaic/<id>-<uid>`)
+- **Isolated work has no merge path.** A session's branch (`pantheon/<id>-<uid>`)
   survives when it has commits, but the UI never shows the branch name or a
   diff.
 - **Dispatch assumes an idle target.** Instructions are typed into the
@@ -226,28 +245,30 @@ exchange is kept on the task, so an answer given once is not asked again.
 - **Dirty worktree recovery is manual.** Closing a session refuses to remove
   its dirty worktree, preserving uncommitted edits on disk, but the UI does
   not yet show the preserved path or offer a recovery workflow.
-- The markdown mirror under `.mosaic/context/` is written for humans to read
+- The markdown mirror under `.pantheon/context/` is written for humans to read
   and is never read back. The shared context itself does persist: entries,
   sessions, and tasks are rehydrated from `brain.jsonl` when the app opens a
   project.
 - Fit layout is intended for at most 6 panes; scroll layout remains usable
   beyond that.
-- The frontend has no tests and no test tooling; `package.json` has no test
-  script. The Rust side is covered by unit tests in `lib.rs`, `mcp.rs`, and
-  `worktree.rs`. `src-tauri/tests/pty_truncation.rs` is a ConPTY measurement
-  harness rather than a regression test, ignored by default and run
+- Frontend coverage is thin: `pnpm test` runs Vitest over a small set of
+  cases, well short of the UI as a whole. The Rust side is covered by unit
+  tests in `lib.rs`, `mcp.rs`, and `worktree.rs`.
+  `src-tauri/tests/pty_truncation.rs` is a ConPTY measurement harness rather
+  than a regression test, is Windows-only, and is ignored by default and run
   deliberately (see its header for the command).
 - Single-user, single-machine threat model. See [SECURITY.md](SECURITY.md)
-  for what that means in practice before pointing Mosaic at anything
+  for what that means in practice before pointing Pantheon at anything
   sensitive.
 
 ## Verification
 
-```powershell
+```bash
 cd src-tauri
 cargo test        # Rust unit tests: PTY engine, shared brain, worktree isolation
 cd ..
-pnpm build         # tsc in strict mode, then the Vite production build
+pnpm build        # tsc in strict mode, then the Vite production build
+pnpm test         # Vitest frontend tests
 ```
 
 CI runs both on every pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)),

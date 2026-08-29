@@ -198,7 +198,7 @@ export function TerminalPane({
     ro.observe(elRef.current!);
 
     if (isolate) {
-      term.write("\x1b[38;5;245m[mosaic] creating an isolated git worktree…\x1b[0m\r\n");
+      term.write("\x1b[38;5;245m[pantheon] creating an isolated git worktree…\x1b[0m\r\n");
     }
     const start = (withIsolation: boolean) => {
       setIsolationError(null);

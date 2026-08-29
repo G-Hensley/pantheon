@@ -1,4 +1,4 @@
-// Mosaic — multi-session PTY engine.
+// Pantheon — multi-session PTY engine.
 //
 // Each live agent runs on its own pseudo-terminal (ConPTY). Sessions are keyed
 // by a client-supplied id so the frontend can address a pane (write/resize/kill)
@@ -223,12 +223,12 @@ pub struct SessionManager {
 fn report_worktree_cleanup(worktree: &worktree::Worktree) {
     match worktree::remove(worktree) {
         Ok(worktree::RemoveOutcome::RefusedDirty) => eprintln!(
-            "[mosaic] preserved dirty worktree at {}",
+            "[pantheon] preserved dirty worktree at {}",
             worktree.path.display()
         ),
         Ok(_) => {}
         Err(error) => eprintln!(
-            "[mosaic] worktree cleanup failed for {}: {error}",
+            "[pantheon] worktree cleanup failed for {}: {error}",
             worktree.path.display()
         ),
     }
@@ -285,7 +285,7 @@ impl Drop for SpawnRollback {
             return;
         }
         eprintln!(
-            "[mosaic] spawn failed for {}, rolling back",
+            "[pantheon] spawn failed for {}, rolling back",
             self.session_id
         );
         if let Some(server) = self.server.take() {
@@ -444,9 +444,12 @@ impl SessionManager {
     }
 }
 
-/// Decide how to launch `program` (see the M1 note): real shells launch directly;
-/// everything else (claude/codex/opencode `.cmd` shims) is routed through
-/// `cmd.exe /c <bare-name>` so PATH — not our quoting — resolves it.
+/// Decide how to launch `program` (see the M1 note). On Windows real shells
+/// launch directly, and everything else (claude/codex/opencode `.cmd` shims) is
+/// routed through `cmd.exe /c <bare-name>` so PATH — not our quoting — resolves
+/// it. On Unix there are no shims: the agent CLIs are real executables that
+/// `execvp` resolves on PATH, so everything launches directly and a wrapper
+/// would only add a shell to misquote through.
 fn build_command(
     program: &str,
     args: &[String],
@@ -455,10 +458,10 @@ fn build_command(
 ) -> CommandBuilder {
     let is_native_shell = matches!(
         program.to_ascii_lowercase().trim_end_matches(".exe"),
-        "powershell" | "pwsh" | "cmd" | "bash" | "wsl"
+        "powershell" | "pwsh" | "cmd" | "bash" | "sh" | "zsh" | "fish" | "wsl"
     );
 
-    let mut cmd = if is_native_shell {
+    let mut cmd = if is_native_shell || !cfg!(windows) {
         let mut c = CommandBuilder::new(program);
         for a in args {
             c.arg(a);
@@ -482,6 +485,21 @@ fn build_command(
     for (k, v) in std::env::vars() {
         cmd.env(k, v);
     }
+
+    // Pantheon is the terminal emulator here, so Pantheon declares the terminal
+    // type. portable-pty sets none of its own, and the inherited value is
+    // whatever launched the app: nothing at all from the desktop entry (which
+    // runs `bash -lc`, a non-interactive shell that never sets TERM), or the
+    // host terminal's own type when launched from a shell. Both are wrong.
+    //
+    // An absent TERM is the damaging case. A CLI on a PTY sees isTTY, then
+    // reads TERM to decide how much color it may emit, and with TERM unset the
+    // answer is none: Claude Code renders entirely in the default foreground,
+    // its status icon included. `xterm-256color` plus COLORTERM is what
+    // xterm.js actually implements, so it is what the pane advertises.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
     // Applied after the inherited environment so per-session wiring wins.
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -489,17 +507,85 @@ fn build_command(
     cmd
 }
 
-/// Root for everything Mosaic stores per machine: worktrees, per-session agent
+/// Root for everything Pantheon stores per machine: worktrees, per-session agent
 /// config, and the fallback context dir.
 ///
 /// Keyed by bundle identifier rather than product name on purpose. A per-user
-/// install puts the app itself in `%LOCALAPPDATA%\Mosaic`, and Windows paths are
-/// case-insensitive — so a plain "mosaic" here would mix runtime data in with
+/// install puts the app itself in `%LOCALAPPDATA%\Pantheon`, and Windows paths are
+/// case-insensitive — so a plain "pantheon" here would mix runtime data in with
 /// the installed binaries, and an uninstall could take an agent's worktree with it.
+/// The identifier is kept on Unix too, so a repo cloned on both platforms keeps
+/// one layout rather than two that drift.
 pub fn app_data_dir() -> PathBuf {
-    let root = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    PathBuf::from(root).join("com.gavinhensley.mosaic")
+    let root = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA").ok()
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| format!("{h}/.local/share"))
+            })
+    };
+    let root = root
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+    compatible_app_data_dir(PathBuf::from(root))
+}
+
+/// Keep the pre-rename machine directory when it exists. Worktree registrations
+/// and saved pane records contain absolute paths beneath this root, so moving it
+/// would make preserved work unreachable even if every byte moved successfully.
+fn compatible_app_data_dir(root: PathBuf) -> PathBuf {
+    let current = root.join("com.gavinhensley.pantheon");
+    let legacy = root.join("com.gavinhensley.mosaic");
+    if legacy.exists() {
+        if current.exists() {
+            eprintln!(
+                "[pantheon] both {} and {} exist; using the legacy directory to preserve worktree paths",
+                legacy.display(),
+                current.display()
+            );
+        }
+        legacy
+    } else {
+        current
+    }
+}
+
+/// Move a pre-rename data directory when possible, and keep using it when the
+/// filesystem will not permit the move. Existing sessions and context are more
+/// important than making the new path appear immediately.
+fn migrate_legacy_dir(current: PathBuf, legacy: PathBuf) -> PathBuf {
+    if !legacy.exists() {
+        return current;
+    }
+    if current.exists() {
+        eprintln!(
+            "[pantheon] both {} and {} exist; using the legacy directory so existing context stays visible",
+            legacy.display(),
+            current.display()
+        );
+        return legacy;
+    }
+
+    if let Some(parent) = current.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(&legacy, &current) {
+        Ok(()) => current,
+        Err(error) => {
+            eprintln!(
+                "[pantheon] could not migrate {} to {}: {error}; using the legacy path",
+                legacy.display(),
+                current.display()
+            );
+            legacy
+        }
+    }
 }
 
 /// Per-session scratch dir for the config files we hand an agent CLI at launch.
@@ -539,8 +625,8 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// arguments and environment — we never touch the user's global config.
 ///
 /// That matters twice over. It keeps identity honest (a session's port is only
-/// ever registered to that session, so Mosaic knows the caller from the
-/// connection alone), and it leaves no stale `mosaic` server behind pointing at
+/// ever registered to that session, so Pantheon knows the caller from the
+/// connection alone), and it leaves no stale `pantheon` server behind pointing at
 /// a random port that died with the app.
 ///
 /// Config is written to a file rather than passed inline because these commands
@@ -554,7 +640,7 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// command line. Command lines are readable by any local process; environments
 /// are not, and putting the token in an argument would hand it to exactly the
 /// observer the token exists to stop.
-const CODEX_TOKEN_ENV: &str = "MOSAIC_MCP_TOKEN";
+const CODEX_TOKEN_ENV: &str = "PANTHEON_MCP_TOKEN";
 
 fn agent_mcp_wiring(
     program: &str,
@@ -569,7 +655,7 @@ fn agent_mcp_wiring(
 
     match prog {
         // Additive on purpose: `--strict-mcp-config` would suppress every other
-        // MCP server the user has configured, so a Mosaic pane would silently
+        // MCP server the user has configured, so a Pantheon pane would silently
         // lose the rest of their toolkit.
         //
         // `--mcp-config` is VARIADIC — it keeps eating following arguments as
@@ -582,7 +668,7 @@ fn agent_mcp_wiring(
                 None => String::new(),
             };
             let body = format!(
-                r#"{{"mcpServers":{{"mosaic":{{"type":"http","url":"{url}"{headers}}}}}}}"#
+                r#"{{"mcpServers":{{"pantheon":{{"type":"http","url":"{url}"{headers}}}}}}}"#
             );
             match std::fs::write(&path, body) {
                 Ok(_) => (
@@ -593,7 +679,7 @@ fn agent_mcp_wiring(
                     vec![],
                 ),
                 Err(e) => {
-                    eprintln!("[mosaic] claude mcp config write failed: {e}");
+                    eprintln!("[pantheon] claude mcp config write failed: {e}");
                     (vec![], vec![])
                 }
             }
@@ -601,12 +687,12 @@ fn agent_mcp_wiring(
         // A bare value fails TOML parsing, at which point Codex documents that it
         // falls back to the raw string — which sidesteps nested quoting.
         "codex" => {
-            let mut args = vec!["-c".to_string(), format!("mcp_servers.mosaic.url={url}")];
+            let mut args = vec!["-c".to_string(), format!("mcp_servers.pantheon.url={url}")];
             let mut env = vec![];
             if let Some(t) = token {
                 args.push("-c".to_string());
                 args.push(format!(
-                    "mcp_servers.mosaic.bearer_token_env_var={CODEX_TOKEN_ENV}"
+                    "mcp_servers.pantheon.bearer_token_env_var={CODEX_TOKEN_ENV}"
                 ));
                 env.push((CODEX_TOKEN_ENV.to_string(), t.to_string()));
             }
@@ -620,7 +706,7 @@ fn agent_mcp_wiring(
                 None => String::new(),
             };
             let body = format!(
-                r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"mosaic":{{"type":"remote","url":"{url}"{headers}}}}}}}"#
+                r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"pantheon":{{"type":"remote","url":"{url}"{headers}}}}}}}"#
             );
             match std::fs::write(&path, body) {
                 Ok(_) => (
@@ -631,7 +717,7 @@ fn agent_mcp_wiring(
                     )],
                 ),
                 Err(e) => {
-                    eprintln!("[mosaic] opencode config write failed: {e}");
+                    eprintln!("[pantheon] opencode config write failed: {e}");
                     (vec![], vec![])
                 }
             }
@@ -823,7 +909,7 @@ where
             worktree::Reattach::Unusable(why) => {
                 return Err(format!(
                     "the worktree {session_id} was working in is still on disk at {} but {why}. \
-                     Mosaic will not create a second one, because the first may hold uncommitted \
+                     Pantheon will not create a second one, because the first may hold uncommitted \
                      work — recover or delete it, then start the session again",
                     saved.path
                 ))
@@ -932,7 +1018,7 @@ async fn spawn_session(
             // self-declared-identity path audit finding #6 also covers, and it is
             // still open.
             Err(e) => {
-                eprintln!("[mosaic] session endpoint failed, using shared: {e}");
+                eprintln!("[pantheon] session endpoint failed, using shared: {e}");
                 agent_mcp_wiring(&program, &session_id, &mcp.url, None)
             }
         };
@@ -976,9 +1062,9 @@ async fn spawn_session(
         }
 
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
-        // The agent's Mosaic name = its session id, so the collab skill can
+        // The agent's Pantheon name = its session id, so the collab skill can
         // self-identify and the app can map it to a brain.
-        cmd.env("MOSAIC_SESSION", &session_id);
+        cmd.env("PANTHEON_SESSION", &session_id);
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave); // so the reader hits EOF when the child exits
 
@@ -1116,7 +1202,10 @@ fn default_context_dir() -> PathBuf {
 #[tauri::command]
 fn set_project(shared: State<'_, Arc<mcp::Shared>>, path: Option<String>) {
     let dir = match path {
-        Some(p) if !p.is_empty() => PathBuf::from(p).join(".mosaic").join("context"),
+        Some(p) if !p.is_empty() => {
+            let root = PathBuf::from(p);
+            migrate_legacy_dir(root.join(".pantheon"), root.join(".mosaic")).join("context")
+        }
         _ => default_context_dir(),
     };
     shared.set_dir(dir);
@@ -1308,13 +1397,82 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_mcp_wiring, choose_worktree, delivery_allowance_ms, is_agent_cli, is_codex,
-        ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
-        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
-        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
-        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
+        delivery_allowance_ms, is_agent_cli, is_codex, migrate_legacy_dir, ready_to_submit,
+        resolve_isolation, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
+        IsolationReason, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS,
+        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
+
+    #[test]
+    fn legacy_data_directory_moves_to_the_pantheon_identity() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join(".mosaic");
+        let current = tmp.path().join(".pantheon");
+        fs::create_dir_all(legacy.join("context")).unwrap();
+        fs::write(legacy.join("context/brain.jsonl"), "remember me").unwrap();
+
+        let chosen = migrate_legacy_dir(current.clone(), legacy.clone());
+
+        assert_eq!(chosen, current);
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read_to_string(chosen.join("context/brain.jsonl")).unwrap(),
+            "remember me"
+        );
+    }
+
+    #[test]
+    fn coexisting_project_directories_keep_legacy_context_visible() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join(".mosaic");
+        let current = tmp.path().join(".pantheon");
+        fs::create_dir_all(legacy.join("context")).unwrap();
+        fs::create_dir_all(current.join("context")).unwrap();
+        fs::write(legacy.join("context/brain.jsonl"), "legacy work").unwrap();
+
+        let chosen = migrate_legacy_dir(current, legacy.clone());
+
+        assert_eq!(chosen, legacy);
+        assert_eq!(
+            fs::read_to_string(chosen.join("context/brain.jsonl")).unwrap(),
+            "legacy work"
+        );
+    }
+
+    #[test]
+    fn existing_machine_data_keeps_its_absolute_worktree_root() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("com.gavinhensley.mosaic");
+        fs::create_dir_all(legacy.join("worktrees/session-1")).unwrap();
+
+        assert_eq!(compatible_app_data_dir(tmp.path().to_path_buf()), legacy);
+    }
+
+    #[test]
+    fn a_machine_carrying_both_identities_still_reads_the_legacy_one() {
+        // What a machine that ran Mosaic and then a Pantheon build actually
+        // looks like. The Pantheon directory exists because Tauri creates it
+        // from the bundle identifier on first launch, which says nothing about
+        // where the worktrees and sessions went.
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("com.gavinhensley.mosaic");
+        fs::create_dir_all(legacy.join("sessions/sess-1")).unwrap();
+        fs::create_dir_all(tmp.path().join("com.gavinhensley.pantheon")).unwrap();
+
+        assert_eq!(compatible_app_data_dir(tmp.path().to_path_buf()), legacy);
+    }
+
+    #[test]
+    fn a_machine_that_never_ran_mosaic_uses_the_pantheon_identity() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(
+            compatible_app_data_dir(tmp.path().to_path_buf()),
+            tmp.path().join("com.gavinhensley.pantheon")
+        );
+    }
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -1461,7 +1619,7 @@ mod tests {
         let saved = worktree::Saved {
             repo: repo.to_string_lossy().to_string(),
             path: orphan.to_string_lossy().to_string(),
-            branch: "mosaic/sess-unusable".to_string(),
+            branch: "pantheon/sess-unusable".to_string(),
             base: wt.base.clone(),
         };
 
@@ -1966,5 +2124,24 @@ mod tests {
             agent_mcp_wiring("codex", "sess-tok-none2", "http://127.0.0.1:1/mcp", None);
         assert!(!args.join(" ").contains("bearer_token_env_var"));
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn panes_advertise_a_color_capable_terminal() {
+        // Without this the desktop entry's environment reaches the agent with
+        // no TERM at all, and a CLI that checks TERM before emitting color
+        // emits none: monochrome output in a pane that renders 24-bit fine.
+        let cmd = build_command("bash", &[], Path::new("."), &[]);
+        assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-256color");
+        assert_eq!(cmd.get_env("COLORTERM").unwrap(), "truecolor");
+    }
+
+    #[test]
+    fn per_session_env_still_overrides_the_terminal_type() {
+        // Per-session wiring is applied last on purpose, so a caller that has a
+        // reason to declare a different terminal is not silently overruled.
+        let extra = vec![("TERM".to_string(), "xterm-kitty".to_string())];
+        let cmd = build_command("bash", &[], Path::new("."), &extra);
+        assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-kitty");
     }
 }

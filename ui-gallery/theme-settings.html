@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mosaic — Appearance settings</title>
+<title>Pantheon — Appearance settings</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -159,7 +159,7 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;tex
   <div class="win">
     <div class="titlebar">
       <div class="dots"><i></i><i></i><i></i></div>
-      <div class="t">mosaic · <b>Settings</b></div>
+      <div class="t">pantheon · <b>Settings</b></div>
       <div class="esc">Esc to close</div>
     </div>
     <div class="sbody">
@@ -198,13 +198,13 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;tex
           </div>
           <div class="astage">
             <div class="cards">
-              <div class="card claude"><div class="ch"><span class="av">C</span><span class="nm">Claude <em>· backend</em></span><span class="br">mosaic/claude-be</span></div><div class="cb term"><span class="p">›</span> design the schema
+              <div class="card claude"><div class="ch"><span class="av">C</span><span class="nm">Claude <em>· backend</em></span><span class="br">pantheon/claude-be</span></div><div class="cb term"><span class="p">›</span> design the schema
 <span class="cor">⏺</span> <span class="code">users(id, email, created_at)</span>
 <span class="ok">⏺ recorded → brain</span></div></div>
-              <div class="card codex"><div class="ch"><span class="av">Cx</span><span class="nm">Codex <em>· frontend</em></span><span class="br">mosaic/codex-fe</span></div><div class="cb term"><span class="p">›</span> build signup form
+              <div class="card codex"><div class="ch"><span class="av">Cx</span><span class="nm">Codex <em>· frontend</em></span><span class="br">pantheon/codex-fe</span></div><div class="cb term"><span class="p">›</span> build signup form
 <span class="ok">⏺</span> fields: email, created_at
 <span class="cmt">// from shared brain</span> <span class="cur" style="color:var(--ok)"></span></div></div>
-              <div class="card oc"><div class="ch"><span class="av">oc</span><span class="nm">opencode <em>· tests</em></span><span class="br">mosaic/oc-tests</span></div><div class="cb term"><span class="p">›</span> vitest signup
+              <div class="card oc"><div class="ch"><span class="av">oc</span><span class="nm">opencode <em>· tests</em></span><span class="br">pantheon/oc-tests</span></div><div class="cb term"><span class="p">›</span> vitest signup
 <span class="ok">✓ 12 passing</span></div></div>
               <div class="card cond"><div class="ch"><span class="av">◆</span><span class="nm">Conductor <em>· opus</em></span><span class="br">autonomous</span></div><div class="cb term"><span class="am">◆</span> next: wire form → API
 <span class="dim">budget 3/8 · Stop anytime</span></div></div>
@@ -244,8 +244,8 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;tex
   var agentsToggle=document.getElementById('agentsToggle');
   var DEFAULTS={theme:'tokyo-night',glow:true,agents:false,density:'comfortable',font:'13'};
   var FS={'12':'10.5px','13':'11.5px','14':'12.5px'};
-  var S;try{S=Object.assign({},DEFAULTS,JSON.parse(localStorage.getItem('mosaic.appearance'))||{});}catch(e){S=Object.assign({},DEFAULTS);}
-  function save(){try{localStorage.setItem('mosaic.appearance',JSON.stringify(S));}catch(e){}}
+  var S;try{S=Object.assign({},DEFAULTS,JSON.parse(localStorage.getItem('pantheon.appearance'))||{});}catch(e){S=Object.assign({},DEFAULTS);}
+  function save(){try{localStorage.setItem('pantheon.appearance',JSON.stringify(S));}catch(e){}}
 
   THEMES.forEach(function(t){
     var b=document.createElement('button');

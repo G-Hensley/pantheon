@@ -1,46 +1,65 @@
-# Contributing to Mosaic
+# Contributing to Pantheon
 
-Mosaic is a working prototype (see the README's "Known gaps" section), so
+Pantheon is a working prototype (see the README's "Known gaps" section), so
 expect some rough edges. Contributions, bug reports, and design feedback are
 welcome.
 
 ## Prerequisites
 
-Mosaic is Windows-only; the terminal layer is ConPTY. You will need:
+Pantheon runs on Windows and Linux. The terminal layer is `portable-pty`:
+ConPTY on Windows, a Unix PTY elsewhere. On both platforms you will need:
 
 - [pnpm](https://pnpm.io)
 - The [Rust toolchain](https://rustup.rs) (stable)
-- The [Tauri CLI prerequisites for Windows](https://v2.tauri.app/start/prerequisites/), including the Visual Studio 2022 Build Tools. `dev.cmd` and `build.cmd` both call `vcvars64.bat` for you, so a plain `cargo build` from a regular shell will not link correctly; use the provided scripts.
+
+On Windows, also install the [Tauri CLI prerequisites](https://v2.tauri.app/start/prerequisites/),
+including the Visual Studio 2022 Build Tools. `dev.cmd` and `build.cmd` both
+call `vcvars64.bat` for you, so a plain `cargo build` from a regular shell will
+not link correctly; use the provided scripts.
+
+On Linux, install the GTK and WebKitGTK development packages. On Ubuntu 26.04:
+
+```bash
+sudo apt install pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+  librsvg2-dev libssl-dev libdbus-1-dev
+```
+
+There is no environment setup step on Linux, so `cargo build` works from any
+shell; `dev.sh` and `build.sh` are thin wrappers kept for parity.
 
 ## Setup
 
 ```powershell
 pnpm install
-.\dev.cmd        # sets up the MSVC environment, then `pnpm tauri dev`
+.\dev.cmd        # Windows: sets up the MSVC environment, then `pnpm tauri dev`
+```
+
+```bash
+pnpm install
+./dev.sh         # Linux
 ```
 
 ## Building
 
-```powershell
-.\build.cmd
-```
-
-Artifacts land in `src-tauri/target/release/` (`mosaic.exe` and the NSIS
-installer under `bundle/nsis/`).
+Run `.\build.cmd` on Windows or `./build.sh` on Linux. Artifacts land in
+`src-tauri/target/release/`: `pantheon.exe` plus the NSIS installer under
+`bundle/nsis/` on Windows, and `pantheon` plus `bundle/deb/` and
+`bundle/appimage/` on Linux.
 
 ## Testing
 
-```powershell
+```bash
 cd src-tauri
 cargo test
 ```
 
 This covers the PTY submit-timing logic and the shared-brain prompt
-formatting. There is no frontend test suite yet; a change to `src/` should at
-minimum be exercised manually with `.\dev.cmd` and checked with:
+formatting. Frontend coverage is thin, so a change to `src/` should also be
+exercised manually with `dev.cmd` or `dev.sh` and checked with:
 
-```powershell
+```bash
 pnpm build   # runs `tsc` in strict mode, then the Vite build
+pnpm test    # Vitest
 ```
 
 ## Branching and commits
@@ -53,7 +72,7 @@ commits scoped to one change so the history stays readable.
 
 ## Review before you commit
 
-If a change was made with the help of a Mosaic session, or any AI coding
+If a change was made with the help of a Pantheon session, or any AI coding
 agent, it needs a second pair of eyes from a different model before it lands,
 not a rubber stamp from the model that wrote it. The workflow:
 
@@ -61,7 +80,7 @@ not a rubber stamp from the model that wrote it. The workflow:
    working: tests passing, `pnpm build` clean, no unrelated files touched.
 2. **Route to a different-model reviewer.** Hand the diff to a session
    running a different model than the implementer, for example Claude Code
-   implemented and Codex or opencode reviews. If Mosaic is not available, any
+   implemented and Codex or opencode reviews. If Pantheon is not available, any
    second reviewer works, but the model actually has to differ, not just be a
    fresh prompt to the same one.
 3. **Reviewer reports findings.** The reviewer reads the diff against the

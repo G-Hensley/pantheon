@@ -20,7 +20,7 @@ every task looks the same until you hover it.
 BACKLOG.md refutes the earlier premise that PTY quiet time can identify a
 blocked session — silence can mean thinking, a tool waiting on approval, a cold
 local model, or a dead process, and naming any of those "blocked" is a
-diagnosis Mosaic never observed. `blocked` is a state the backend now sets
+diagnosis Pantheon never observed. `blocked` is a state the backend now sets
 explicitly, through `ask_conductor`/`answer_question` (`mcp.rs:2175`,
 `mcp.rs:2263`). This increment renders that state; it does not add any timing
 heuristic that infers it, and none of the code below reads `last_output` or any

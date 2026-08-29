@@ -1,5 +1,5 @@
 {
-  "name": "mosaic",
+  "name": "pantheon",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -30,10 +30,5 @@
     "typescript": "~7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.11"
-  },
-  "pnpm": {
-    "overrides": {
-      "nanoid@<3.3.17": "3.3.17"
-    }
   }
 }
