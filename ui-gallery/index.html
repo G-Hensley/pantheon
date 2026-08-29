@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mosaic-local — design directions</title>
+<title>Pantheon-local — design directions</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&family=Chakra+Petch:wght@400;500;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -172,7 +172,7 @@ img,svg{display:block;max-width:100%}
 .dir-atelier .dock .stop{display:flex;align-items:center;gap:8px;padding:8px 15px;border-radius:999px;background:#e8785a;color:#1a120b;font-weight:700;font-size:12.5px}
 
 /* =====================================================================
-   DIRECTION 4 · LOOM  (canvas / tiles, nod to the other Mosaic)
+   DIRECTION 4 · LOOM  (canvas / tiles, nod to the other Pantheon)
    ===================================================================== */
 .dir-loom{--bg:#0b0e13;--tile:#111620;--edge:#1e2733;--txt:#c7d0dc;--dim:#657189;--teal:#35e0c9;
   --claude:#e8785a;--codex:#57d98a;--oc:#b28bff;--cond:#ffcf5a;
@@ -215,7 +215,7 @@ img,svg{display:block;max-width:100%}
 
 <header class="chrome">
   <div class="chrome-inner">
-    <div class="brand"><span class="mk"><b>mosaic</b>-local</span><span class="sub">design directions · pick one or a blend</span></div>
+    <div class="brand"><span class="mk"><b>pantheon</b>-local</span><span class="sub">design directions · pick one or a blend</span></div>
     <nav class="tabs" role="tablist" aria-label="Design directions">
       <button class="tab s1" role="tab" aria-selected="true" data-target="substrate"><span class="dot"></span>Substrate <span class="k">1</span></button>
       <button class="tab s2" role="tab" aria-selected="false" data-target="control"><span class="dot"></span>Control Room <span class="k">2</span></button>
@@ -241,7 +241,7 @@ img,svg{display:block;max-width:100%}
       <div class="titlebar">
         <div class="dots"><i></i><i></i><i></i></div>
         <div class="tbtitle">workspace · <b>auth-service</b></div>
-        <div class="tbright"><span>4 SESSIONS</span><span>MCP :52118</span><span>◮ mosaic/*</span></div>
+        <div class="tbright"><span>4 SESSIONS</span><span>MCP :52118</span><span>◮ pantheon/*</span></div>
       </div>
       <div class="body">
         <div class="grid">
@@ -254,21 +254,21 @@ img,svg{display:block;max-width:100%}
 <span class="dim">budget 3/8 · depth 1</span> <span class="cur cor"></span></div>
           </div>
           <div class="pane claude">
-            <div class="phead"><span class="id">claude · backend</span><span class="wt">mosaic/claude-be</span><span class="st"><span class="pip"></span>live</span></div>
+            <div class="phead"><span class="id">claude · backend</span><span class="wt">pantheon/claude-be</span><span class="st"><span class="pip"></span>live</span></div>
             <div class="pbody term"><span class="p">›</span> design the database schema
 <span class="cor">⏺</span> created <span style="color:#8fb4e8">users(id, email, created_at)</span>
 <span class="cor">⏺</span> auth = magic-link, no passwords
 <span class="ok">⏺ recorded decision → brain ✓</span></div>
           </div>
           <div class="pane codex">
-            <div class="phead"><span class="id">codex · frontend</span><span class="wt">mosaic/codex-fe</span><span class="st"><span class="pip"></span>live</span></div>
+            <div class="phead"><span class="id">codex · frontend</span><span class="wt">pantheon/codex-fe</span><span class="st"><span class="pip"></span>live</span></div>
             <div class="pbody term"><span class="p">›</span> build the signup form
 <span style="color:#7cc98a">⏺</span> fields: email, created_at
 <span class="cmt">// field names pulled from shared</span>
 <span class="cmt">// context — codex was never told</span> <span class="cur" style="color:#3fb950"></span></div>
           </div>
           <div class="pane oc">
-            <div class="phead"><span class="id">opencode · tests</span><span class="wt">mosaic/oc-tests</span><span class="st"><span class="pip"></span>live</span></div>
+            <div class="phead"><span class="id">opencode · tests</span><span class="wt">pantheon/oc-tests</span><span class="st"><span class="pip"></span>live</span></div>
             <div class="pbody term"><span class="p">›</span> write tests for signup
 <span class="vi">⏺</span> vitest · signup.test.ts
 <span class="ok">✓ 12 passing</span> <span class="dim">(0.9s)</span></div>
@@ -284,7 +284,7 @@ img,svg{display:block;max-width:100%}
       </div>
       <div class="statusbar">
         <span class="seg hl">CONDUCTOR</span>
-        <span class="seg b">◮ integration ← mosaic/*</span>
+        <span class="seg b">◮ integration ← pantheon/*</span>
         <span class="seg">3 dispatched · 2 done</span>
         <span class="seg">MCP 127.0.0.1:52118</span>
         <button class="stop">■ STOP</button>
@@ -303,7 +303,7 @@ img,svg{display:block;max-width:100%}
     </div>
     <div class="win dir-control">
       <div class="topstrip">
-        <div class="mission">MOSAIC · <b>AUTH-SERVICE</b></div>
+        <div class="mission">PANTHEON · <b>AUTH-SERVICE</b></div>
         <div class="status-word"><span class="pip"></span>Conductor active</div>
         <div class="clock">T+00:04:12</div>
         <button class="stopbtn"><span class="oct"></span>Halt all</button>
@@ -311,22 +311,22 @@ img,svg{display:block;max-width:100%}
       <div class="body">
         <div class="rail">
           <div class="railh">Session vitals</div>
-          <div class="gauge claude"><div class="gname">claude · backend <span class="live">● LIVE</span></div><div class="gsub">mosaic/claude-be · 8.2k tok</div><div class="bar"><i style="width:100%"></i></div></div>
-          <div class="gauge codex"><div class="gname">codex · frontend <span class="live">● LIVE</span></div><div class="gsub">mosaic/codex-fe · 5.1k tok</div><div class="bar"><i style="width:64%"></i></div></div>
-          <div class="gauge oc"><div class="gname">opencode · tests <span class="live">● LIVE</span></div><div class="gsub">mosaic/oc-tests · 2.7k tok</div><div class="bar"><i style="width:100%"></i></div></div>
+          <div class="gauge claude"><div class="gname">claude · backend <span class="live">● LIVE</span></div><div class="gsub">pantheon/claude-be · 8.2k tok</div><div class="bar"><i style="width:100%"></i></div></div>
+          <div class="gauge codex"><div class="gname">codex · frontend <span class="live">● LIVE</span></div><div class="gsub">pantheon/codex-fe · 5.1k tok</div><div class="bar"><i style="width:64%"></i></div></div>
+          <div class="gauge oc"><div class="gname">opencode · tests <span class="live">● LIVE</span></div><div class="gsub">pantheon/oc-tests · 2.7k tok</div><div class="bar"><i style="width:100%"></i></div></div>
           <div class="railh" style="margin-top:16px">Integration</div>
-          <div class="gsub" style="font-family:'IBM Plex Mono',monospace;color:#7fa0c4;line-height:1.7">main<br>&nbsp;├─ mosaic/claude-be&nbsp;<span style="color:#37e29a">merged</span><br>&nbsp;├─ mosaic/codex-fe&nbsp;&nbsp;<span style="color:#ffb838">open</span><br>&nbsp;└─ mosaic/oc-tests&nbsp;&nbsp;<span style="color:#37e29a">merged</span></div>
+          <div class="gsub" style="font-family:'IBM Plex Mono',monospace;color:#7fa0c4;line-height:1.7">main<br>&nbsp;├─ pantheon/claude-be&nbsp;<span style="color:#37e29a">merged</span><br>&nbsp;├─ pantheon/codex-fe&nbsp;&nbsp;<span style="color:#ffb838">open</span><br>&nbsp;└─ pantheon/oc-tests&nbsp;&nbsp;<span style="color:#37e29a">merged</span></div>
         </div>
         <div class="center">
           <div class="railh">Live sessions</div>
           <div class="screens">
-            <div class="cscreen claude"><div class="ch"><span class="id">claude · backend</span><span class="br">mosaic/claude-be</span></div><div class="cb term"><span class="p">›</span> design schema
+            <div class="cscreen claude"><div class="ch"><span class="id">claude · backend</span><span class="br">pantheon/claude-be</span></div><div class="cb term"><span class="p">›</span> design schema
 <span class="cor">⏺</span> users(id, email, created_at)
 <span class="ok">⏺ → brain ✓</span></div></div>
-            <div class="cscreen codex"><div class="ch"><span class="id">codex · frontend</span><span class="br">mosaic/codex-fe</span></div><div class="cb term"><span class="p">›</span> build signup form
+            <div class="cscreen codex"><div class="ch"><span class="id">codex · frontend</span><span class="br">pantheon/codex-fe</span></div><div class="cb term"><span class="p">›</span> build signup form
 <span style="color:#3fe07a">⏺</span> fields: email, created_at
 <span class="cmt">// from shared brain</span> <span class="cur" style="color:#3fe07a"></span></div></div>
-            <div class="cscreen oc"><div class="ch"><span class="id">opencode · tests</span><span class="br">mosaic/oc-tests</span></div><div class="cb term"><span class="p">›</span> vitest signup
+            <div class="cscreen oc"><div class="ch"><span class="id">opencode · tests</span><span class="br">pantheon/oc-tests</span></div><div class="cb term"><span class="p">›</span> vitest signup
 <span class="ok">✓ 12 passing</span></div></div>
             <div class="cscreen cond"><div class="ch"><span class="id">conductor</span><span class="br">opus · autonomous</span></div><div class="cb term"><span class="am">◆</span> planning next: wire form → API <span class="cur am"></span></div></div>
           </div>
@@ -359,13 +359,13 @@ img,svg{display:block;max-width:100%}
       </div>
       <div class="astage">
         <div class="cards">
-          <div class="card claude"><div class="ch"><span class="av">C</span><span class="nm">Claude <em>· backend</em></span><span class="br">mosaic/claude-be</span></div><div class="cb term"><span class="p">›</span> design the database schema
+          <div class="card claude"><div class="ch"><span class="av">C</span><span class="nm">Claude <em>· backend</em></span><span class="br">pantheon/claude-be</span></div><div class="cb term"><span class="p">›</span> design the database schema
 <span class="cor">⏺</span> created <span style="color:#9ec3f0">users(id, email, created_at)</span>
 <span class="ok">⏺ recorded → shared brain</span></div></div>
-          <div class="card codex"><div class="ch"><span class="av">Cx</span><span class="nm">Codex <em>· frontend</em></span><span class="br">mosaic/codex-fe</span></div><div class="cb term"><span class="p">›</span> build the signup form
+          <div class="card codex"><div class="ch"><span class="av">Cx</span><span class="nm">Codex <em>· frontend</em></span><span class="br">pantheon/codex-fe</span></div><div class="cb term"><span class="p">›</span> build the signup form
 <span style="color:#7cc98a">⏺</span> fields: email, created_at
 <span class="cmt">// knew the field names — shared brain</span> <span class="cur" style="color:#7cc98a"></span></div></div>
-          <div class="card oc"><div class="ch"><span class="av">oc</span><span class="nm">opencode <em>· tests</em></span><span class="br">mosaic/oc-tests</span></div><div class="cb term"><span class="p">›</span> write tests for signup
+          <div class="card oc"><div class="ch"><span class="av">oc</span><span class="nm">opencode <em>· tests</em></span><span class="br">pantheon/oc-tests</span></div><div class="cb term"><span class="p">›</span> write tests for signup
 <span class="ok">✓ 12 passing</span> <span class="dim">· vitest</span></div></div>
           <div class="card claude" style="opacity:.9"><div class="ch"><span class="av" style="background:#f0a868">◆</span><span class="nm">Conductor <em>· opus</em></span><span class="br">autonomous</span></div><div class="cb term"><span class="am">◆</span> next: wire signup form → API route
 <span class="dim">budget 3/8 · you can Stop anytime</span></div></div>
@@ -390,7 +390,7 @@ img,svg{display:block;max-width:100%}
     <div class="caption">
       <div>
         <div class="name">Loom <em>· the canvas</em></div>
-        <div class="desc">A nod to the <em>other</em> Mosaic: sessions are tiles you arrange on an infinite canvas, and glowing wires show the shared brain — who learned what from whom. Spatial, not gridded; the coordination is literally drawn.</div>
+        <div class="desc">A nod to the <em>other</em> Pantheon: sessions are tiles you arrange on an infinite canvas, and glowing wires show the shared brain — who learned what from whom. Spatial, not gridded; the coordination is literally drawn.</div>
       </div>
       <div class="sig">signature — connection wires from the shared brain</div>
     </div>
@@ -423,7 +423,7 @@ img,svg{display:block;max-width:100%}
 
         <div class="tile claude" style="left:120px;top:222px">
           <div class="th"><span class="id">claude · backend</span><span class="grip">⠿</span></div>
-          <div class="tb"><div class="wt">worktree · mosaic/claude-be</div><div class="term"><span class="p">›</span> design schema
+          <div class="tb"><div class="wt">worktree · pantheon/claude-be</div><div class="term"><span class="p">›</span> design schema
 <span class="cor">⏺</span> users(id, email,
 &nbsp;&nbsp;created_at)
 <span class="ok">⏺ → brain</span></div></div>
@@ -431,13 +431,13 @@ img,svg{display:block;max-width:100%}
 
         <div class="tile oc" style="left:560px;top:222px">
           <div class="th"><span class="id">opencode · tests</span><span class="grip">⠿</span></div>
-          <div class="tb"><div class="wt">worktree · mosaic/oc-tests</div><div class="term"><span class="p">›</span> vitest signup
+          <div class="tb"><div class="wt">worktree · pantheon/oc-tests</div><div class="term"><span class="p">›</span> vitest signup
 <span class="ok">✓ 12 passing</span></div></div>
         </div>
 
         <div class="tile codex" style="left:345px;top:352px">
           <div class="th"><span class="id">codex · frontend</span><span class="grip">⠿</span></div>
-          <div class="tb"><div class="wt">worktree · mosaic/codex-fe</div><div class="term"><span class="p">›</span> signup form
+          <div class="tb"><div class="wt">worktree · pantheon/codex-fe</div><div class="term"><span class="p">›</span> signup form
 <span style="color:#57d98a">⏺</span> fields: email, created_at
 <span class="cmt">// from the wire ↑</span></div></div>
         </div>

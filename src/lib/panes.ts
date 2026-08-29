@@ -1,4 +1,4 @@
-// Remembering which agent CLIs were open, so reopening Mosaic brings the
+// Remembering which agent CLIs were open, so reopening Pantheon brings the
 // workspace back rather than an empty grid.
 //
 // The project directory and the layout already survive a restart; the panes did
@@ -7,14 +7,15 @@
 // session is stored — a restored pane is freshly spawned, so its status comes
 // from the new spawn, and its scrollback is gone with the old process.
 //
-// localStorage, alongside `mosaic.project` and `mosaic.layout*`, rather than the
+// localStorage, alongside `pantheon.project` and `pantheon.layout*`, rather than the
 // Rust store: the roster is UI state the frontend owns end to end, it is written
 // on every pane change, and keeping it beside the project it belongs with means
 // one place to look when a restore misbehaves.
 
 import { SESSION_TYPES, type SavedWorktree, type SessionType } from "./ipc";
+import { readStored, writeStored } from "./storage";
 
-const KEY = "mosaic.panes";
+const KEY = "panes";
 
 // What is persisted per pane. The session *type id* is stored rather than the
 // type object, so a pane restored after an upgrade picks up the current
@@ -106,7 +107,7 @@ export function parseRoster(raw: string | null): Roster {
 // simply starts with no sessions.
 export function loadRoster(): Roster {
   try {
-    return parseRoster(localStorage.getItem(KEY));
+    return parseRoster(readStored(KEY));
   } catch {
     return EMPTY;
   }
@@ -114,7 +115,7 @@ export function loadRoster(): Roster {
 
 export function saveRoster(panes: StoredPane[]): void {
   try {
-    localStorage.setItem(KEY, JSON.stringify(panes));
+    writeStored(KEY, JSON.stringify(panes));
   } catch {
     /* ignore — persistence is best-effort, it must never break the app */
   }

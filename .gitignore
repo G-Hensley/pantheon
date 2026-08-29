@@ -22,8 +22,8 @@ src-tauri/target-ui-layout/
 src-tauri/target-ui-v2/
 
 # Shared-brain runtime data. Written into whichever project is active; when that
-# project is Mosaic itself, it's just scratch from a test run.
-.mosaic/
+# project is Pantheon itself, it's just scratch from a test run.
+.pantheon/
 
 # Per-machine tool settings
 .claude/settings.local.json

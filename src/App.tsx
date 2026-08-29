@@ -28,6 +28,7 @@ import {
 } from "./lib/ipc";
 import { loadRoster, saveRoster, seedCounter } from "./lib/panes";
 import { brainColorMap } from "./lib/brains";
+import { readStored, writeStored } from "./lib/storage";
 import "./App.css";
 
 type PaneStatus = "running" | "exited";
@@ -62,7 +63,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [layout, setLayout] = useState<LayoutMode>(() => {
     try {
-      return localStorage.getItem("mosaic.layout") === "fit" ? "fit" : "scroll";
+      return readStored("layout") === "fit" ? "fit" : "scroll";
     } catch {
       return "scroll";
     }
@@ -70,7 +71,7 @@ function App() {
   const [focusedPane, setFocusedPane] = useState<string | null>(null);
   const [layoutColumns, setLayoutColumns] = useState<LayoutColumns>(() => {
     try {
-      const value = localStorage.getItem("mosaic.layout.columns");
+      const value = readStored("layout.columns");
       return /^[1-6]$/.test(value ?? "")
         ? (Number(value) as LayoutColumns)
         : "auto";
@@ -80,7 +81,7 @@ function App() {
   });
   const [paneHeight, setPaneHeight] = useState(() => {
     try {
-      const value = Number(localStorage.getItem("mosaic.layout.paneHeight"));
+      const value = Number(readStored("layout.paneHeight"));
       return value >= 280 && value <= 720 ? value : 420;
     } catch {
       return 420;
@@ -90,7 +91,7 @@ function App() {
   // The git repo sessions run in. Isolated sessions get worktrees of it.
   const [project, setProject] = useState<string | null>(() => {
     try {
-      return localStorage.getItem("mosaic.project");
+      return readStored("project");
     } catch {
       return null;
     }
@@ -210,12 +211,12 @@ function App() {
     try {
       const dir = await open({
         directory: true,
-        title: "Pick the git repo Mosaic sessions should work in",
+        title: "Pick the git repo Pantheon sessions should work in",
       });
       if (typeof dir === "string") {
         setProject(dir);
         try {
-          localStorage.setItem("mosaic.project", dir);
+          writeStored("project", dir);
         } catch {
           /* ignore */
         }
@@ -248,9 +249,9 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("mosaic.layout", layout);
-      localStorage.setItem("mosaic.layout.columns", String(layoutColumns));
-      localStorage.setItem("mosaic.layout.paneHeight", String(paneHeight));
+      writeStored("layout", layout);
+      writeStored("layout.columns", String(layoutColumns));
+      writeStored("layout.paneHeight", String(paneHeight));
     } catch {
       /* ignore */
     }
@@ -315,7 +316,7 @@ function App() {
   }
 
   // Capture app shortcuts before xterm sees them. Plain Ctrl+K/Ctrl+B belong
-  // to terminal applications, so Mosaic uses Ctrl+Shift chords instead.
+  // to terminal applications, so Pantheon uses Ctrl+Shift chords instead.
   useEffect(() => {
     const focusPaneAt = (index: number) => {
       const pane = document.querySelectorAll<HTMLElement>(".pane")[index];
@@ -379,7 +380,7 @@ function App() {
   return (
     <div className="app">
       <header className="bar">
-        <h1>Mosaic</h1>
+        <h1>Pantheon</h1>
         <span className="tag">cockpit</span>
         <div className="spacer" />
         <span className="count">

@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- Mosaic app icon. Source of truth for every generated size:
+  <!-- Pantheon app icon. Source of truth for every generated size:
        regenerate with `pnpm tauri icon app-icon.svg`.
 
        Staggered tesserae in the app's own brain palette (src/lib/brains.ts).
        Rows 1 and 3 sit on columns 0/3/6, row 2 is offset to 1/4 — the running
-       bond that reads as a mosaic rather than a uniform grid, while keeping
+       bond that reads as a pantheon rather than a uniform grid, while keeping
        tiles large enough to survive a 16px taskbar icon. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">

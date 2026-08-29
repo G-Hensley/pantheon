@@ -116,7 +116,7 @@ pub(crate) fn create_with_base_dir(
 ) -> Result<Worktree, String> {
     let uid = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("{session_id}-{}", &uid[..6]);
-    let branch = format!("mosaic/{name}");
+    let branch = format!("pantheon/{name}");
     let path = base_dir.join(&name);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -494,7 +494,7 @@ mod tests {
         let saved = Saved {
             repo: repo.to_string_lossy().to_string(),
             path: orphan.to_string_lossy().to_string(),
-            branch: "mosaic/sess-orphan".to_string(),
+            branch: "pantheon/sess-orphan".to_string(),
             base: "HEAD".to_string(),
         };
 

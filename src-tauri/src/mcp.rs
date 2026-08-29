@@ -1,4 +1,4 @@
-// Mosaic "shared brain": an in-process MCP server on loopback that every agent
+// Pantheon "shared brain": an in-process MCP server on loopback that every agent
 // CLI connects to. Agents publish decisions/facts/broadcasts and read the shared
 // context, so one agent's decision instantly becomes another's knowledge. The
 // tool handlers touch app state directly (same process), and each write emits a
@@ -81,8 +81,8 @@ fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
     // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
     // agent can learn from an MCP tool call does not belong in the terminal.
     format!(
-        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} \
-         When done, call the mosaic complete_task tool with task_id \"{task_id}\" \
+        "[pantheon] Task from conductor '{conductor}' (task_id {task_id}): {task} \
+         When done, call the pantheon complete_task tool with task_id \"{task_id}\" \
          and your result."
     )
 }
@@ -125,9 +125,9 @@ fn conductor_briefing(peers: &[String]) -> String {
         )
     };
     format!(
-        "[mosaic] You are now the conductor of this workspace. \
+        "[pantheon] You are now the conductor of this workspace. \
 {roster} \
-Each is a live agent idling until you give it work. Use the mosaic dispatch tool rather than doing separable work yourself; it returns immediately, so fan out every independent piece and collect with get_task_result. "
+Each is a live agent idling until you give it work. Use the pantheon dispatch tool rather than doing separable work yourself; it returns immediately, so fan out every independent piece and collect with get_task_result. "
     )
 }
 
@@ -761,7 +761,7 @@ impl Shared {
             for task in &changed {
                 let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
                 eprintln!(
-                    "[mosaic] task {} abandoned: target '{}' is gone",
+                    "[pantheon] task {} abandoned: target '{}' is gone",
                     task.id, task.target
                 );
             }
@@ -1743,17 +1743,17 @@ pub struct TaskQuery {
 #[tool_router]
 impl BrainHandler {
     #[tool(
-        description = "Declare who you are in this Mosaic workspace. Call once at startup before other tools."
+        description = "Declare who you are in this Pantheon workspace. Call once at startup before other tools."
     )]
     fn set_session_identity(&self, Parameters(p): Parameters<Identify>) -> String {
-        // On a dedicated endpoint Mosaic already knows who you are.
+        // On a dedicated endpoint Pantheon already knows who you are.
         if let Some(b) = &self.bound {
             if !p.room.is_empty() {
                 if let Err(e) = self.shared.try_set_room(b, &p.room) {
                     return format!("Refused: {e}.");
                 }
             }
-            return format!("Already identified as '{b}' â€” Mosaic knows this session.");
+            return format!("Already identified as '{b}' â€” Pantheon knows this session.");
         }
         let session = AgentSession {
             name: p.name.clone(),
@@ -2301,19 +2301,19 @@ impl BrainHandler {
 /// in whichever repo it was launched against.
 ///
 /// The workspace section exists for a second, distinct failure: an agent that
-/// treats Mosaic as a nicer terminal and never notices the other panes are
+/// treats Pantheon as a nicer terminal and never notices the other panes are
 /// usable capacity. Because MCP delivers this text once, at connect time, it can
 /// only describe the role an agent *might* be given â€” the conductor briefing
 /// injected by `set_conductor` is what covers the role it actually has.
-const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
+const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Pantheon, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
 
-Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
+Pantheon already knows who you are from this connection. You do not need to call set_session_identity.
 
 ## The workspace
 
 The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
 
-Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
+Pantheon gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
 
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
 - Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
@@ -2322,9 +2322,9 @@ If you ARE the conductor, the rest of the workspace is yours to direct, and usin
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
 - A task reported as blocked is waiting on YOU, not on the agent. Answer it with answer_question(task_id, answer) and the agent starts moving again. wait_for_tasks returns early when one appears, precisely so you can answer without watching for it.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
-- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
+- This does not replace your own subagents. Prefer a Pantheon session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
 
-If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[pantheon] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
 
 If that brief turns out to be ambiguous, call ask_conductor with your task_id and the specific question rather than guessing or asking the human in your terminal. The conductor wrote the brief and holds the reasoning it compressed away, so it is usually the better answerer as well as the right one; the human often lacks the context and did not ask to be the routing point for five panes. Your task shows as blocked while you wait, and you get the answer back in the same call. If nobody answers in time you are told to use your own judgement, and then you should say in your result what you assumed.
 
@@ -2344,7 +2344,7 @@ impl ServerHandler for BrainHandler {
     // "rmcp" (the default is resolved inside that crate, not ours).
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("pantheon", env!("CARGO_PKG_VERSION")))
             .with_instructions(BRAIN_INSTRUCTIONS)
     }
 }

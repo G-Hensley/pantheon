@@ -7,15 +7,16 @@ import {
   type ReactNode,
 } from "react";
 import { DEFAULT_THEME_ID, resolveTheme, type Theme } from "./themes";
+import { readStored, writeStored } from "./storage";
 
 export type Appearance = { theme: string; glow: boolean; fontSize: number };
 
-const KEY = "mosaic.appearance";
+const KEY = "appearance";
 const DEFAULT: Appearance = { theme: DEFAULT_THEME_ID, glow: false, fontSize: 13 };
 
 export function loadAppearance(): Appearance {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = readStored(KEY);
     if (raw) return { ...DEFAULT, ...JSON.parse(raw) };
   } catch {
     /* corrupt/unavailable storage → defaults */
@@ -25,7 +26,7 @@ export function loadAppearance(): Appearance {
 
 function save(a: Appearance) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(a));
+    writeStored(KEY, JSON.stringify(a));
   } catch {
     /* ignore */
   }
