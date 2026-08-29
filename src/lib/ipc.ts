@@ -20,11 +20,21 @@ export type SessionType = {
   color: string;
 };
 
+// Which plain shell the Shell pane launches. The webview user agent is the only
+// platform signal available here without adding a Tauri OS plugin, and it is
+// enough: WebView2 reports Windows, WebKitGTK and WKWebView do not. Guarded for
+// the jsdom test environment, which has a user agent but no real platform.
+const IS_WINDOWS =
+  typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+
 // The launchable session types. The three agent CLIs are wired to the shared
 // brain automatically at launch (see agent_mcp_wiring in the backend); Shell is
-// a plain terminal with no MCP wiring.
+// a plain terminal with no MCP wiring. Only the shell differs by platform: the
+// agent CLIs carry the same command name everywhere.
 export const SESSION_TYPES: SessionType[] = [
-  { id: "shell", label: "Shell", program: "powershell.exe", args: ["-NoLogo"], color: "#7dcfff" },
+  IS_WINDOWS
+    ? { id: "shell", label: "Shell", program: "powershell.exe", args: ["-NoLogo"], color: "#7dcfff" }
+    : { id: "shell", label: "Shell", program: "bash", args: [], color: "#7dcfff" },
   { id: "claude", label: "Claude Code", program: "claude", args: [], color: "#e0af68" },
   { id: "codex", label: "Codex", program: "codex", args: [], color: "#bb9af7" },
   { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a" },

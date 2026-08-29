@@ -22,8 +22,11 @@ src-tauri/target-ui-layout/
 src-tauri/target-ui-v2/
 
 # Shared-brain runtime data. Written into whichever project is active; when that
-# project is Pantheon itself, it's just scratch from a test run.
+# project is Pantheon itself, it's just scratch from a test run. The pre-rename
+# name is ignored too: set_project keeps using an existing .mosaic/ when the
+# migration cannot move it, so that directory can still be the live one.
 .pantheon/
+.mosaic/
 
 # Per-machine tool settings
 .claude/settings.local.json

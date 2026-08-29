@@ -6,41 +6,60 @@ welcome.
 
 ## Prerequisites
 
-Pantheon is Windows-only; the terminal layer is ConPTY. You will need:
+Pantheon runs on Windows and Linux. The terminal layer is `portable-pty`:
+ConPTY on Windows, a Unix PTY elsewhere. On both platforms you will need:
 
 - [pnpm](https://pnpm.io)
 - The [Rust toolchain](https://rustup.rs) (stable)
-- The [Tauri CLI prerequisites for Windows](https://v2.tauri.app/start/prerequisites/), including the Visual Studio 2022 Build Tools. `dev.cmd` and `build.cmd` both call `vcvars64.bat` for you, so a plain `cargo build` from a regular shell will not link correctly; use the provided scripts.
+
+On Windows, also install the [Tauri CLI prerequisites](https://v2.tauri.app/start/prerequisites/),
+including the Visual Studio 2022 Build Tools. `dev.cmd` and `build.cmd` both
+call `vcvars64.bat` for you, so a plain `cargo build` from a regular shell will
+not link correctly; use the provided scripts.
+
+On Linux, install the GTK and WebKitGTK development packages. On Ubuntu 26.04:
+
+```bash
+sudo apt install pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+  librsvg2-dev libssl-dev libdbus-1-dev
+```
+
+There is no environment setup step on Linux, so `cargo build` works from any
+shell; `dev.sh` and `build.sh` are thin wrappers kept for parity.
 
 ## Setup
 
 ```powershell
 pnpm install
-.\dev.cmd        # sets up the MSVC environment, then `pnpm tauri dev`
+.\dev.cmd        # Windows: sets up the MSVC environment, then `pnpm tauri dev`
+```
+
+```bash
+pnpm install
+./dev.sh         # Linux
 ```
 
 ## Building
 
-```powershell
-.\build.cmd
-```
-
-Artifacts land in `src-tauri/target/release/` (`pantheon.exe` and the NSIS
-installer under `bundle/nsis/`).
+Run `.\build.cmd` on Windows or `./build.sh` on Linux. Artifacts land in
+`src-tauri/target/release/`: `pantheon.exe` plus the NSIS installer under
+`bundle/nsis/` on Windows, and `pantheon` plus `bundle/deb/` and
+`bundle/appimage/` on Linux.
 
 ## Testing
 
-```powershell
+```bash
 cd src-tauri
 cargo test
 ```
 
 This covers the PTY submit-timing logic and the shared-brain prompt
-formatting. There is no frontend test suite yet; a change to `src/` should at
-minimum be exercised manually with `.\dev.cmd` and checked with:
+formatting. Frontend coverage is thin, so a change to `src/` should also be
+exercised manually with `dev.cmd` or `dev.sh` and checked with:
 
-```powershell
+```bash
 pnpm build   # runs `tsc` in strict mode, then the Vite build
+pnpm test    # Vitest
 ```
 
 ## Branching and commits

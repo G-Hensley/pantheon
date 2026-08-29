@@ -9,7 +9,10 @@ work out to the rest and collect the results.
 
 **Status:** working prototype. The session engine, shared context, worktree
 isolation, and conductor all function, but see [Known gaps and limitations](#known-gaps-and-limitations)
-before relying on it. Windows only: the terminal layer is ConPTY.
+before relying on it. Runs on Windows and Linux: the terminal layer is
+`portable-pty`, which is ConPTY on Windows and a Unix PTY elsewhere. macOS is
+unexercised rather than ruled out; nothing in the code targets Windows or Linux
+specifically, but nobody has run it there.
 
 ## Why it exists
 
@@ -24,8 +27,8 @@ others and collect what comes back.
 
 ## Capabilities
 
-- Runs Claude Code, Codex, opencode, or a plain PowerShell in parallel panes,
-  each on its own pseudo-terminal.
+- Runs Claude Code, Codex, opencode, or a plain shell (PowerShell on Windows,
+  bash on Linux) in parallel panes, each on its own pseudo-terminal.
 - Connects agents to a **shared brain**, an in-process MCP server they use to
   record decisions and facts, broadcast, and read what the others have
   decided.
@@ -53,30 +56,46 @@ others and collect what comes back.
 
 ## Quick start
 
-Install `Pantheon_0.1.0_x64-setup.exe` and launch from the Start Menu, or run
-from a checkout:
+On Windows, install `Pantheon_0.1.0_x64-setup.exe` and launch from the Start
+Menu, or run from a checkout:
 
 ```powershell
 pnpm install
 .\dev.cmd        # sets up the MSVC environment, then `pnpm tauri dev`
 ```
 
-To build the installer:
+On Linux, run from a checkout:
 
-```powershell
-.\build.cmd
+```bash
+pnpm install
+./dev.sh         # thin wrapper for `pnpm tauri dev`
 ```
 
-Artifacts land in `src-tauri/target/release/`:
+To build and register Pantheon in the Linux app grid:
+
+```bash
+./install-desktop.sh
+```
+
+When upgrading from Mosaic, the installer safely adopts the latest packaged
+UI state, retires the old launcher, and preserves legacy worktree and context
+data. Quit Mosaic or Pantheon before running it so WebKit can close its state
+database cleanly.
+
+To build the bundles, use `.\build.cmd` on Windows or `./build.sh` on Linux.
+Artifacts land under `src-tauri/target/release/`:
 
 | Path | What it is |
 |---|---|
-| `pantheon.exe` | Standalone, no install needed |
-| `bundle/nsis/Pantheon_0.1.0_x64-setup.exe` | Installer with a Start Menu entry |
+| `pantheon.exe` | Windows standalone, no install needed |
+| `bundle/nsis/Pantheon_0.1.0_x64-setup.exe` | Windows installer with a Start Menu entry |
+| `pantheon` | Linux standalone |
+| `bundle/deb/`, `bundle/appimage/` | Linux packages |
 
-Requires the Visual Studio 2022 Build Tools (both scripts call `vcvars64.bat`),
-Rust, and pnpm. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup and
-test workflow.
+Requires Rust and pnpm on both platforms, plus the Visual Studio 2022 Build
+Tools on Windows (both `.cmd` scripts call `vcvars64.bat`) or the GTK and
+WebKitGTK development packages on Linux. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full setup and test workflow.
 
 ## Usage
 
@@ -232,10 +251,11 @@ exchange is kept on the task, so an answer given once is not asked again.
   project.
 - Fit layout is intended for at most 6 panes; scroll layout remains usable
   beyond that.
-- The frontend has no tests and no test tooling; `package.json` has no test
-  script. The Rust side is covered by unit tests in `lib.rs`, `mcp.rs`, and
-  `worktree.rs`. `src-tauri/tests/pty_truncation.rs` is a ConPTY measurement
-  harness rather than a regression test, ignored by default and run
+- Frontend coverage is thin: `pnpm test` runs Vitest over a small set of
+  cases, well short of the UI as a whole. The Rust side is covered by unit
+  tests in `lib.rs`, `mcp.rs`, and `worktree.rs`.
+  `src-tauri/tests/pty_truncation.rs` is a ConPTY measurement harness rather
+  than a regression test, is Windows-only, and is ignored by default and run
   deliberately (see its header for the command).
 - Single-user, single-machine threat model. See [SECURITY.md](SECURITY.md)
   for what that means in practice before pointing Pantheon at anything
@@ -243,11 +263,12 @@ exchange is kept on the task, so an answer given once is not asked again.
 
 ## Verification
 
-```powershell
+```bash
 cd src-tauri
 cargo test        # Rust unit tests: PTY engine, shared brain, worktree isolation
 cd ..
-pnpm build         # tsc in strict mode, then the Vite production build
+pnpm build        # tsc in strict mode, then the Vite production build
+pnpm test         # Vitest frontend tests
 ```
 
 CI runs both on every pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)),

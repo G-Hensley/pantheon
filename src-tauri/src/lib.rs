@@ -444,9 +444,12 @@ impl SessionManager {
     }
 }
 
-/// Decide how to launch `program` (see the M1 note): real shells launch directly;
-/// everything else (claude/codex/opencode `.cmd` shims) is routed through
-/// `cmd.exe /c <bare-name>` so PATH — not our quoting — resolves it.
+/// Decide how to launch `program` (see the M1 note). On Windows real shells
+/// launch directly, and everything else (claude/codex/opencode `.cmd` shims) is
+/// routed through `cmd.exe /c <bare-name>` so PATH — not our quoting — resolves
+/// it. On Unix there are no shims: the agent CLIs are real executables that
+/// `execvp` resolves on PATH, so everything launches directly and a wrapper
+/// would only add a shell to misquote through.
 fn build_command(
     program: &str,
     args: &[String],
@@ -455,10 +458,10 @@ fn build_command(
 ) -> CommandBuilder {
     let is_native_shell = matches!(
         program.to_ascii_lowercase().trim_end_matches(".exe"),
-        "powershell" | "pwsh" | "cmd" | "bash" | "wsl"
+        "powershell" | "pwsh" | "cmd" | "bash" | "sh" | "zsh" | "fish" | "wsl"
     );
 
-    let mut cmd = if is_native_shell {
+    let mut cmd = if is_native_shell || !cfg!(windows) {
         let mut c = CommandBuilder::new(program);
         for a in args {
             c.arg(a);
@@ -482,6 +485,21 @@ fn build_command(
     for (k, v) in std::env::vars() {
         cmd.env(k, v);
     }
+
+    // Pantheon is the terminal emulator here, so Pantheon declares the terminal
+    // type. portable-pty sets none of its own, and the inherited value is
+    // whatever launched the app: nothing at all from the desktop entry (which
+    // runs `bash -lc`, a non-interactive shell that never sets TERM), or the
+    // host terminal's own type when launched from a shell. Both are wrong.
+    //
+    // An absent TERM is the damaging case. A CLI on a PTY sees isTTY, then
+    // reads TERM to decide how much color it may emit, and with TERM unset the
+    // answer is none: Claude Code renders entirely in the default foreground,
+    // its status icon included. `xterm-256color` plus COLORTERM is what
+    // xterm.js actually implements, so it is what the pane advertises.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
     // Applied after the inherited environment so per-session wiring wins.
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -496,9 +514,25 @@ fn build_command(
 /// install puts the app itself in `%LOCALAPPDATA%\Pantheon`, and Windows paths are
 /// case-insensitive — so a plain "pantheon" here would mix runtime data in with
 /// the installed binaries, and an uninstall could take an agent's worktree with it.
+/// The identifier is kept on Unix too, so a repo cloned on both platforms keeps
+/// one layout rather than two that drift.
 pub fn app_data_dir() -> PathBuf {
-    let root = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+    let root = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA").ok()
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| format!("{h}/.local/share"))
+            })
+    };
+    let root = root
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     compatible_app_data_dir(PathBuf::from(root))
 }
 
@@ -522,8 +556,11 @@ fn compatible_app_data_dir(root: PathBuf) -> PathBuf {
     }
 }
 
-/// Move pre-rename project context when possible. If both identities exist,
-/// prefer the legacy directory so existing decisions never silently disappear.
+/// Move a pre-rename project context directory when possible, and keep using
+/// the legacy path when the filesystem will not permit the move. If both
+/// identities exist, prefer the legacy one so existing decisions never silently
+/// disappear: preserved sessions and context matter more than making the new
+/// path appear immediately.
 fn migrate_legacy_dir(current: PathBuf, legacy: PathBuf) -> PathBuf {
     if !legacy.exists() {
         return current;
@@ -1362,15 +1399,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_mcp_wiring, choose_worktree, compatible_app_data_dir, delivery_allowance_ms,
-        is_agent_cli, is_codex, migrate_legacy_dir, ready_to_submit, resolve_isolation,
-        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, IsolationReason,
-        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
-        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
+        delivery_allowance_ms, is_agent_cli, is_codex, migrate_legacy_dir, ready_to_submit,
+        resolve_isolation, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
+        IsolationReason, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS,
+        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use tempfile::TempDir;
 
     #[test]
     fn legacy_data_directory_moves_to_the_pantheon_identity() {
@@ -1416,6 +1451,32 @@ mod tests {
 
         assert_eq!(compatible_app_data_dir(tmp.path().to_path_buf()), legacy);
     }
+
+    #[test]
+    fn a_machine_carrying_both_identities_still_reads_the_legacy_one() {
+        // What a machine that ran Mosaic and then a Pantheon build actually
+        // looks like. The Pantheon directory exists because Tauri creates it
+        // from the bundle identifier on first launch, which says nothing about
+        // where the worktrees and sessions went.
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("com.gavinhensley.mosaic");
+        fs::create_dir_all(legacy.join("sessions/sess-1")).unwrap();
+        fs::create_dir_all(tmp.path().join("com.gavinhensley.pantheon")).unwrap();
+
+        assert_eq!(compatible_app_data_dir(tmp.path().to_path_buf()), legacy);
+    }
+
+    #[test]
+    fn a_machine_that_never_ran_mosaic_uses_the_pantheon_identity() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(
+            compatible_app_data_dir(tmp.path().to_path_buf()),
+            tmp.path().join("com.gavinhensley.pantheon")
+        );
+    }
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     /// A temp repo plus one worktree created inside it, standing in for the state
     /// a spawn has already built when a later step fails.
@@ -2065,5 +2126,24 @@ mod tests {
             agent_mcp_wiring("codex", "sess-tok-none2", "http://127.0.0.1:1/mcp", None);
         assert!(!args.join(" ").contains("bearer_token_env_var"));
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn panes_advertise_a_color_capable_terminal() {
+        // Without this the desktop entry's environment reaches the agent with
+        // no TERM at all, and a CLI that checks TERM before emitting color
+        // emits none: monochrome output in a pane that renders 24-bit fine.
+        let cmd = build_command("bash", &[], Path::new("."), &[]);
+        assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-256color");
+        assert_eq!(cmd.get_env("COLORTERM").unwrap(), "truecolor");
+    }
+
+    #[test]
+    fn per_session_env_still_overrides_the_terminal_type() {
+        // Per-session wiring is applied last on purpose, so a caller that has a
+        // reason to declare a different terminal is not silently overruled.
+        let extra = vec![("TERM".to_string(), "xterm-kitty".to_string())];
+        let cmd = build_command("bash", &[], Path::new("."), &extra);
+        assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-kitty");
     }
 }

@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "deb", "appimage"],
     "publisher": "Gavin Hensley",
     "shortDescription": "Multi-agent cockpit",
     "longDescription": "Run parallel AI coding sessions side by side, each in its own terminal and optionally its own git worktree, connected by a shared MCP brain.",

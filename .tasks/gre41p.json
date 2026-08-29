@@ -1,0 +1,13 @@
+{
+  "schema": 2,
+  "id": "gre41p",
+  "rev": 4,
+  "title": "Rename Mosaic to Pantheon",
+  "status": "done",
+  "priority": "P2",
+  "rank": 1000,
+  "done_when": "Application identity, state migration, docs, and tree references use Pantheon; verification passes",
+  "created": "2026-08-28T01:15:26Z",
+  "updated": "2026-08-28T02:34:46Z",
+  "status_changed": "2026-08-28T02:34:46Z"
+}
