@@ -59,6 +59,42 @@ load-bearing and does not need a record at all.
 `published: unknown` is a legitimate value and more honest than a guess. An
 undated source is weaker evidence, and recording that is the point.
 
+### Emitted records, when the set is written to a file
+
+Everything above describes a record as working material behind an answer. A
+record set **written to a file** is a different artifact with a stricter
+contract, because something mechanical reads it: a delegating lead re-opening a
+worker's sources, or `researchctl verify`.
+
+Six additions. They are what separate evidence from prose, and a worker's
+summary satisfies none of them.
+
+| Field | Meaning |
+|---|---|
+| `lane_id` | The bounded assignment this record came from. Name your own when you did not delegate |
+| `outcome` | `evidence`, `no-evidence-found`, `unretrievable`, or `out-of-scope` |
+| `quote` | A verbatim span from the source, 25 to 300 characters, that the claim rests on |
+| `observation` | What the source says |
+| `inference` | What you concluded from it, which the source does not itself state |
+| `coverage` | The surfaces actually reached. Required when the outcome is `no-evidence-found` |
+| `retrieval_method` | The exact tool call, query, or URL sequence, so the lane is reproducible |
+
+`outcome` is a closed set because silence is the failure a lead cannot detect.
+A lane that found nothing and a lane that fell over read identically in prose
+and are entirely different facts. A record whose outcome is `unretrievable` is
+a useful record; it is not required to carry a claim or a quote.
+
+`observation` and `inference` are separate **fields**, not separate prose
+voices. A stylistic distinction does not survive a delegation boundary.
+
+`quote` is the single most valuable addition. It makes re-opening cheap, since
+the lead searches the page for the span rather than reading the document again,
+and it is what makes a mechanical check possible at all.
+
+Do not apply this section to a record rendered inline in an answer. Full
+ceremony on every incidental claim is how a schema gets abandoned, and an
+abandoned schema protects nothing.
+
 ### The `status` set
 
 Five values, chosen to answer the question the reader actually has, which is
@@ -133,6 +169,34 @@ recommendation.
 
 No status, no dates, no links, and "newer work" quietly implies the draft is the
 direction to follow.
+
+## Checking a set of records
+
+`researchctl verify <records.json>` runs the checks that do not need judgement:
+
+- required fields present for the outcome the record claims;
+- `published` present or explicitly `unknown`;
+- `retrieved` inside the run window;
+- `coverage` present whenever the outcome is `no-evidence-found`, which is what
+  makes a negative claim auditable;
+- `corroboration` entries differing in origin from the source and each other,
+  because two pages on one host is one source with two URLs;
+- a `normative` status on a date-versioned URL carrying a `currency_pointer` to
+  a **different** document.
+
+With `--fetch` it also opens each `source_url` and confirms the `quote` occurs
+in it. Offline by default, so a clean result never comes from a run that
+quietly skipped half its work.
+
+The last check exists because of a defect this system produced about itself: a
+research pass cited a specification at a dated URL as `normative` while the
+project's own versioning page named a newer version. The rule that would have
+caught it was loaded at the time and was not applied, which is the argument for
+a check that runs over a rule that must be remembered.
+
+**A pass is not a verification.** Confirming that a span occurs in a document
+confirms it was copied rather than invented. It says nothing about whether the
+span supports the claim beside it, and nothing about whether the claim is true.
 
 ## Confidence
 
