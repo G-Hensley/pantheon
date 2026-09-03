@@ -136,6 +136,16 @@ with a logging proxy, not assuming.
 
 ## Liveness: tell a slow agent apart from a dead one
 
+**Shipped, task e18r66.** A task whose target pane's process has exited now
+reaches a terminal `abandoned` status, distinct from `cancelled` and from
+`overdue`, and `list_sessions` marks the pane `DEAD` so dispatch to it is
+refused. Evidence: `abandon_lost` and `Shared::reconcile_abandoned` in
+`src-tauri/src/mcp.rs` with their tests, `SessionManager::liveness` in
+`src-tauri/src/lib.rs`, and `README.md`, which describes the `abandoned`
+status and the `DEAD` marker under "Guardrails" and "Known gaps". A pane that is alive but silent is deliberately still
+indistinguishable from one thinking; that case is "A pane whose model is failing
+looks exactly like a healthy idle one", at the end of this file.
+
 Found while testing the overdue fix, and partly caused by it.
 
 Before, a task past the threshold flipped to "timeout" and its result was
@@ -187,6 +197,12 @@ wrong in a useful way: it reports presence, and presence is not readiness.
   session, and whether that should be automatic or offered.
 
 ## `get_task_result` with no id outgrows its own response limit
+
+**Shipped, task d4nhzh.** With no id, `get_task_result` now returns every open
+task plus the `RECENT_FINISHED` most recently finished ones and says how many
+older ones it left out; `status` filters by state and `include_all` returns the
+whole history. Evidence: `select_tasks` in `src-tauri/src/mcp.rs` and its
+`include_all_and_status_bypass_the_window` test.
 
 It returns every task ever dispatched. At 28 tasks that is already ~67k
 characters, which exceeds the tool response limit and fails outright, so the
@@ -363,6 +379,17 @@ routing, and it is what `#24` should replace.
 
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
+**Shipped, task dq3s0j.** `wait_for_tasks` blocks until the named ids reach a
+terminal status or the timeout fires (600 s default, 1800 s ceiling), returns
+the same rendering `get_task_result` would, words a timeout distinctly from
+completion, cancels nothing, and returns early when a task becomes `blocked`.
+Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
+tool list under "How agents connect" in `README.md`. One caveat, measured
+2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
+transport with "The operation timed out" while 45 s returns, so the 600 s
+default is not usable from that host; tracked in the repair plan at
+`~/Projects/docs/plans/2026-09-03-pantheon-repair.md`.
+
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
 work and has nothing else queued has exactly two options: guess an interval and
@@ -400,6 +427,17 @@ is slow. This is the other half, letting it act on that without spinning.
 
 ## A blocked agent can only ask the human, never the conductor
 
+**Shipped, task 6v3ebz.** `ask_conductor` lets a dispatched agent put a question
+against its `task_id` and wait; the task holds a distinct open `blocked` status
+until `answer_question` (conductor only) delivers the answer and sets it running
+again. Exchanges are kept on the task, capped at `MAX_QUESTIONS_PER_TASK`; a
+900 s ask timeout tells the agent to use its own judgement; no conductor, or a
+halted workspace, is a stated fallback to the human rather than a silent one;
+and `wait_for_tasks` returns early on a blocked task, the shared mechanism the
+entry above asked for. Evidence: `ask_conductor` and `answer_question` in
+`src-tauri/src/mcp.rs` with their tests, and the tool list under "How agents
+connect" in `README.md`.
+
 Dispatch is one-way. `dispatch` hands a brief to a pane and returns; the only
 path back is `complete_task` at the end. So an agent that hits a genuine
 ambiguity mid-task has three options, and all of them are bad: guess and risk
@@ -412,7 +450,7 @@ task, put its question to the user rather than to the conductor that briefed it.
 The user's own words were that it "probably should've routed to you". With five
 panes working in parallel, every one of them holds this option, so the human
 becomes the synchronisation point for questions they did not ask and lack the
-context to answer — which is the exact cost conducting was supposed to remove.
+context to answer, which is the exact cost conducting was supposed to remove.
 
 The conductor is usually the *better* answerer, not merely the more appropriate
 one. It wrote the brief, it holds the reasoning the brief compressed away, and
@@ -423,7 +461,7 @@ them.
 **The shape to aim for.** An `ask_conductor` call: a blocked agent poses a
 question against its `task_id`, the question surfaces in the conductor's pane
 the way a task result does, and the answer is delivered back to the waiting
-agent. The task stays open and distinguishable throughout — `blocked` is a
+agent. The task stays open and distinguishable throughout: `blocked` is a
 different thing from `pending`, and a conductor collecting results needs to see
 the difference.
 
@@ -448,6 +486,14 @@ share one mechanism rather than grow two.
 
 ## Nothing enforces cross-model review, so "done" means self-certified
 
+**Shipped, task d575h4, in PR #16 (`3efebac`).** A task now carries a
+`reviewer`, `complete_task` moves it to `in_review` rather than `done`, and only
+`review_task` from that reviewer closes it or sends it back as `rework`.
+`dispatch` picks a reviewer unless one is named or review is explicitly waived,
+and `get_task_result` says which. Evidence: `review_task` in
+`src-tauri/src/mcp.rs`, and the `get_task_result` tool description there, which
+spells out what `in_review` and `rework` mean to a conductor.
+
 The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
 you commit") lays out six steps: implement, route to a **different-model**
 reviewer, reviewer reports findings, implementer fixes and asks for a recheck,
@@ -469,7 +515,7 @@ So the policy holds only as long as a conductor remembers it, which is the
 failure mode of every convention that lives in a document and nowhere else.
 
 **Evidence, from this session.** Commit `ba2fc87` changes `mcp.rs` and the
-dispatch path — two of the areas `CONTRIBUTING.md` says *always* require a
+dispatch path, two of the areas `CONTRIBUTING.md` says *always* require a
 cross-model review. It was implemented, tested, committed and pushed by one
 model with no reviewer. Not because the rule was rejected, but because nothing
 asked. The review was dispatched to sess-2 only after the user asked which item
@@ -504,7 +550,7 @@ sessions on a free-tier model, which is close to the worst available match for
 it.
 
 **Pantheon does not merely omit the model, it never learns it.** `SESSION_TYPES`
-in `src/lib/ipc.ts` launches each agent CLI bare — `{ id: "opencode", program:
+in `src/lib/ipc.ts` launches each agent CLI bare: `{ id: "opencode", program:
 "opencode", args: [] }`, and the same for `claude` and `codex`. No model flag is
 passed, so the model is whatever that CLI's own config selects, and Pantheon has
 no channel to find out. Any fix here starts by *acquiring* the fact, not by
@@ -522,7 +568,7 @@ sess-4 (codex), sess-6 (opencode) and sess-8 (opencode). sess-8 was a local
 model via Ollama and produced nothing at all; sess-6, listed identically as
 `(opencode)`, worked fine. Nothing in the roster distinguished them, and the
 conductor only caught it by reading `git status` in each pane's worktree on disk
-and noticing sess-8's was clean. The user knew which pane was local — the
+and noticing sess-8's was clean. The user knew which pane was local; the
 conductor could not. This is the same failure the liveness entry above describes,
 approached from the routing side rather than the detection side: the cheapest
 pane to hand work to is the one most likely to silently drop it.
@@ -628,6 +674,15 @@ Still outstanding, and still the only real guarantee: the account-side state
 is declared intent; the balance is the enforcement.
 
 ## The conductor's five-pill task strip hides the work it is meant to coordinate
+
+**Shipped, task 7c7f3j, in PR #25 (`8d07262`).** The five-pill feed is replaced
+by a task drawer that shows every open task without truncating its brief, gives
+`blocked`, `pending`, `overdue`, `in_review`, `rework`, and terminal work their
+own treatment, focuses the target pane from a task, and bounds finished history.
+Evidence: `src/components/TaskDrawer.tsx` and `TaskDrawer.test.tsx`, whose tests
+prove a sixth concurrent task stays visible and that `blocked` is shown only
+for a task holding an open question. Design in
+`docs/design/conductor-task-surface/increment-1.md`.
 
 The conductor bar is an at-a-glance view only while the fan-out is small.
 `src/components/ConductorBar.tsx:42-60` reverses the task list, keeps five
