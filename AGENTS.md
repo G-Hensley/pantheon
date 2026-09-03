@@ -5,8 +5,9 @@ rather than siloed. Each agent gets a live terminal pane; panes can share a
 context store, and one can be promoted to conductor to fan work out and collect
 results.
 
-Windows only: the terminal layer is ConPTY. Status is working prototype, so read
-the Known gaps section of `README.md` before relying on any part of it.
+Runs on Windows and Linux: the terminal layer is `portable-pty`, which is ConPTY
+on Windows and a Unix PTY elsewhere. Status is working prototype, so read the
+Known gaps section of `README.md` before relying on any part of it.
 
 This file is orientation. It does not restate the global working-style rules or
 the delivery policy, both of which are already loaded from the parent tree.
@@ -25,7 +26,8 @@ the delivery policy, both of which are already loaded from the parent tree.
   measured, which hypotheses were refuted, and what was tried and did not work.
   That is the part worth keeping, and it is why it stays prose.
 
-Build with `pnpm`. `dev.cmd` and `build.cmd` wrap the usual commands.
+Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
+`build.sh` on Linux, wrap the usual commands.
 
 ## Tasks
 
