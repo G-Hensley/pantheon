@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
@@ -507,6 +507,14 @@ pub struct Shared {
     halted: Mutex<bool>,
     tasks: Mutex<Vec<Task>>,
     dispatches: Mutex<u32>,
+    /// Gates every terminal write, separately from `tasks`. `set_halted`
+    /// takes this exclusively while it flips the flag and cancels, so a
+    /// delivery path holding it as a reader cannot have Stop land between
+    /// its eligibility check and the write; readers hold it only across
+    /// that check and the write itself, never across the task mutex, so a
+    /// blocked PTY write stalls other deliveries but never a completion,
+    /// review, or cancellation.
+    delivery: RwLock<()>,
 }
 
 impl Shared {
@@ -753,23 +761,70 @@ impl Shared {
         self.conductor.lock().unwrap().clone()
     }
 
+    /// Every write to a task's persisted state goes through here: `f` gets
+    /// the locked task list to mutate in place, and the `tasks` lock stays
+    /// held until every record `f` hands back has been journaled. Nothing
+    /// else can observe this batch of tasks as mid-flight between the
+    /// mutation and the append, because nothing else can even see the
+    /// mutation until this whole call releases the lock. This is the only
+    /// place in the file that constructs `StoreRecord::Task` for a write;
+    /// every task mutator below routes through it (directly, or through
+    /// `mutate_task_and_journal`) rather than locking `tasks` itself, so a
+    /// future mutator that skips it is a review question, not a silent gap.
+    fn mutate_and_journal<R>(&self, f: impl FnOnce(&mut Vec<Task>) -> (R, Vec<Task>)) -> R {
+        let mut tasks = self.tasks.lock().unwrap();
+        let (result, changed) = f(&mut tasks);
+        if !changed.is_empty() {
+            let dir = self.dir.lock().unwrap().clone();
+            for task in &changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+            }
+        }
+        result
+    }
+
+    /// The shape `review_task`, `finish_task`, and `ask_task_question` all
+    /// share: run a `..._pending`-style mutator, then journal the one task
+    /// it touched. Written once here instead of three times with the same
+    /// lock-mutate-refetch dance, which is exactly the shape that left the
+    /// refetch reading through a second, separate lock acquisition in the
+    /// finding this round.
+    fn mutate_task_and_journal<E: From<TaskAccessError>>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Vec<Task>) -> Result<(), E>,
+    ) -> Result<Task, E> {
+        self.mutate_and_journal(|tasks| match f(tasks) {
+            Ok(()) => match tasks.iter().find(|t| t.id == id).cloned() {
+                Some(t) => (Ok(t.clone()), vec![t]),
+                None => (Err(TaskAccessError::NotFound.into()), Vec::new()),
+            },
+            Err(e) => (Err(e), Vec::new()),
+        })
+    }
+
     /// Stop halts all dispatch immediately; clearing it also refreshes the budget.
     pub fn set_halted(&self, v: bool) {
+        // Exclusive: a delivery path holding `delivery` as a reader is
+        // between its own eligibility check and its `submit_to` call, and
+        // must not have this land in between. Taking this here, not
+        // `tasks`, is what keeps that guarantee without ever holding
+        // `tasks` across a PTY write.
+        let _delivery = self.delivery.write().unwrap();
         *self.halted.lock().unwrap() = v;
         if v {
             let now = Self::now_ms();
-            let mut changed = Vec::new();
-            for t in self.tasks.lock().unwrap().iter_mut() {
-                if t.status == "pending" {
-                    t.status = "cancelled".to_string();
-                    t.done_ms = Some(now);
-                    changed.push(t.clone());
+            self.mutate_and_journal(|tasks| {
+                let mut changed = Vec::new();
+                for t in tasks.iter_mut() {
+                    if t.status == "pending" {
+                        t.status = "cancelled".to_string();
+                        t.done_ms = Some(now);
+                        changed.push(t.clone());
+                    }
                 }
-            }
-            let dir = self.dir.lock().unwrap().clone();
-            for task in changed {
-                let _ = append_record(&dir, &StoreRecord::Task(task));
-            }
+                ((), changed)
+            });
         } else {
             *self.dispatches.lock().unwrap() = 0;
         }
@@ -795,9 +850,10 @@ impl Shared {
     }
 
     fn add_task(&self, t: Task) {
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
-        self.tasks.lock().unwrap().push(t);
+        self.mutate_and_journal(|tasks| {
+            tasks.push(t.clone());
+            ((), vec![t])
+        });
         self.app.emit("conductor-changed");
     }
 
@@ -825,14 +881,13 @@ impl Shared {
     /// cheaper than the poll it replaces.
     fn reconcile_abandoned(&self) -> Vec<String> {
         let live = self.live_ids();
-        let changed = {
-            let mut tasks = self.tasks.lock().unwrap();
-            abandon_lost(&mut tasks, &live, Self::now_ms())
-        };
+        let now = Self::now_ms();
+        let changed = self.mutate_and_journal(|tasks| {
+            let changed = abandon_lost(tasks, &live, now);
+            (changed.clone(), changed)
+        });
         if !changed.is_empty() {
-            let dir = self.dir.lock().unwrap().clone();
             for task in &changed {
-                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
                 if task.status == STATUS_ABANDONED {
                     eprintln!(
                         "[pantheon] task {} abandoned: target '{}' is gone",
@@ -862,38 +917,18 @@ impl Shared {
         approved: bool,
         findings: &str,
     ) -> Result<Task, TaskAccessError> {
-        review_pending(
-            &mut self.tasks.lock().unwrap(),
-            caller,
-            id,
-            approved,
-            findings,
-            Self::now_ms(),
-        )?;
-        let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned()
-            .ok_or(TaskAccessError::NotFound)?;
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        let task = self.mutate_task_and_journal(id, |tasks| {
+            review_pending(tasks, caller, id, approved, findings, Self::now_ms())
+        })?;
         self.app.emit("context-changed");
         Ok(task)
     }
 
     /// Block a task on a question for its conductor.
     fn ask_task_question(&self, caller: &str, id: &str, question: &str) -> Result<(), AskError> {
-        ask_pending(
-            &mut self.tasks.lock().unwrap(),
-            caller,
-            id,
-            question,
-            Self::now_ms(),
-        )?;
-        self.persist_task(id);
+        self.mutate_task_and_journal(id, |tasks| {
+            ask_pending(tasks, caller, id, question, Self::now_ms())
+        })?;
         self.app.emit("conductor-changed");
         Ok(())
     }
@@ -906,32 +941,17 @@ impl Shared {
         answer: &str,
     ) -> Result<String, AskError> {
         let conductor = self.conductor();
-        let question = answer_pending(
-            &mut self.tasks.lock().unwrap(),
-            caller,
-            conductor.as_deref(),
-            id,
-            answer,
-        )?;
-        self.persist_task(id);
+        let question = self.mutate_and_journal(|tasks| {
+            match answer_pending(tasks, caller, conductor.as_deref(), id, answer) {
+                Ok(question) => match tasks.iter().find(|t| t.id == id).cloned() {
+                    Some(t) => (Ok(question), vec![t]),
+                    None => (Err(AskError::Access(TaskAccessError::NotFound)), Vec::new()),
+                },
+                Err(e) => (Err(e), Vec::new()),
+            }
+        })?;
         self.app.emit("conductor-changed");
         Ok(question)
-    }
-
-    /// Append one task's current state to the store. Factored out because the
-    /// look-up-then-append dance was repeated at every mutation and drifted.
-    fn persist_task(&self, id: &str) {
-        let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned();
-        if let Some(task) = task {
-            let dir = self.dir.lock().unwrap().clone();
-            let _ = append_record(&dir, &StoreRecord::Task(task));
-        }
     }
 
     /// The open question on a task, for the agent that is waiting on it.
@@ -948,23 +968,9 @@ impl Shared {
     /// happened to it. "Result recorded" is the wrong thing to say when the
     /// work has gone to a reviewer and is not finished.
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<Task, TaskAccessError> {
-        finish_pending(
-            &mut self.tasks.lock().unwrap(),
-            caller,
-            id,
-            result,
-            Self::now_ms(),
-        )?;
-        let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned()
-            .ok_or(TaskAccessError::NotFound)?;
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        let task = self.mutate_task_and_journal(id, |tasks| {
+            finish_pending(tasks, caller, id, result, Self::now_ms())
+        })?;
         self.app.emit("conductor-changed");
         Ok(task)
     }
@@ -972,19 +978,17 @@ impl Shared {
     /// Mark a recorded task as errored when terminal delivery fails. A task
     /// that completed or was cancelled concurrently is never overwritten.
     fn mark_delivery_failed(&self, id: &str) {
-        let changed = mark_pending_error(&mut self.tasks.lock().unwrap(), id, Self::now_ms());
-        if changed {
-            if let Some(task) = self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.id == id)
-                .cloned()
-            {
-                let dir = self.dir.lock().unwrap().clone();
-                let _ = append_record(&dir, &StoreRecord::Task(task));
+        let now = Self::now_ms();
+        let changed = self.mutate_and_journal(|tasks| {
+            if !mark_pending_error(tasks, id, now) {
+                return (false, Vec::new());
             }
+            match tasks.iter().find(|t| t.id == id).cloned() {
+                Some(t) => (true, vec![t]),
+                None => (false, Vec::new()),
+            }
+        });
+        if changed {
             self.app.emit("conductor-changed");
         }
     }
@@ -994,16 +998,21 @@ impl Shared {
         // Same reason as `tasks_from`: asking after one task must be able to
         // answer "its pane is gone", not just "still pending".
         self.reconcile_abandoned();
-        let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
-        let t = task_for_dispatcher(&mut tasks, caller, id)?;
-        let previous = t.status.clone();
-        age(t, now);
-        if t.status != previous {
-            let dir = self.dir.lock().unwrap().clone();
-            let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
-        }
-        Ok(t.clone())
+        self.mutate_and_journal(|tasks| {
+            let t = match task_for_dispatcher(tasks, caller, id) {
+                Ok(t) => t,
+                Err(e) => return (Err(e), Vec::new()),
+            };
+            let previous = t.status.clone();
+            age(t, now);
+            let changed = if t.status != previous {
+                vec![t.clone()]
+            } else {
+                Vec::new()
+            };
+            (Ok(t.clone()), changed)
+        })
     }
 
     /// Every task a given agent dispatched, aged out the same way `task_status`
@@ -1016,27 +1025,23 @@ impl Shared {
         // the call a conductor makes while waiting, so it is the one that has to
         // stop it waiting. Done before the lock, because it takes the lock.
         self.reconcile_abandoned();
-        let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
-        let mut changed = Vec::new();
-        let result = tasks
-            .iter_mut()
-            .filter(|t| t.from == from)
-            .map(|t| {
-                let previous = t.status.clone();
-                age(t, now);
-                if t.status != previous {
-                    changed.push(t.clone());
-                }
-                t.clone()
-            })
-            .collect();
-        drop(tasks);
-        let dir = self.dir.lock().unwrap().clone();
-        for task in changed {
-            let _ = append_record(&dir, &StoreRecord::Task(task));
-        }
-        result
+        self.mutate_and_journal(|tasks| {
+            let mut changed = Vec::new();
+            let result = tasks
+                .iter_mut()
+                .filter(|t| t.from == from)
+                .map(|t| {
+                    let previous = t.status.clone();
+                    age(t, now);
+                    if t.status != previous {
+                        changed.push(t.clone());
+                    }
+                    t.clone()
+                })
+                .collect();
+            (result, changed)
+        })
     }
 
     /// Validate and hand a task to a live session: the shared core of the
@@ -1050,6 +1055,10 @@ impl Shared {
     /// The task record is created in "pending" status BEFORE `submit_to` is
     /// called. That closes the original race while still allowing an unusually
     /// fast target to complete the task as soon as it receives the prompt.
+    /// The gap that left open, from before Phase 1, is between that creation
+    /// and the write: `add_task` and the delivery decision both happen while
+    /// holding `delivery` as a reader, so `set_halted` cannot cancel this
+    /// task in between without this call seeing it before it types anything.
     pub fn dispatch_task(
         &self,
         from: &str,
@@ -1091,6 +1100,7 @@ impl Shared {
         // finding out only when the first brief's result never comes.
         let already_busy = open_task_for_target(&self.tasks.lock().unwrap(), target);
 
+        let delivery_gate = self.delivery.read().unwrap();
         self.add_task(Task {
             id: id.clone(),
             from: from.to_string(),
@@ -1105,12 +1115,18 @@ impl Shared {
             reviewer_gone: false,
             done_ms: None,
         });
-
         // Typed into the target's terminal, so the human sees every
         // instruction. Submit Enter separately: Codex and Claude Code treat
-        // text+CR in one PTY write as a paste and can leave it waiting in the
-        // input editor â€” see `SessionManager::submit_to`.
-        let delivered = self.engine.submit_to(target, &injection);
+        // text+CR in one PTY write as a paste and can leave it waiting in
+        // the input editor; see `SessionManager::submit_to`. `is_halted` is
+        // re-read here, inside the gate, because the precheck above ran
+        // before the gate was taken and before the task existed at all.
+        let delivered = if self.is_halted() {
+            false
+        } else {
+            self.engine.submit_to(target, &injection)
+        };
+        drop(delivery_gate);
         if !delivered {
             self.mark_delivery_failed(&id);
         }
@@ -1133,29 +1149,21 @@ impl Shared {
     /// finishing.
     fn cancel_tasks(&self, ids: &[String], reason: &str) -> Vec<(String, CancelOutcome)> {
         let now = Self::now_ms();
-        // Mutate, decide what changed, and journal it, all under one lock
-        // hold: the same fix as `reassign_task`, for the same reason. A
-        // second writer for one of these same ids (`set_halted` chief
-        // among them) can only ever see this batch's outcome as already
-        // committed, never mid-flight between the mutation and the append.
-        let mut tasks = self.tasks.lock().unwrap();
-        let results: Vec<(String, CancelOutcome)> = ids
-            .iter()
-            .map(|id| (id.clone(), cancel_pending(&mut tasks, id, reason, now)))
-            .collect();
-        let changed: Vec<Task> = results
-            .iter()
-            .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
-            .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
-            .collect();
-        if !changed.is_empty() {
-            let dir = self.dir.lock().unwrap().clone();
-            for task in &changed {
-                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
-            }
-        }
-        drop(tasks);
-        if !changed.is_empty() {
+        let mut any_cancelled = false;
+        let results = self.mutate_and_journal(|tasks| {
+            let results: Vec<(String, CancelOutcome)> = ids
+                .iter()
+                .map(|id| (id.clone(), cancel_pending(tasks, id, reason, now)))
+                .collect();
+            let changed: Vec<Task> = results
+                .iter()
+                .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
+                .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
+                .collect();
+            any_cancelled = !changed.is_empty();
+            (results, changed)
+        });
+        if any_cancelled {
             self.app.emit("conductor-changed");
         }
         results
@@ -1175,22 +1183,16 @@ impl Shared {
     /// carried entirely by the `reviewer` field, the same way it is when
     /// `dispatch_task` first chooses one.
     ///
-    /// The mutation, the journal append, and (when retargeting) the terminal
-    /// write all happen inside one hold of the `tasks` lock. Two earlier,
-    /// narrower fixes each closed half of the same race and left the other
-    /// open: capturing the mutation snapshot from inside the lock stopped
-    /// `persist_task` from re-reading a cancellation in its place, but the
-    /// journal append still happened after release, so `set_halted` could
-    /// still cancel and journal first, leaving a "pending" record on top of
-    /// a "cancelled" one; re-checking the status right before delivery
-    /// stopped a stale brief from being typed after a halt already seen, but
-    /// not one landing in the gap the re-check itself left open. One lock
-    /// held across all four steps closes both at once: `set_halted` cancels
-    /// under this same lock, so it cannot run until this whole section
-    /// releases it, by which point the journal already agrees with the
-    /// mutation and delivery has already happened or been skipped. The PTY
-    /// write in `submit_to` is one small write, and the Enter is sent from
-    /// its own thread, so nothing slow runs while the lock is held.
+    /// Three rounds landed on this shape. Holding `tasks` across the
+    /// mutation and its journal append is still what makes the record order
+    /// agree with the mutation order (`mutate_and_journal`), but a third
+    /// round found that holding `tasks` across `submit_to` too, on top of
+    /// closing the halt race, stalled every other completion, review, and
+    /// cancellation behind a PTY write. Delivery now runs after the task
+    /// lock is released, under `delivery` instead: a shared hold blocks
+    /// `set_halted`'s exclusive one (and the reverse), so Stop still cannot
+    /// land between the eligibility check and the write, without the task
+    /// mutex ever being held across it.
     fn reassign_task(
         &self,
         caller: &str,
@@ -1209,39 +1211,55 @@ impl Shared {
         let retargeting = new_target.is_some();
         let now = Self::now_ms();
 
-        let mut tasks = self.tasks.lock().unwrap();
-        let task = reassign_pending(&mut tasks, id, caller, new_target, new_reviewer, &live, now)?;
-
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        let task = self.mutate_and_journal(|tasks| {
+            match reassign_pending(tasks, id, caller, new_target, new_reviewer, &live, now) {
+                Ok(t) => (Ok(t.clone()), vec![t]),
+                Err(e) => (Err(e), Vec::new()),
+            }
+        })?;
+        self.app.emit("conductor-changed");
 
         if !retargeting {
-            drop(tasks);
-            self.app.emit("conductor-changed");
             return Ok((task, true));
         }
 
+        // Shared: blocks `set_halted`'s exclusive hold, and is blocked by
+        // it, so nothing here can straddle a Stop landing mid-decision.
+        let delivery_gate = self.delivery.read().unwrap();
+        let current = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned();
+        let deliverable = match &current {
+            Some(t) => !self.is_halted() && t.status == "pending",
+            None => false,
+        };
+        if !deliverable {
+            drop(delivery_gate);
+            return Ok((current.unwrap_or(task), false));
+        }
+        let current = current.expect("checked above: deliverable implies Some");
         // Same delivery path `dispatch_task` uses, so a reassigned brief
         // looks to the new target exactly like a fresh dispatch: typed into
-        // its terminal, Enter sent separately. Still under the lock taken
-        // above, so nothing can have changed this task's status since the
-        // mutation just journaled.
-        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
-        let delivered = self.engine.submit_to(&task.target, &injection);
+        // its terminal, Enter sent separately.
+        let injection = dispatch_prompt(&current.from, &current.id, &current.task);
+        let delivered = self.engine.submit_to(&current.target, &injection);
+        drop(delivery_gate);
         let result = if delivered {
-            task
+            current
         } else {
-            mark_pending_error(&mut tasks, &task.id, now);
-            let failed = tasks
+            self.mark_delivery_failed(&current.id);
+            self.tasks
+                .lock()
+                .unwrap()
                 .iter()
-                .find(|t| t.id == task.id)
+                .find(|t| t.id == current.id)
                 .cloned()
-                .unwrap_or(task);
-            let _ = append_record(&dir, &StoreRecord::Task(failed.clone()));
-            failed
+                .unwrap_or(current)
         };
-        drop(tasks);
-        self.app.emit("conductor-changed");
         Ok((result, delivered))
     }
 }
@@ -1540,6 +1558,15 @@ enum AskError {
     NotAsking,
     /// The per-task ceiling. A pane in a question loop is bounded here.
     TooMany,
+}
+
+/// So `ask_task_question` can route through `mutate_task_and_journal`,
+/// which needs to turn "the task this id names is gone" into whatever
+/// error type the caller's mutator returns.
+impl From<TaskAccessError> for AskError {
+    fn from(e: TaskAccessError) -> Self {
+        AskError::Access(e)
+    }
 }
 
 /// States a dispatched agent may still report a result from.
@@ -3208,6 +3235,7 @@ pub fn start(
         halted: Mutex::new(false),
         tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
+        delivery: RwLock::new(()),
     });
 
     // Bind synchronously so we can hand the port back before the server task runs.
@@ -3250,7 +3278,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::Duration;
 
@@ -3558,6 +3586,7 @@ mod tests {
             halted: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             dispatches: Mutex::new(0),
+            delivery: RwLock::new(()),
         });
         // `app` owns the runtime the handle points at, so it has to outlive the
         // handle. Leaking it is cheaper than threading it through every caller
@@ -5600,6 +5629,170 @@ mod tests {
         );
         let reloaded = load_brain(dir.path());
         assert_eq!(reloaded.tasks[0].status, "cancelled");
+    }
+
+    // ---- fourth round: every writer journals under the lock ----
+    //
+    // The third round's fix only reached `reassign_task` and `cancel_tasks`.
+    // `tasks_from`'s overdue flip, `reconcile_abandoned`, `review_task`,
+    // `finish_task`, `ask_task_question`, and `answer_task_question` all had
+    // the identical shape: mutate under one lock acquisition, release it,
+    // then append under a second, separate one, leaving the same gap for a
+    // second writer to land in between. `mutate_and_journal` makes this
+    // structural: it is now the only place `StoreRecord::Task` is
+    // constructed for a write, so every one of these routes through it (see
+    // `mutate_and_journal`'s own doc comment). What follows are persistence
+    // checks per newly routed writer, proving each one's record actually
+    // reaches the journal, rather than re-proving the lock's mutual
+    // exclusion once per call site, which `mutate_and_journal` and
+    // `set_halted_cannot_touch_a_task_whose_reassignment_holds_the_lock`
+    // above already establish generically.
+
+    #[test]
+    fn set_halted_cannot_run_while_a_delivery_holds_the_gate() {
+        // The other half of this round: `submit_to` now runs outside the
+        // task mutex, under `delivery` instead, so this is what has to
+        // block `set_halted` in its place. Same mechanism as the task-mutex
+        // test above, aimed at the new gate.
+        let (shared, _dir) = shared_for_test();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let delivering = shared.delivery.read().unwrap();
+
+        let halting = thread::spawn({
+            let shared = shared.clone();
+            let started = started.clone();
+            move || {
+                started.store(true, Ordering::SeqCst);
+                shared.set_halted(true);
+            }
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !shared.is_halted(),
+            "set_halted must not complete while a delivery holds the gate"
+        );
+
+        drop(delivering);
+        halting.join().unwrap();
+        assert!(
+            shared.is_halted(),
+            "set_halted must still run once the gate is free"
+        );
+    }
+
+    #[test]
+    fn shared_add_task_journals_before_returning() {
+        let (shared, dir) = shared_for_test();
+        shared.add_task(task_at("t1", "pending", 0));
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks.len(), 1);
+        assert_eq!(reloaded.tasks[0].id, "t1");
+    }
+
+    #[test]
+    fn shared_review_task_journals_before_returning() {
+        let (shared, dir) = shared_for_test();
+        let mut t = task_at("t1", "in_review", 0);
+        t.reviewer = "sess-9".into();
+        shared.tasks.lock().unwrap().push(t);
+
+        shared
+            .review_task("sess-9", "t1", true, "looks good")
+            .unwrap();
+
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "done");
+        assert_eq!(reloaded.tasks[0].findings, "looks good");
+    }
+
+    #[test]
+    fn shared_finish_task_journals_before_returning() {
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        shared
+            .finish_task("sess-2", "t1", "the audit is clean")
+            .unwrap();
+
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "done");
+        assert_eq!(reloaded.tasks[0].result, "the audit is clean");
+    }
+
+    #[test]
+    fn shared_ask_and_answer_task_question_each_journal_before_returning() {
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        shared
+            .ask_task_question("sess-2", "t1", "what format?")
+            .unwrap();
+        let after_ask = load_brain(dir.path());
+        assert_eq!(after_ask.tasks[0].status, STATUS_BLOCKED);
+
+        shared
+            .answer_task_question("sess-1", "t1", "use JSON")
+            .unwrap();
+        let after_answer = load_brain(dir.path());
+        assert_eq!(after_answer.tasks[0].status, "pending");
+        assert_eq!(after_answer.tasks[0].exchanges[0].answer, "use JSON");
+    }
+
+    #[test]
+    fn shared_mark_delivery_failed_journals_before_returning() {
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        shared.mark_delivery_failed("t1");
+
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "error");
+    }
+
+    #[test]
+    fn shared_task_status_journals_the_abandon_sweep_before_returning() {
+        // Not the overdue flip `age` performs: `task_status` calls
+        // `reconcile_abandoned` first, and `shared_for_test`'s engine
+        // reports nothing live, so a pending task with an unreachable
+        // target is swept to abandoned before `age` ever sees it, the
+        // same reason `shared_reassign_task_refuses_a_reviewer_that_is_not_live`
+        // reaches for `in_review` instead of `pending`. `age`'s own flip
+        // is already covered directly and purely by
+        // `age_marks_a_stale_pending_task_overdue_but_leaves_other_statuses_alone`;
+        // reaching it through `task_status` at the `Shared` level, past a
+        // live target this fixture cannot provide, is the residual gap.
+        // What this can still check is that `task_status`'s own call
+        // into `mutate_and_journal` (via `reconcile_abandoned`) still
+        // reaches the target it asked about.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let t = shared.task_status("sess-1", "t1").unwrap();
+
+        assert_eq!(t.status, STATUS_ABANDONED);
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, STATUS_ABANDONED);
     }
 
     // ---- note_session: a reconnected pane's kind must not go stale ----
