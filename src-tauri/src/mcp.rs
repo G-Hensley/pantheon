@@ -1167,6 +1167,11 @@ impl Shared {
         }
         let live = self.reconcile_abandoned();
         let retargeting = new_target.is_some();
+        // Captured from inside the same lock acquisition as the mutation,
+        // not re-read afterward: `persist_task` re-reads under a fresh lock,
+        // and a `set_halted` landing in the gap between release and re-read
+        // would make it snapshot the cancellation instead of the transition
+        // that actually happened here, losing the pending record entirely.
         let task = {
             let mut tasks = self.tasks.lock().unwrap();
             reassign_pending(
@@ -1179,21 +1184,44 @@ impl Shared {
                 Self::now_ms(),
             )?
         };
-        self.persist_task(id);
+        {
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        }
         self.app.emit("conductor-changed");
 
         if !retargeting {
             return Ok((task, true));
         }
+        // Re-read immediately before typing into a terminal, this close to
+        // delivery rather than trusting the snapshot above: `set_halted`
+        // cancels every pending task synchronously as part of setting the
+        // flag, so a Stop that lands anywhere in the window between the
+        // mutation and here has already turned this task's own status into
+        // something other than "pending" by the time this reads it. Skip
+        // delivery rather than type a brief for work that no longer exists.
+        let current = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned();
+        let Some(current) = current else {
+            return Ok((task, false));
+        };
+        if !reassignment_still_deliverable(&current.status) {
+            return Ok((current, false));
+        }
         // Same delivery path `dispatch_task` uses, so a reassigned brief looks
         // to the new target exactly like a fresh dispatch: typed into its
         // terminal, Enter sent separately.
-        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
-        let delivered = self.engine.submit_to(&task.target, &injection);
+        let injection = dispatch_prompt(&current.from, &current.id, &current.task);
+        let delivered = self.engine.submit_to(&current.target, &injection);
         if !delivered {
-            self.mark_delivery_failed(&task.id);
+            self.mark_delivery_failed(&current.id);
         }
-        Ok((task, delivered))
+        Ok((current, delivered))
     }
 }
 
@@ -1468,6 +1496,16 @@ fn open_question(t: &Task) -> Option<&Exchange> {
     t.exchanges.iter().rev().find(|e| e.answer.is_empty())
 }
 
+/// Whether `ask_conductor`'s wait loop should release the agent because its
+/// task left `blocked` for some other reason (`cancel_task` is the common
+/// case). Pure over the task's current status so the loop's early-return is
+/// testable without a live handler. Without this, `answer_question` refuses
+/// once the task is no longer blocked, and the agent would otherwise wait
+/// out the full timeout for an answer that can never come.
+fn blocked_wait_should_release(status: &str) -> bool {
+    status != STATUS_BLOCKED
+}
+
 /// Why an ask or an answer was refused. Wraps `TaskAccessError` rather than
 /// extending it, because the existing variants already carry meanings that
 /// `complete_task` and `review_task` depend on.
@@ -1730,6 +1768,11 @@ enum ReassignError {
     /// a brief into a terminal the same way dispatch does, so it is gated
     /// the same way.
     Halted,
+    /// The named target is also the task's current reviewer: retargeting
+    /// there would let the reviewer submit and then sign off on its own
+    /// work, the same self-certification `ReviewerIsTarget` already refuses
+    /// from the other direction.
+    TargetIsReviewer,
 }
 
 /// Retarget a pending/overdue task, or hand an in_review/rework task to a new
@@ -1767,6 +1810,9 @@ fn reassign_pending(
         }
         if target == t.target {
             return Err(ReassignError::SameTarget);
+        }
+        if target == t.reviewer {
+            return Err(ReassignError::TargetIsReviewer);
         }
         if !live.iter().any(|s| s == target) {
             return Err(ReassignError::NotLive(target.to_string()));
@@ -1822,6 +1868,18 @@ fn reassign_pending(
     // The reviewer named here was just checked live, by the call above.
     t.reviewer_gone = false;
     Ok(t.clone())
+}
+
+/// Whether a just-retargeted task is still safe to deliver, checked against
+/// its status immediately before the terminal write rather than the
+/// snapshot taken when it was retargeted. `set_halted` cancels every
+/// pending task synchronously as part of setting the flag, so a Stop
+/// landing anywhere between the retarget mutation and this check has
+/// already turned the task's own status into something other than
+/// "pending" by the time it is read; delivering anyway would type a brief
+/// for work the record already says is over.
+fn reassignment_still_deliverable(status: &str) -> bool {
+    status == "pending"
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
@@ -2499,7 +2557,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, or already-abandoned task to a different live session: this retypes the same brief into the new target's terminal and resets its dispatch clock, the same as a fresh dispatch, and is refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, or is the same as what is already there, naming why."
+        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, or already-abandoned task to a different live session: this retypes the same brief into the new target's terminal and resets its dispatch clock, the same as a fresh dispatch, and is refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, that is the same as what is already there, or that would let one session both do the work and sign off on it, naming why."
     )]
     fn reassign_task(&self, Parameters(p): Parameters<ReassignArgs>) -> String {
         let target = (!p.target.is_empty()).then_some(p.target.as_str());
@@ -2513,8 +2571,8 @@ impl BrainHandler {
                 task.id, task.target
             ),
             Ok((task, _)) if target.is_some() => format!(
-                "Task '{}' reassigned to {} but redelivery failed (could not write to that session), status is 'error'.",
-                task.id, task.target
+                "Task '{}' reassigned to {} but delivery did not happen; current status is '{}'.",
+                task.id, task.target, task.status
             ),
             Ok((task, _)) => format!(
                 "Task '{}' reassigned to reviewer {}.",
@@ -2533,6 +2591,9 @@ impl BrainHandler {
             }
             Err(ReassignError::ReviewerIsTarget) => {
                 "Refused: the reviewer cannot be the session that did the work.".to_string()
+            }
+            Err(ReassignError::TargetIsReviewer) => {
+                "Refused: the target cannot be the task's reviewer, that would let it approve its own work.".to_string()
             }
             Err(ReassignError::NotLive(who)) => format!(
                 "Refused: no live session '{who}'. Call list_sessions for valid names."
@@ -2568,7 +2629,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Sign off on a task you were named to review, or send it back. Only the named reviewer can call this, and only while the task is in_review. Approving marks it done; rejecting sets it to 'rework' and returns it to the agent that did the work, which can fix your findings and resubmit. Read the work before deciding: an approval you did not earn is worse than no review, because it looks like one."
+        description = "Sign off on a task you were named to review, or send it back. Only the named reviewer can call this, and only while the task is in_review. Approving marks it done; rejecting sets its status to 'rework' and keeps your findings on the record, but changes nothing else: nothing is typed into the agent's terminal, and the agent cannot read the record itself (get_task_result is dispatcher-only), so the conductor has to tell it by hand that rework is waiting. Read the work before deciding: an approval you did not earn is worse than no review, because it looks like one."
     )]
     fn review_task(&self, Parameters(p): Parameters<ReviewArgs>) -> String {
         if !p.approved && p.findings.trim().is_empty() {
@@ -2599,7 +2660,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work you dispatched. Only the dispatcher may call this for a given task; the agent that did the work cannot read its own task's record through this tool, so a conductor waiting on a review or a rework fix has to be the one who tells the target. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -2857,6 +2918,27 @@ impl BrainHandler {
                     return format!(
                         "{conductor} answered:\n\n{}\n\nYour task is running again. Carry on.",
                         exchange.answer
+                    );
+                }
+            }
+
+            // A task that leaves "blocked" for any other reason (cancel_task
+            // is the common case) releases the agent too. Without this,
+            // answer_question refuses once the task is no longer blocked, so
+            // this call would otherwise hold the agent to the full 900s
+            // ceiling asking a question nobody can ever answer any more.
+            if let Some(t) = self
+                .shared
+                .tasks_snapshot()
+                .into_iter()
+                .find(|t| t.id == p.task_id)
+            {
+                if blocked_wait_should_release(&t.status) {
+                    return format!(
+                        "Your task left 'blocked' while you were waiting (status is now \
+                         '{}'), most likely because it was cancelled. There is nothing left \
+                         to wait for here; call get_task_result if you need the details.",
+                        t.status
                     );
                 }
             }
@@ -3132,16 +3214,16 @@ pub fn start(
 mod tests {
     use super::{
         abandon_lost, age, answer_pending, append_record, ask_pending, attribute_open_tasks,
-        bearer_matches, busy_label, cancel_pending, choose_reviewer, conductor_briefing,
-        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
-        is_terminal, load_brain, mark_pending_error, mint_session_token, open_question,
-        open_task_for_target, oversize_refusal, parse_task_ids, reassign_pending,
-        render_open_task_summaries, render_task, render_task_summary, review_pending,
-        reviewing_label, select_tasks, status_tag, still_open, task_for_dispatcher,
-        validate_path_component, wait_timeout, AgentSession, AskError, CancelOutcome, Entry,
-        Exchange, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
-        MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, STATUS_BLOCKED,
-        TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
+        bearer_matches, blocked_wait_should_release, busy_label, cancel_pending, choose_reviewer,
+        conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
+        injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
+        mint_session_token, open_question, open_task_for_target, oversize_refusal, parse_task_ids,
+        reassign_pending, reassignment_still_deliverable, render_open_task_summaries, render_task,
+        render_task_summary, review_pending, reviewing_label, select_tasks, status_tag, still_open,
+        task_for_dispatcher, validate_path_component, wait_timeout, AgentSession, AskError,
+        CancelOutcome, Entry, Exchange, Notifier, ReassignError, Shared, StoreRecord, Task,
+        TaskAccessError, MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED,
+        STATUS_BLOCKED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -4844,6 +4926,26 @@ mod tests {
     }
 
     #[test]
+    fn blocked_wait_should_release_holds_while_still_blocked() {
+        assert!(!blocked_wait_should_release(STATUS_BLOCKED));
+    }
+
+    #[test]
+    fn blocked_wait_should_release_fires_once_cancelled() {
+        // Finding 3, second round: cancel_task accepts a blocked task, but
+        // without this the agent's ask_conductor call would sit until the
+        // 900s ceiling asking a question nobody can ever answer.
+        assert!(blocked_wait_should_release("cancelled"));
+    }
+
+    #[test]
+    fn blocked_wait_should_release_fires_for_any_other_status_too() {
+        for status in ["pending", "overdue", "done", "error", STATUS_ABANDONED] {
+            assert!(blocked_wait_should_release(status), "{status}");
+        }
+    }
+
+    #[test]
     fn a_listing_puts_the_question_where_the_conductor_will_see_it() {
         // Behind another call is behind a call the conductor will not make.
         let mut tasks = vec![task_at("t1", "pending", 0)];
@@ -5239,6 +5341,26 @@ mod tests {
     }
 
     #[test]
+    fn reassign_pending_refuses_to_retarget_onto_the_reviewer() {
+        // Finding 1, second round: without this, a pending task can be
+        // retargeted to its own reviewer, who then submits and calls
+        // review_task on its own work. Mirrors ReviewerIsTarget from the
+        // other direction.
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        tasks[0].reviewer = "sess-5".into();
+        let live = vec!["sess-5".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", "sess-1", Some("sess-5"), None, &live, 0)
+                .unwrap_err(),
+            ReassignError::TargetIsReviewer
+        );
+        assert_eq!(
+            tasks[0].target, "sess-2",
+            "a refused reassignment must not mutate the task"
+        );
+    }
+
+    #[test]
     fn reassign_pending_refuses_to_retarget_work_already_submitted() {
         let mut tasks = vec![task_at("t1", "in_review", 0)];
         let live = vec!["sess-5".to_string()];
@@ -5383,6 +5505,39 @@ mod tests {
             .unwrap_err(),
             ReassignError::NotFound
         );
+    }
+
+    // ---- reassignment_still_deliverable: halt race across the lock, second round ----
+
+    #[test]
+    fn reassignment_still_deliverable_allows_a_task_still_pending() {
+        assert!(reassignment_still_deliverable("pending"));
+    }
+
+    #[test]
+    fn reassignment_still_deliverable_refuses_a_task_a_race_already_cancelled() {
+        // Finding 2, second round: `set_halted` cancels every pending task
+        // synchronously as part of setting the flag, so a Stop landing
+        // between the retarget mutation and the pre-delivery check leaves
+        // exactly this status for the check to see. Asserting against the
+        // state the race would actually leave behind, rather than trying to
+        // simulate the race itself, mirrors
+        // `mark_pending_error_does_not_overwrite_a_cancelled_task`.
+        assert!(!reassignment_still_deliverable("cancelled"));
+    }
+
+    #[test]
+    fn reassignment_still_deliverable_refuses_every_other_status_too() {
+        for status in [
+            "overdue",
+            "done",
+            "error",
+            "in_review",
+            "rework",
+            STATUS_ABANDONED,
+        ] {
+            assert!(!reassignment_still_deliverable(status), "{status}");
+        }
     }
 
     // ---- note_session: a reconnected pane's kind must not go stale ----

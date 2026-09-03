@@ -150,7 +150,12 @@ only), `cancel_task` (conductor only), `reassign_task` (conductor only),
 them together. `reassign_task` moves a pending, overdue, or already-abandoned
 task to a new live target (redelivering the brief), or hands an in_review or
 rework task to a new live reviewer, so a session that is stuck, gone, or
-already given up on does not have to leave the work stranded.
+already given up on does not have to leave the work stranded. `review_task`
+only changes the task's record: approving or rejecting reaches nobody's
+terminal, and the agent that did the work cannot even read the record itself
+with `get_task_result`, which only the dispatcher may call. Delivering a
+review result to the target is Phase 2 work; until then the conductor has to
+tell the target by hand what the review found.
 
 ## How agents are briefed
 
