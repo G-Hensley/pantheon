@@ -1,0 +1,85 @@
+name: Bug
+description: A specific observed defect, filed as a work packet an agent or a human can act on without a round trip.
+title: "<what breaks, not where>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The fields below are the `fix-bug` skill's required work packet. It refuses
+        to edit code when target, scope, or expected behavior is missing or
+        contradictory, and returns `incomplete` instead. Filling this in at file
+        time is what prevents that round trip.
+
+        A vulnerability is not a bug report. See the security link in the template
+        chooser.
+
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: Repository, revision or branch, component, and environment in scope.
+      placeholder: lexicon @ main, src/agent_toolkit/synchronizer.py, local uv env on Linux
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: The failure, including when and where it occurs. Paste the actual error, not a description of it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: >-
+        The required outcome, according to the report or an established
+        specification. If no specification says what should happen, say so: that
+        makes this a design question rather than a defect, and it routes
+        elsewhere.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        The commands and conditions that produce the failure, and how reliably.
+        A defect nobody has reproduced is a report, not yet a bug.
+      placeholder: |
+        1. ...
+        2. ...
+        Fails on N of N runs.
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Files or systems included, anything explicitly excluded, and compatibility bounds the fix must respect.
+    validations:
+      required: false
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: >-
+        The commands and environments that must pass before this is fixed. A fix
+        claim needs failure evidence from before the change and verification
+        after it, so name what produces both.
+    validations:
+      required: false
+
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Inputs
+      description: Logs, traces, source locations, prior attempts, and known constraints.
+    validations:
+      required: false

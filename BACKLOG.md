@@ -775,3 +775,159 @@ Open questions worth settling before building:
 - **Dirty worktree recovery.** Reuse is already safer than replacement. If
   reattachment fails, the UI still needs to lead the user to the preserved path
   and explain why the pane was not reopened.
+
+## The conductor cannot see or reclaim a pane's context window
+
+A long fan-out slowly poisons itself. Every dispatched brief, every tool result,
+and every file an agent read stays in that agent's context window, and nothing
+in Pantheon ever gives it back. Panes degrade in the order they were first used,
+and the conductor, which is the one component positioned to notice, is the one
+component with no way to see it.
+
+**First, a vocabulary collision worth fixing before anything is built.**
+"Context" already means something else here. `get_shared_context` at
+`src-tauri/src/mcp.rs:1815`, `search_context`, and the `context-changed` event
+all refer to the shared brain store: decisions and facts agents publish to each
+other. That store is small, durable, and deliberately shared. A context *window*
+is large, per agent, invisible, and disposable. Naming a new tool `clear_context`
+would read as "wipe the brain" to anyone who learned the existing vocabulary
+first. Whatever gets built should say "context window" or "session memory" in
+full, every time.
+
+**Pantheon does not know how full any window is, and cannot currently find out.**
+`list_sessions` (`src-tauri/src/mcp.rs:1857`) reports the pane id, its CLI, its
+brain, its role, and whether it is busy, overdue, or dead. Nothing about
+occupancy. The deeper obstacle is that the backend never reads what a pane says:
+the reader thread at `src-tauri/src/lib.rs:1104-1120` stamps `last_output` on
+arrival and forwards the bytes straight down a channel to the frontend
+renderer. Pantheon knows *when* a pane spoke and never *what* it said. Every CLI
+in `SESSION_TYPES` prints a context percentage in its own status line, and
+Pantheon's own architecture is what stops it from reading one.
+
+Clearing is the easier half. Dispatch already works by typing into the target's
+TUI through `SessionManager::submit_to` (`src-tauri/src/lib.rs:346`), so a
+`/clear` travels the same path a brief does. Two cautions come with that:
+`submit_to` returns whether the write reached the PTY, which is not the same as
+the CLI having acted on it, and the clear command differs per CLI, so it belongs
+next to the `SessionType` records in `src/lib/ipc.ts:34-41` rather than
+hard-coded at the call site.
+
+**Clearing is destructive and Pantheon cannot undo it.** This is the same loss
+described in "Restoring panes does not restore the agents that occupied them",
+except deliberate: a cleared pane is a fresh agent wearing an old pane id. So
+the interlock matters more than the feature. A pane holding an open task must
+never be cleared, and that is the one fact Pantheon does hold reliably, in the
+task table that `busy_label` (`src-tauri/src/mcp.rs:1044`) already reads. The
+honest pairing is clear-plus-brain: anything worth surviving the wipe should be
+written to shared context first, which is what that store is for.
+
+**The shape to aim for:** `list_sessions` carries a context-occupancy signal
+alongside busy and dead, the conductor can clear an idle pane it owns, and the
+clear is refused rather than queued when the pane has open work.
+
+Open questions before building:
+
+- **Where the number comes from.** Three candidates, none clean. Scraping the
+  CLI status line means teaching the backend to read pane output and parse a
+  different format per CLI, and re-parse it whenever any of them changes.
+  A self-report tool is honest and cheap, but arrives only as often as an agent
+  chooses to call it, and an agent in trouble stops calling anything. An estimate
+  Pantheon keeps by counting bytes it typed in and bytes it saw come back needs
+  no parsing and is systematically low, because it cannot see the files and tool
+  results the agent read on its own. The estimate is probably the right first
+  cut: it is always available, never blocks, and only has to be good enough to
+  rank panes against each other.
+- **Whether an estimate is worth showing.** A number that is confidently wrong
+  is worse than no number. If it ships as an estimate it must be labelled as one
+  in the roster line, not rendered as a measurement.
+- **Autonomy.** Same escalation shape as "Orchestrator may open the sessions the
+  work needs", and strictly worse if it goes wrong: spawning a pane wastes
+  quota, clearing one destroys work in progress. Human approval by default.
+- **Verification.** After the clear is typed, how does the conductor learn it
+  took effect? Without an observation channel the only evidence is the pane's
+  own next answer, which is circular.
+- **Bounding.** A conductor that can clear panes can clear them in a loop, and a
+  freshly cleared agent gives worse answers than the one it replaced. A ceiling
+  belongs here for the same reason `MAX_DISPATCHES` exists.
+
+## A pane whose model is failing looks exactly like a healthy idle one
+
+Liveness today detects one thing: process exit. A pane whose child has gone is
+marked `[DEAD, process exited]` at `src-tauri/src/mcp.rs:628`, and its open work
+is settled as abandoned. Every other failure is invisible. A provider that
+returns 429, a local model that never produces a first byte, an OpenRouter model
+that has left the free pool: in all three the CLI is alive, the process is
+healthy, the pane is idle, and the roster line is identical to a pane that is
+genuinely free. The cheapest pane to hand work to stays the one most likely to
+drop it.
+
+This is already documented from two other directions. "Model-aware dispatch"
+records the sess-4/sess-6/sess-8 run of 2026-08-13, where the local-Ollama pane
+produced nothing and nothing in the roster distinguished it from the OpenCode
+pane that worked. "Prior art: nobody has solved the OpenCode local-model
+timeout" establishes that the 30s interactive ceiling is upstream and unfixed,
+so silent local failures are the expected case here, not an anomaly.
+
+**Scope this against what the free-model router already absorbs.** Per the
+guardrail entry, `~/.config/opencode/opencode.json` pins
+`openrouter/openrouter/free`, which selects per request from the live free pool.
+That already survives one model leaving the pool, so "swap to another free
+OpenRouter model" is largely solved for the single-model case and should not be
+rebuilt. What the router does not absorb is the two failures actually worth
+handling: the account-wide free quota (20 requests/minute, 50/day below $10
+lifetime credit) and the local-provider hang.
+
+**The quota case makes naive per-pane fallback actively harmful.** Free quota is
+account-wide, not per session, so when it runs out it runs out for every OpenCode
+pane at once. Rotating a rate-limited pane onto a different free model walks it
+into the same wall, and doing that across a fan-out burns the retry budget of
+every pane in parallel. The correct response to a 429 is to stop dispatching and
+tell the human, or to fall back to a local model, never to rotate within the
+tier that just refused.
+
+**Detection has to be external to the failing agent, which is the hard part.**
+The obvious design, an agent that reports its own provider error through a tool,
+fails precisely when it is needed: the inference loop that would make that call
+is the thing that broke. So the signal must come from Pantheon, and Pantheon's
+only current evidence is the `last_output` timestamp written at
+`src-tauri/src/lib.rs:1113`. That timestamp is more useful than it currently
+looks. A pane that emits a short burst seconds after a dispatch and then goes
+silent has almost certainly errored; a slow local model is quiet for a long time
+and then talks. Shape of silence, not duration of silence, is what separates
+them, and Pantheon records enough to tell the difference without reading a byte
+of content.
+
+**Switching the model is blocked on a fact Pantheon never acquires.**
+`SESSION_TYPES` (`src/lib/ipc.ts:34-41`) launches every CLI bare, with no model
+flag, so Pantheon does not know what a pane is running and has no handle on it.
+Typing `/models` into OpenCode opens an interactive picker, which the
+type-then-Enter path in `submit_to` cannot drive reliably. The paths that do work
+are non-interactive: relaunch the pane as `opencode -m provider/model`, or send
+the work through `opencode run -m provider/model` as the headless-dispatch entry
+proposes. Both make this entry depend on Pantheon learning and passing the model,
+which is "Model-aware dispatch". That entry is the prerequisite, not a parallel
+nice-to-have.
+
+**The shape to aim for:** a per-pane health state that distinguishes "working
+slowly" from "the provider refused", and a bounded recovery ladder the conductor
+can climb: re-dispatch to a different live pane first (cheapest, and already
+possible today), then a model switch, then mark the pane unusable and say so in
+the roster. Each step recorded on the task so the human can see what was tried.
+
+Open questions before building:
+
+- **Relaunching to change a model destroys the pane's conversation**, which is
+  the same irreversible act as the clear described above. The two features share
+  a mechanism and should share one consent rule rather than growing two.
+- **Where the fallback list comes from.** `MODEL-GUIDE.md` again, read from a
+  configured path, not vendored. The same staleness argument applies.
+- **Telling an error apart from a terse success.** An agent that did the work
+  and answered in one line also produces a short burst then silence. The task
+  table knows whether `complete_task` was called, which is the disambiguator,
+  but only after the fact.
+- **Bounding the ladder.** A task failing for its own reasons will happily walk
+  a switch loop through the entire free pool. Cap attempts per task, not per
+  pane, and make exhaustion a visible refusal rather than a quiet stall.
+- **Who is told.** A silent automatic recovery hides exactly the signal the
+  human needs when a provider is degrading. Recovery should be loud in the
+  conductor feed even when it succeeds.
