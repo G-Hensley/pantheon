@@ -48,6 +48,7 @@ export function TerminalPane({
   isolate,
   cwd,
   reuseWorktree,
+  model,
   onExit,
   onIsolationChange,
   onSpawnError,
@@ -60,6 +61,7 @@ export function TerminalPane({
   // through so a restored isolated pane rejoins its own worktree rather than
   // abandoning it and cutting a second one.
   reuseWorktree?: SavedWorktree;
+  model?: string;
   onExit: (id: string) => void;
   // Isolation was refused and the user chose to carry on without it, so the
   // pane's remembered isolation has to change with it.
@@ -209,6 +211,8 @@ export function TerminalPane({
         // without isolation means there is no worktree to rejoin, and handing
         // one over anyway would ask the backend for a contradiction.
         reuseWorktree: withIsolation ? reuseWorktree : undefined,
+        model: model && model.length > 0 ? model : undefined,
+        modelFlag: type.modelFlag,
       }).catch((e) => {
         const message = spawnErrorText(e);
         writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);

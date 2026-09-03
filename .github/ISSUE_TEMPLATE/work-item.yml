@@ -1,0 +1,63 @@
+name: Work item
+description: A unit of work, with an explicit condition for being finished.
+title: "<verb the work, not the area>"
+labels: ["work-item"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The heading structure this form produces is a contract. An agent creating
+        the same issue with `gh issue create --body-file` must produce the same
+        headings, so one parser reads both. See `docs/templates/README.md`.
+
+  - type: textarea
+    id: done_when
+    attributes:
+      label: Done when
+      description: >-
+        The observable condition that ends this work. Write what a reader could
+        check without asking you. Name the test that fails today, the command and
+        its expected output, or the file and the state it must be in. "Refactor
+        the loader" is not a condition; "the loader keeps an unknown field intact
+        across a save, proven by a test that fails against the current save path"
+        is.
+      placeholder: <what is true when this is finished, checkable by someone else>
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P1
+        - P2
+        - P3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      description: >-
+        Mirrors the status label. Open and closed alone cannot express the
+        difference between queued, claimed, and awaiting review.
+      options:
+        - backlog
+        - todo
+        - doing
+        - review
+    validations:
+      required: true
+
+  - type: textarea
+    id: links
+    attributes:
+      label: Links
+      description: >-
+        Files, pull requests, or issues this depends on or touches. Reasoning
+        belongs in the project's own backlog document, linked from here. A task
+        links to its reasoning; it does not swallow it.
+    validations:
+      required: false

@@ -170,6 +170,39 @@ fn is_codex(program: &str) -> bool {
     p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
 }
 
+/// Whether a model id is a paid OpenRouter model that must be refused for opencode.
+///
+/// OpenRouter free-tier models have ids ending in `:free`, or exactly
+/// `openrouter/free` / `openrouter/openrouter/free`. Anything else under
+/// `openrouter/` is paid. Local providers (ollama, llama.cpp, lmstudio, etc.)
+/// never match `openrouter/` and are therefore always allowed.
+///
+/// The id is trimmed first so a leading or trailing space — the kind of thing a
+/// paste or a quoted shell argument leaves behind — cannot silently downgrade a
+/// paid id to a free one. Empty model is allowed (the CLI picks its own default).
+fn is_paid_openrouter_model(model: &str) -> bool {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed.starts_with("openrouter/") {
+        return false;
+    }
+    // Strip the leading "openrouter/" prefix, then check the remainder.
+    let stripped = &trimmed["openrouter/".len()..];
+    if stripped == "free" {
+        return false;
+    }
+    // Accept "openrouter/free" (stripped == "free") and "openrouter/openrouter/free" (stripped == "openrouter/free")
+    if stripped == "openrouter/free" {
+        return false;
+    }
+    if stripped.ends_with(":free") {
+        return false;
+    }
+    true
+}
+
 /// Whether the Enter that submits a prompt can be sent yet.
 ///
 /// Split out from the waiting loop so the policy is testable without a live PTY.
@@ -959,6 +992,13 @@ async fn spawn_session(
     // The worktree this session used before the app was last closed, when the
     // frontend is restoring a remembered pane. See `choose_worktree`.
     reuse_worktree: Option<worktree::Saved>,
+    // Optional model override (e.g., "openrouter/free"). If provided, the
+    // corresponding flag is prepended to args.
+    model: Option<String>,
+    // The model flag to use (e.g., "--model" for claude, "-m" for codex/opencode).
+    // Comes from the frontend's SessionType definition so there's a single
+    // source of truth for which CLI uses which flag.
+    model_flag: Option<String>,
 ) -> Result<(), SpawnError> {
     // Refuse a session id that is already live. Inserting over one would replace
     // the handle without killing the process or removing its worktree, orphaning
@@ -969,6 +1009,19 @@ async fn spawn_session(
         return Err(SpawnError::failed(format!(
             "session {session_id} is already running"
         )));
+    }
+
+    // Free-model guard for opencode: only allow openrouter/* models that are
+    // free-tier. Local providers (ollama, lmstudio, etc.) are allowed.
+    if program == "opencode" {
+        if let Some(ref m) = model {
+            if is_paid_openrouter_model(m) {
+                return Err(SpawnError::failed(format!(
+                    "Refused: model '{}' is a paid OpenRouter model. opencode will only launch with openrouter/* models that end in ':free' or equal 'openrouter/free' (or 'openrouter/openrouter/free').",
+                    m
+                )));
+            }
+        }
     }
 
     // Decide where this session runs: the project dir, or its own git worktree
@@ -1009,7 +1062,8 @@ async fn spawn_session(
                 let url = format!("http://127.0.0.1:{}/mcp", server.port);
                 let token = server.token.clone();
                 rollback.server = Some(server);
-                shared.note_session(&session_id, &program);
+                let model_str = model.as_deref().unwrap_or("");
+                shared.note_session(&session_id, &program, model_str);
                 agent_mcp_wiring(&program, &session_id, &url, Some(&token))
             }
             // Endpoint failed: fall back to the shared one. The agent can still reach
@@ -1021,6 +1075,8 @@ async fn spawn_session(
             // still open.
             Err(e) => {
                 eprintln!("[pantheon] session endpoint failed, using shared: {e}");
+                let model_str = model.as_deref().unwrap_or("");
+                shared.note_session(&session_id, &program, model_str);
                 agent_mcp_wiring(&program, &session_id, &mcp.url, None)
             }
         };
@@ -1061,6 +1117,14 @@ async fn spawn_session(
             return Err(SpawnError::failed(format!(
                 "session {session_id} is already running"
             )));
+        }
+
+        // Prepend the model flag and model to the command when both are provided.
+        // The model_flag comes from the frontend's SessionType definition, so
+        // there's a single source of truth for which CLI uses which flag.
+        if let (Some(ref m), Some(ref flag)) = (model, model_flag) {
+            args.insert(0, flag.clone());
+            args.insert(1, m.clone());
         }
 
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
@@ -1404,6 +1468,7 @@ mod tests {
         resolve_isolation, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
         IsolationReason, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS,
         SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        is_paid_openrouter_model,
     };
     use std::fs;
 
@@ -2145,5 +2210,41 @@ mod tests {
         let extra = vec![("TERM".to_string(), "xterm-kitty".to_string())];
         let cmd = build_command("bash", &[], Path::new("."), &extra);
         assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-kitty");
+    }
+
+    // Free-model guard tests: paid id, :free id, both router spellings,
+    // local id, empty model.
+    #[test]
+    fn free_model_guard_refuses_paid_openrouter_id() {
+        assert!(is_paid_openrouter_model("openrouter/claude-sonnet-4"));
+        assert!(is_paid_openrouter_model("openrouter/gpt-4o"));
+        assert!(is_paid_openrouter_model("openrouter/anthropic/claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn free_model_guard_allows_free_openrouter_ids() {
+        assert!(!is_paid_openrouter_model("openrouter/free"));
+        assert!(!is_paid_openrouter_model("openrouter/openrouter/free"));
+        assert!(!is_paid_openrouter_model("openrouter/anthropic/claude-3-5-sonnet:free"));
+        assert!(!is_paid_openrouter_model("openrouter/any-model:free"));
+    }
+
+    #[test]
+    fn free_model_guard_allows_local_and_empty_models() {
+        assert!(!is_paid_openrouter_model("ollama/llama3"));
+        assert!(!is_paid_openrouter_model("llama"));
+        assert!(!is_paid_openrouter_model("lmstudio/mistral"));
+        assert!(!is_paid_openrouter_model(""));
+    }
+
+    #[test]
+    fn free_model_guard_trims_whitespace_before_check() {
+        // A pasted or quoted model id with surrounding whitespace must not be
+        // silently downgraded from paid to free.
+        assert!(is_paid_openrouter_model(" openrouter/claude-sonnet-4"));
+        assert!(is_paid_openrouter_model("openrouter/claude-sonnet-4 "));
+        assert!(is_paid_openrouter_model("\topenrouter/gpt-4o\n"));
+        // Free-tier with whitespace is still free.
+        assert!(!is_paid_openrouter_model(" openrouter/free "));
     }
 }

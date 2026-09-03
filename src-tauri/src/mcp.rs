@@ -107,7 +107,7 @@ fn conductor_briefing(peers: &[String]) -> String {
     } else {
         format!(
             "Live sessions you can dispatch to: {}.",
-            // Just id and model. `roster_lines` also carries brain= and the
+            // Just id, kind, and model. `roster_lines` also carries brain= and the
             // conductor marker, which are useful in list_sessions output but are
             // noise in a line the user has to read and type around; the agent can
             // call list_sessions for the full picture.
@@ -141,10 +141,15 @@ pub struct Entry {
     pub room: String, // which brain this belongs to
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct AgentSession {
     pub name: String,
     pub kind: String,
+    /// The model id the user selected at launch, or empty when none was given.
+    /// Empty is a deliberate distinction from "unknown": an empty string means
+    /// the user chose not to pass one, and the CLI picked its own default.
+    #[serde(default)]
+    pub model: String,
 }
 
 /// One dispatched unit of work, from the conductor to another session.
@@ -581,25 +586,34 @@ impl Shared {
     /// Record a session the app already knows about (dedicated endpoint), so it
     /// shows up in list_sessions without the agent announcing itself.
     ///
-    /// Refreshes the kind when a name reconnects under a different one, rather
-    /// than recording it once and never looking again. A pane's id is stable
-    /// across relaunches but the CLI in it is not â€” the same id can be closed
-    /// as one agent and reopened as another â€” and a roster line that still
-    /// named the old CLI was actively misleading a conductor about what it was
-    /// dispatching to.
-    pub fn note_session(&self, name: &str, kind: &str) {
+    /// Refreshes whichever of `kind` or `model` changed when a name
+    /// reconnects, rather than recording it once and never looking again. A
+    /// pane's id is stable across relaunches but the CLI in it is not, the
+    /// same id can be closed as one agent and reopened as another, and its
+    /// model can change on a relaunch with a different flag; a roster line
+    /// that still named the old CLI or model was actively misleading a
+    /// conductor about what it was dispatching to.
+    pub fn note_session(&self, name: &str, kind: &str, model: &str) {
         let to_persist = {
             let mut s = self.sessions.lock().unwrap();
             match s.iter_mut().find(|a| a.name == name) {
-                Some(existing) if existing.kind != kind => {
-                    existing.kind = kind.to_string();
-                    Some(existing.clone())
+                Some(existing) => {
+                    let mut changed = false;
+                    if existing.kind != kind {
+                        existing.kind = kind.to_string();
+                        changed = true;
+                    }
+                    if existing.model != model {
+                        existing.model = model.to_string();
+                        changed = true;
+                    }
+                    changed.then(|| existing.clone())
                 }
-                Some(_) => None,
                 None => {
                     let session = AgentSession {
                         name: name.to_string(),
                         kind: kind.to_string(),
+                        model: model.to_string(),
                     };
                     s.push(session.clone());
                     Some(session)
@@ -679,8 +693,13 @@ impl Shared {
                          do not dispatch]"
                     );
                 }
+                let model_display = identified
+                    .iter()
+                    .find(|a| &a.name == id)
+                    .map(|a| a.model.as_str())
+                    .unwrap_or("model unknown");
                 format!(
-                    "- {id} ({kind}) brain={room}{role}{}{}",
+                    "- {id} ({kind}, {model_display}) brain={room}{role}{}{}",
                     busy_label(busy),
                     reviewing_label(reviewing)
                 )
@@ -2350,9 +2369,23 @@ impl BrainHandler {
             }
             return format!("Already identified as '{b}' â€” Pantheon knows this session.");
         }
+        // Preserve the model the session was launched with: an agent that
+        // re-identifies must not lose the model that was set at spawn, because
+        // the roster would drop it and the conductor would see a different
+        // pane than the one that actually exists.
+        let existing_model = self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.name == p.name)
+            .map(|a| a.model.clone())
+            .unwrap_or_default();
         let session = AgentSession {
             name: p.name.clone(),
             kind: p.kind.clone(),
+            model: existing_model,
         };
         *self.identity.lock().unwrap() = Some(session.clone());
         // Replace rather than append: an agent that identifies twice should not
@@ -2447,7 +2480,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
+        description = "List the other AI agents live in this workspace right now, with their CLI kind, model (if one was set at launch), brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -4024,6 +4057,7 @@ mod tests {
         let session = AgentSession {
             name: "sess-1".into(),
             kind: "codex".into(),
+            model: String::new(),
         };
         let pending = Task {
             id: "task-1".into(),
@@ -5545,19 +5579,20 @@ mod tests {
     #[test]
     fn note_session_records_a_new_session() {
         let (shared, _dir) = shared_for_test();
-        shared.note_session("sess-9", "codex");
+        shared.note_session("sess-9", "codex", "sonnet");
 
         let sessions = shared.sessions_snapshot();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].kind, "codex");
+        assert_eq!(sessions[0].model, "sonnet");
     }
 
     #[test]
     fn note_session_refreshes_the_kind_when_a_pane_reconnects_differently() {
         let (shared, dir) = shared_for_test();
-        shared.note_session("sess-1", "codex");
+        shared.note_session("sess-1", "codex", "");
 
-        shared.note_session("sess-1", "claude");
+        shared.note_session("sess-1", "claude", "");
 
         let sessions = shared.sessions_snapshot();
         assert_eq!(
@@ -5574,10 +5609,31 @@ mod tests {
     }
 
     #[test]
-    fn note_session_is_a_no_op_when_the_kind_has_not_changed() {
+    fn note_session_refreshes_the_model_when_a_pane_reconnects_with_a_different_model() {
         let (shared, dir) = shared_for_test();
-        shared.note_session("sess-1", "codex");
-        shared.note_session("sess-1", "codex");
+        shared.note_session("sess-1", "claude", "sonnet");
+
+        shared.note_session("sess-1", "claude", "opus");
+
+        let sessions = shared.sessions_snapshot();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a reconnect must not duplicate the roster entry"
+        );
+        assert_eq!(sessions[0].model, "opus");
+
+        // Persisted, not just held in memory: a reload must see the refresh.
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.sessions.len(), 1);
+        assert_eq!(reloaded.sessions[0].model, "opus");
+    }
+
+    #[test]
+    fn note_session_is_a_no_op_when_neither_kind_nor_model_has_changed() {
+        let (shared, dir) = shared_for_test();
+        shared.note_session("sess-1", "codex", "");
+        shared.note_session("sess-1", "codex", "");
 
         // Only one record should have been appended; the file it would have
         // grown is the cheapest way to see a silent extra write.
