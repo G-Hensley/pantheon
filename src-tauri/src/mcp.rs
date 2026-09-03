@@ -209,6 +209,17 @@ pub struct Task {
     /// the fields above: older records predate it and load as empty.
     #[serde(default)]
     pub exchanges: Vec<Exchange>,
+    /// True while this task is `in_review` or `rework` and its named reviewer
+    /// is not live. Not abandonment: the submitted work already exists, so a
+    /// dead reviewer means nobody will sign it off, not that nothing is there
+    /// to sign off on. Set and cleared by the same sweep that abandons a dead
+    /// target, so it is never stale by more than one reconciliation.
+    ///
+    /// `serde(default)` for the same reason as the fields above: tasks already
+    /// written to `brain.jsonl` predate it and load as `false`, which is the
+    /// honest answer before the first sweep has looked.
+    #[serde(default)]
+    pub reviewer_gone: bool,
 }
 
 /// One question from a working agent and the conductor's answer to it.
@@ -335,10 +346,17 @@ const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 
 /// How long `wait_for_tasks` waits when the caller does not say.
 ///
-/// Ten minutes is under the overdue threshold on purpose. A default that ran
-/// past it would routinely return "still running" for work the roster has
-/// already flagged as slow, which tells the conductor nothing it did not know.
-const WAIT_DEFAULT_SECS: u64 = 600;
+/// Measured 2026-09-03: a Claude Code pane's MCP transport kills the call
+/// somewhere between 45 and 110 seconds ("The operation timed out"), while a
+/// 45 second call reliably returns. The previous ten-minute default never
+/// fired on that host at all â€” the transport gave up first, so the caller got
+/// a transport error rather than the honest "still running" this tool exists
+/// to report, and had no way to tell the two apart. 45 sits inside the
+/// measured working range rather than at its edge, and the tool description
+/// says outright that a wait returns within this window and should simply be
+/// called again: a conductor that treats one call as the whole wait was the
+/// failure mode a longer default invited.
+const WAIT_DEFAULT_SECS: u64 = 45;
 
 /// The longest any single wait may last, whatever the caller asks for.
 ///
@@ -346,7 +364,12 @@ const WAIT_DEFAULT_SECS: u64 = 600;
 /// on a pane that will never answer. Dead panes are settled by
 /// `reconcile_abandoned`, which ends a wait properly, but a live pane that has
 /// simply stopped is not detectable, and this is the backstop for that case.
-const WAIT_MAX_SECS: u64 = 1800;
+/// Capped at 55, not 1800: the same transport measurement that set
+/// `WAIT_DEFAULT_SECS` puts failure somewhere between 45 and 110 seconds, so a
+/// cap anywhere near the old 30 minutes was never reachable from a Claude Code
+/// pane â€” the call would die en route and look like a hang rather than the
+/// timeout report this tool is supposed to hand back.
+const WAIT_MAX_SECS: u64 = 55;
 
 /// How often a wait re-reads task state.
 ///
@@ -369,6 +392,15 @@ pub struct DispatchOutcome {
     /// conductor usually did not choose this: omitting a reviewer picks one,
     /// and a conductor that is not told which cannot follow up.
     pub reviewer: String,
+    /// The id of a task the target already held open, if it did. Dispatch does
+    /// NOT refuse on this: it types the new brief in on top of the old one
+    /// exactly as before, because holding the queue for a future queue
+    /// (BACKLOG.md's per-pane queue item) is a bigger change than Phase 1
+    /// makes. What changes is that the conductor is told, rather than
+    /// discovering it later as a brief the target never seemed to act on:
+    /// naming the id gives it something to act on, cancel_task or
+    /// reassign_task, before piling on more work.
+    pub already_busy: Option<String>,
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
@@ -548,18 +580,35 @@ impl Shared {
 
     /// Record a session the app already knows about (dedicated endpoint), so it
     /// shows up in list_sessions without the agent announcing itself.
+    ///
+    /// Refreshes the kind when a name reconnects under a different one, rather
+    /// than recording it once and never looking again. A pane's id is stable
+    /// across relaunches but the CLI in it is not â€” the same id can be closed
+    /// as one agent and reopened as another â€” and a roster line that still
+    /// named the old CLI was actively misleading a conductor about what it was
+    /// dispatching to.
     pub fn note_session(&self, name: &str, kind: &str) {
-        let mut s = self.sessions.lock().unwrap();
-        if !s.iter().any(|a| a.name == name) {
-            let session = AgentSession {
-                name: name.to_string(),
-                kind: kind.to_string(),
-            };
-            let dir = self.dir.lock().unwrap().clone();
-            let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
-            s.push(session);
-        }
-        drop(s);
+        let to_persist = {
+            let mut s = self.sessions.lock().unwrap();
+            match s.iter_mut().find(|a| a.name == name) {
+                Some(existing) if existing.kind != kind => {
+                    existing.kind = kind.to_string();
+                    Some(existing.clone())
+                }
+                Some(_) => None,
+                None => {
+                    let session = AgentSession {
+                        name: name.to_string(),
+                        kind: kind.to_string(),
+                    };
+                    s.push(session.clone());
+                    Some(session)
+                }
+            }
+        };
+        let Some(session) = to_persist else { return };
+        let dir = self.dir.lock().unwrap().clone();
+        let _ = append_record(&dir, &StoreRecord::Session(session));
         self.app.emit("context-changed");
     }
 
@@ -586,13 +635,9 @@ impl Shared {
         // listed exactly like an idle one, so a conductor picks it again and
         // waits on a result that is not coming. The open task and its age are
         // the cheapest honest signal available here.
-        let open_for: Vec<(String, u64)> = {
+        let (open_for, in_review_for) = {
             let tasks = self.tasks.lock().unwrap();
-            tasks
-                .iter()
-                .filter(|t| is_open(&t.status))
-                .map(|t| (t.target.clone(), now.saturating_sub(t.ts_ms)))
-                .collect()
+            attribute_open_tasks(&tasks, now)
         };
         // Held sessions, not live ones: a pane whose process has died is still
         // worth a line, marked dead, because a conductor that simply stops
@@ -620,6 +665,11 @@ impl Shared {
                     .filter(|(target, _)| target == id)
                     .map(|(_, age_ms)| *age_ms)
                     .max();
+                let reviewing = in_review_for
+                    .iter()
+                    .filter(|(reviewer, _)| reviewer == id)
+                    .map(|(_, age_ms)| *age_ms)
+                    .max();
                 // A dead pane says so instead of reporting how busy it is. Its
                 // tasks have just been abandoned, so any busy label would be
                 // describing work that no longer exists.
@@ -629,7 +679,11 @@ impl Shared {
                          do not dispatch]"
                     );
                 }
-                format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
+                format!(
+                    "- {id} ({kind}) brain={room}{role}{}{}",
+                    busy_label(busy),
+                    reviewing_label(reviewing)
+                )
             })
             .collect()
     }
@@ -998,6 +1052,14 @@ impl Shared {
             return Err("dispatch budget exhausted for this run.".to_string());
         }
 
+        // Read before this dispatch's own task is added, so it can only ever
+        // name work that predates this call. Not a refusal: Phase 2's per-pane
+        // queue is where holding the brief instead of typing it belongs. For
+        // now the target still gets the new brief typed in on top, and the
+        // conductor gets told there was already something there, rather than
+        // finding out only when the first brief's result never comes.
+        let already_busy = open_task_for_target(&self.tasks.lock().unwrap(), target);
+
         self.add_task(Task {
             id: id.clone(),
             from: from.to_string(),
@@ -1009,6 +1071,7 @@ impl Shared {
             reviewer: reviewer.clone(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             done_ms: None,
         });
 
@@ -1024,7 +1087,90 @@ impl Shared {
             task_id: id,
             delivered,
             reviewer,
+            already_busy,
         })
+    }
+
+    /// Cancel every id in `ids` that is still open, recording `reason` on
+    /// each. Conductor-only enforcement lives in the `cancel_task` tool, the
+    /// same as `dispatch_task`.
+    ///
+    /// Takes several ids in one call because the failure this exists for is a
+    /// pile of stale tasks, not one: 38 open tasks aged 1 to 113 hours,
+    /// measured 2026-09-03, with no way to close them at all. A conductor
+    /// clearing that pile one id per call is a conductor that gives up before
+    /// finishing.
+    fn cancel_tasks(&self, ids: &[String], reason: &str) -> Vec<(String, CancelOutcome)> {
+        let now = Self::now_ms();
+        let results: Vec<(String, CancelOutcome)> = {
+            let mut tasks = self.tasks.lock().unwrap();
+            ids.iter()
+                .map(|id| (id.clone(), cancel_pending(&mut tasks, id, reason, now)))
+                .collect()
+        };
+        let changed: Vec<Task> = {
+            let tasks = self.tasks.lock().unwrap();
+            results
+                .iter()
+                .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
+                .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
+                .collect()
+        };
+        if !changed.is_empty() {
+            let dir = self.dir.lock().unwrap().clone();
+            for task in changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task));
+            }
+            self.app.emit("conductor-changed");
+        }
+        results
+    }
+
+    /// Retarget a pending/overdue task to a new live session, redelivering the
+    /// same brief, or hand an in_review/rework task to a new live reviewer.
+    /// Conductor-only enforcement lives in the `reassign_task` tool, the same
+    /// as `dispatch_task`.
+    ///
+    /// Returns the task as it stands after the change, plus whether
+    /// redelivery reached the new target's terminal. The second value is
+    /// meaningless (`true`) when this call only changed the reviewer, because
+    /// nothing is typed into a terminal for that: a reviewer's assignment is
+    /// carried entirely by the `reviewer` field, the same way it is when
+    /// `dispatch_task` first chooses one.
+    fn reassign_task(
+        &self,
+        id: &str,
+        new_target: Option<&str>,
+        new_reviewer: Option<&str>,
+    ) -> Result<(Task, bool), ReassignError> {
+        let live = self.reconcile_abandoned();
+        let retargeting = new_target.is_some();
+        let task = {
+            let mut tasks = self.tasks.lock().unwrap();
+            reassign_pending(
+                &mut tasks,
+                id,
+                new_target,
+                new_reviewer,
+                &live,
+                Self::now_ms(),
+            )?
+        };
+        self.persist_task(id);
+        self.app.emit("conductor-changed");
+
+        if !retargeting {
+            return Ok((task, true));
+        }
+        // Same delivery path `dispatch_task` uses, so a reassigned brief looks
+        // to the new target exactly like a fresh dispatch: typed into its
+        // terminal, Enter sent separately.
+        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
+        let delivered = self.engine.submit_to(&task.target, &injection);
+        if !delivered {
+            self.mark_delivery_failed(&task.id);
+        }
+        Ok((task, delivered))
     }
 }
 
@@ -1041,6 +1187,47 @@ impl Shared {
 /// tells a conductor to stop waiting and consider another target. A pane that
 /// took a task and went silent was previously indistinguishable from an idle
 /// one, and got picked again.
+/// The id of an open task the given target already holds, if any. Pure over a
+/// task list so `dispatch`'s "already busy" note is testable without a live
+/// `Shared`. The oldest match is not singled out here the way `roster_lines`
+/// singles out the oldest for its label; naming any one open task is enough
+/// to tell the conductor there was already something there.
+fn open_task_for_target(tasks: &[Task], target: &str) -> Option<String> {
+    tasks
+        .iter()
+        .find(|t| t.target == target && is_open(&t.status))
+        .map(|t| t.id.clone())
+}
+
+/// Who holds an open task, and for how long: a session name paired with the
+/// task's age. Named so `attribute_open_tasks`'s signature reads, rather than
+/// repeating the pair inline twice.
+type AgeBySession = Vec<(String, u64)>;
+
+/// Who each open task counts against for the roster's busy/reviewing labels,
+/// and for how long. Pure over a task list, so the attribution rule is
+/// testable without a live `Shared` or a running pane.
+///
+/// Attribution differs by status: an `in_review` task is waiting on its
+/// reviewer, not its target, who already submitted and is free to take more
+/// work. Counting it against the target is the bug that left a pane reading
+/// `[busy, OVERDUE]` forever after it had finished and handed the result off.
+/// Every other open status still names the target, who is the one actually
+/// holding the work.
+fn attribute_open_tasks(tasks: &[Task], now_ms: u64) -> (AgeBySession, AgeBySession) {
+    let mut busy = Vec::new();
+    let mut reviewing = Vec::new();
+    for t in tasks.iter().filter(|t| is_open(&t.status)) {
+        let age_ms = now_ms.saturating_sub(t.ts_ms);
+        if t.status == "in_review" {
+            reviewing.push((t.reviewer.clone(), age_ms));
+        } else {
+            busy.push((t.target.clone(), age_ms));
+        }
+    }
+    (busy, reviewing)
+}
+
 fn busy_label(oldest_open_ms: Option<u64>) -> String {
     match oldest_open_ms {
         None => String::new(),
@@ -1048,6 +1235,18 @@ fn busy_label(oldest_open_ms: Option<u64>) -> String {
             format!(" [busy {}, OVERDUE, may be stuck]", human_ms(ms))
         }
         Some(ms) => format!(" [busy {}]", human_ms(ms)),
+    }
+}
+
+/// What to append to a roster line for the oldest `in_review` task a pane is
+/// reviewing. A separate label from `busy_label`, not a shared one with
+/// different wording, because the two describe different roles: a pane can be
+/// both a target holding its own work and a reviewer holding someone else's,
+/// and a conductor needs to be able to tell which is which at a glance.
+fn reviewing_label(oldest_review_ms: Option<u64>) -> String {
+    match oldest_review_ms {
+        None => String::new(),
+        Some(ms) => format!(" [reviewing {}]", human_ms(ms)),
     }
 }
 
@@ -1070,8 +1269,10 @@ fn age(t: &mut Task, now: u64) {
     }
 }
 
-/// Flip every open task whose target pane is gone to `abandoned`, returning the
-/// ones that changed so the caller can persist and announce them.
+/// Flip every open task whose *actor* is gone to `abandoned`, and flag (or
+/// clear) `reviewer_gone` on an `in_review`/`rework` task whose reviewer is
+/// not live. Returns every task that changed, so the caller can persist and
+/// announce them.
 ///
 /// Pure over a task list and a roster, with no lock, no clock and no I/O, so
 /// the transition can be tested directly. `live` is the set of panes whose
@@ -1086,10 +1287,48 @@ fn age(t: &mut Task, now: u64) {
 /// task whose agent had died sat open forever, and the conductor could not tell
 /// that from an agent still thinking. The absence of a result meant both, so it
 /// meant nothing.
+///
+/// `in_review` is a second fix for a related bug: this used to check the
+/// *target*'s liveness for every open status, including `in_review`, even
+/// though the target has already submitted and is no longer the actor â€” the
+/// reviewer is. That meant a target closing its pane after a clean submission
+/// could erase a result the reviewer had not even looked at yet, while a task
+/// stuck on a reviewer that no longer existed (the actual failure, see
+/// BACKLOG.md) went completely undetected: the target was still live, so
+/// nothing ever flagged it. `in_review` is therefore never abandoned by this
+/// sweep, whatever the target is doing; a dead reviewer is surfaced instead,
+/// because reassigning the reviewer is all it takes to recover, and abandoning
+/// a result nobody asked to discard would be worse than leaving it stuck.
+/// `rework` keeps the target-liveness check, because rework hands the
+/// reviewer's findings back to the target to act on, so the target is the
+/// actor again there.
 fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
     let mut changed = Vec::new();
     for t in tasks.iter_mut() {
-        if !is_open(&t.status) || live.iter().any(|id| id == &t.target) {
+        if !is_open(&t.status) {
+            continue;
+        }
+
+        if matches!(t.status.as_str(), "in_review" | "rework") {
+            // An empty reviewer means review was waived, so there is no
+            // reviewer to be gone; that combination should not occur for
+            // these statuses in practice (see `finish_pending` and
+            // `choose_reviewer`), but treating it as "not gone" is the safe
+            // reading if it ever does.
+            let reviewer_gone = !t.reviewer.is_empty() && !live.iter().any(|id| id == &t.reviewer);
+            if t.reviewer_gone != reviewer_gone {
+                t.reviewer_gone = reviewer_gone;
+                changed.push(t.clone());
+            }
+            if t.status == "in_review" {
+                continue;
+            }
+            // rework still falls through to the target-liveness check below:
+            // the reviewer flag above is informational, not a substitute for
+            // settling a rework task whose implementer is actually gone.
+        }
+
+        if live.iter().any(|id| id == &t.target) {
             continue;
         }
         t.status = STATUS_ABANDONED.to_string();
@@ -1367,6 +1606,158 @@ fn task_for_dispatcher<'a>(
     Ok(task)
 }
 
+/// Add a note to a task's result without losing what was already there. Used
+/// by both `cancel_pending` and `reassign_pending`, whose refusals must never
+/// look like the erasure of a real result: submitted work is exactly what a
+/// conductor is trying to recover when it reaches for either tool.
+fn append_note(t: &mut Task, note: &str) {
+    t.result = if t.result.is_empty() {
+        note.to_string()
+    } else {
+        format!("{}\n\n{note}", t.result)
+    };
+}
+
+/// What happened to one id passed to `cancel_pending`.
+#[derive(Debug, PartialEq)]
+enum CancelOutcome {
+    Cancelled,
+    /// Already done, error, cancelled, or abandoned. Not a refusal: asking to
+    /// cancel work that already finished is a stale request, not a mistake,
+    /// and the 38-stale-task diagnosis this tool exists to clear out is
+    /// exactly the situation where a conductor does not know which is which.
+    AlreadyTerminal,
+    NotFound,
+}
+
+/// Cancel one task if it is still open (pending, overdue, in_review, rework,
+/// or blocked), recording why. Pure over a task list, so the transition is
+/// testable without a live `Shared`.
+///
+/// Conductor-only enforcement lives in the `cancel_task` tool, the same way
+/// it does for `dispatch`: this function has no notion of who may call it,
+/// only of what cancelling means once the caller is already authorized.
+fn cancel_pending(tasks: &mut [Task], id: &str, reason: &str, now_ms: u64) -> CancelOutcome {
+    let Some(t) = tasks.iter_mut().find(|t| t.id == id) else {
+        return CancelOutcome::NotFound;
+    };
+    if !is_open(&t.status) {
+        return CancelOutcome::AlreadyTerminal;
+    }
+    let reason = reason.trim();
+    append_note(
+        t,
+        &if reason.is_empty() {
+            "Cancelled by the conductor.".to_string()
+        } else {
+            format!("Cancelled by the conductor: {reason}")
+        },
+    );
+    t.status = "cancelled".to_string();
+    t.done_ms = Some(now_ms);
+    CancelOutcome::Cancelled
+}
+
+/// Why a reassignment was refused.
+#[derive(Debug, PartialEq)]
+enum ReassignError {
+    NotFound,
+    /// `target` was given but the task is not pending or overdue, so there is
+    /// nothing to redeliver.
+    NotOpenForRetarget,
+    /// `reviewer` was given but the task is not in_review or rework, so there
+    /// is no reviewer to replace.
+    NotOpenForReview,
+    /// Neither field was given, or both were. A task's status decides which
+    /// one field it accepts; naming both invites changing a status the caller
+    /// did not ask for, and naming neither leaves nothing to do.
+    AmbiguousChange,
+    SameTarget,
+    SameReviewer,
+    /// The named reviewer is also the target: the same self-certification
+    /// `choose_reviewer` already refuses at dispatch time.
+    ReviewerIsTarget,
+    NotLive(String),
+}
+
+/// Retarget a pending/overdue task, or hand an in_review/rework task to a new
+/// reviewer. Exactly one of `new_target` / `new_reviewer` may be set, because
+/// which field a task accepts depends on its status.
+///
+/// Pure over the task list and the live roster, so the branching is testable
+/// without a live `Shared`. Redelivering the brief to a new target happens in
+/// `Shared::reassign_task`, which is the only place that can reach the
+/// engine; this function only decides whether the change is allowed and
+/// leaves the task ready for it.
+fn reassign_pending(
+    tasks: &mut [Task],
+    id: &str,
+    new_target: Option<&str>,
+    new_reviewer: Option<&str>,
+    live: &[String],
+    now_ms: u64,
+) -> Result<Task, ReassignError> {
+    let (new_target, new_reviewer) = match (new_target, new_reviewer) {
+        (Some(target), None) if !target.is_empty() => (Some(target), None),
+        (None, Some(reviewer)) if !reviewer.is_empty() => (None, Some(reviewer)),
+        _ => return Err(ReassignError::AmbiguousChange),
+    };
+
+    let t = tasks
+        .iter_mut()
+        .find(|t| t.id == id)
+        .ok_or(ReassignError::NotFound)?;
+
+    if let Some(target) = new_target {
+        if !matches!(t.status.as_str(), "pending" | "overdue") {
+            return Err(ReassignError::NotOpenForRetarget);
+        }
+        if target == t.target {
+            return Err(ReassignError::SameTarget);
+        }
+        if !live.iter().any(|s| s == target) {
+            return Err(ReassignError::NotLive(target.to_string()));
+        }
+        append_note(
+            t,
+            &format!("[reassigned by conductor: target {} -> {target}]", t.target),
+        );
+        t.target = target.to_string();
+        // Fresh delivery, fresh clock: the old dispatch time would otherwise
+        // read as though the new target had already been sitting on it.
+        t.status = "pending".to_string();
+        t.ts_ms = now_ms;
+        return Ok(t.clone());
+    }
+
+    let reviewer = new_reviewer.expect("checked above: exactly one of the two is Some");
+    if !matches!(t.status.as_str(), "in_review" | "rework") {
+        return Err(ReassignError::NotOpenForReview);
+    }
+    if reviewer == t.reviewer {
+        return Err(ReassignError::SameReviewer);
+    }
+    if reviewer == t.target {
+        return Err(ReassignError::ReviewerIsTarget);
+    }
+    if !live.iter().any(|s| s == reviewer) {
+        return Err(ReassignError::NotLive(reviewer.to_string()));
+    }
+    let previous = if t.reviewer.is_empty() {
+        "(none)".to_string()
+    } else {
+        t.reviewer.clone()
+    };
+    append_note(
+        t,
+        &format!("[reassigned by conductor: reviewer {previous} -> {reviewer}]"),
+    );
+    t.reviewer = reviewer.to_string();
+    // The reviewer named here was just checked live, by the call above.
+    t.reviewer_gone = false;
+    Ok(t.clone())
+}
+
 fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
     let safe = !value.is_empty()
         && value != "."
@@ -1396,6 +1787,17 @@ fn mark_pending_error(tasks: &mut [Task], id: &str, now_ms: u64) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// The status shown to an agent, with a dead reviewer folded in so it cannot
+/// be rendered without it. Shared by `render_task` and `render_task_summary`
+/// so the full view and the abbreviated one never disagree about it.
+fn status_tag(t: &Task) -> String {
+    if t.reviewer_gone {
+        format!("{}, reviewer gone", t.status)
+    } else {
+        t.status.clone()
     }
 }
 
@@ -1432,15 +1834,31 @@ fn render_task(t: &Task) -> String {
         None => String::new(),
     };
 
+    // The other state where the reader is the one who has to act: nobody is
+    // going to sign this off until the conductor does something about it.
+    // Named explicitly rather than left to the status tag alone, because
+    // "in_review, reviewer gone" reads as a fact and this is a call to act.
+    let reviewer_gone = if t.reviewer_gone {
+        format!(
+            "\n--- reviewer gone ---\n'{}' is no longer live, so this cannot be signed off as \
+             is. reassign_task to hand review to someone else, or review it yourself if that \
+             makes sense here.",
+            t.reviewer
+        )
+    } else {
+        String::new()
+    };
+
+    let status = status_tag(t);
     if t.result.is_empty() {
         format!(
-            "[{}]{} {} â†’ {}{}",
-            t.status, sign_off, t.target, t.task, asked
+            "[{status}]{sign_off} {} â†’ {}{asked}{reviewer_gone}",
+            t.target, t.task
         )
     } else {
         format!(
-            "[{}]{} {} â†’ {}\n{}{}{}",
-            t.status, sign_off, t.target, t.task, t.result, findings, asked
+            "[{status}]{sign_off} {} â†’ {}\n{}{findings}{asked}{reviewer_gone}",
+            t.target, t.task, t.result
         )
     }
 }
@@ -1532,7 +1950,7 @@ fn render_task_summary(t: &Task) -> String {
     if t.status == "done" {
         format!("[done] {} â†’ {}\n{}", t.target, brief, t.result)
     } else {
-        format!("[{}] {} â†’ {}", t.status, t.target, brief)
+        format!("[{}] {} â†’ {}", status_tag(t), t.target, brief)
     }
 }
 
@@ -1618,6 +2036,21 @@ impl BrainHandler {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "unknown".to_string())
     }
+
+    /// The gate `dispatch`, `cancel_task`, and `reassign_task` all share:
+    /// conductor-only, checked here rather than on `Shared`, because it is
+    /// MCP-specific policy â€” `human_dispatch` (lib.rs) has no agent identity
+    /// to check it against, since the human already decided who to promote.
+    fn require_conductor(&self) -> Result<(), String> {
+        let me = self.author();
+        match self.shared.conductor() {
+            Some(c) if c == me => Ok(()),
+            Some(_) => Err("Refused: you are not the conductor of this workspace.".to_string()),
+            None => {
+                Err("Refused: no conductor is set. Ask the user to promote a pane.".to_string())
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1674,6 +2107,31 @@ pub struct DispatchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct CancelArgs {
+    /// One or more task_ids to cancel, separated by commas or spaces.
+    pub task_ids: String,
+    /// Why you're cancelling. Kept on the task, so the history says what
+    /// happened rather than just that it stopped.
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReassignArgs {
+    /// The task_id to reassign.
+    pub task_id: String,
+    /// New target for a pending or overdue task: redelivers the same brief to
+    /// this live session and resets its dispatch clock. Leave empty when you
+    /// are reassigning a reviewer instead.
+    #[serde(default)]
+    pub target: String,
+    /// New reviewer for an in_review or rework task. Leave empty when you are
+    /// retargeting a pending or overdue task instead.
+    #[serde(default)]
+    pub reviewer: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct ReviewArgs {
     /// The task_id you were asked to review.
     pub task_id: String,
@@ -1718,7 +2176,9 @@ pub struct WaitArgs {
     #[serde(default)]
     pub task_ids: String,
     /// Give up after this many seconds and report what is still running.
-    /// Defaults to 600 and is capped at 1800. A timeout cancels nothing.
+    /// Defaults to 45 and is capped at 55, sized to the host's own transport
+    /// timeout rather than the task. A timeout cancels nothing: call this
+    /// again with the same ids to keep waiting.
     #[serde(default)]
     pub timeout_seconds: u64,
 }
@@ -1883,7 +2343,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already holds an open task, this still delivers the new brief on top, but the response names the older task id so you can cancel_task or reassign_task it first rather than stacking work silently."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -1893,29 +2353,112 @@ impl BrainHandler {
         if self.shared.is_halted() {
             return "Refused: dispatch is halted by the user (Stop). Do not retry.".to_string();
         }
-        match self.shared.conductor() {
-            Some(c) if c == me => {}
-            Some(_) => {
-                return "Refused: you are not the conductor of this workspace.".to_string();
-            }
-            None => {
-                return "Refused: no conductor is set. Ask the user to promote a pane.".to_string()
-            }
+        if let Err(refusal) = self.require_conductor() {
+            return refusal;
         }
 
-        match self.shared.dispatch_task(&me, &p.target, &p.task, &p.reviewer) {
+        match self
+            .shared
+            .dispatch_task(&me, &p.target, &p.task, &p.reviewer)
+        {
             Err(e) => format!("Refused: {e}"),
-            Ok(o) if o.delivered && !o.reviewer.is_empty() => format!(
-                "Dispatched to {} as task {}. {} will review it before it counts as done, so                  expect status 'in_review' before 'done'. Poll get_task_result with that id.",
-                p.target, o.task_id, o.reviewer
+            Ok(o) => {
+                let mut msg = if o.delivered && !o.reviewer.is_empty() {
+                    format!(
+                        "Dispatched to {} as task {}. {} will review it before it counts as done, so                          expect status 'in_review' before 'done'. Poll get_task_result with that id.",
+                        p.target, o.task_id, o.reviewer
+                    )
+                } else if o.delivered {
+                    format!(
+                        "Dispatched to {} as task {} with NO review: nobody else is live to check it.                          Poll get_task_result with that id.",
+                        p.target, o.task_id
+                    )
+                } else {
+                    format!(
+                        "Task {} recorded for {} but delivery failed (could not write to that session) â€” status is 'error'.",
+                        o.task_id, p.target
+                    )
+                };
+                // Not a refusal: the brief still went in on top of whatever was
+                // already there. Naming the older task is what lets the
+                // conductor act on it, with cancel_task or reassign_task,
+                // rather than finding out only when nothing comes back.
+                if let Some(busy_id) = &o.already_busy {
+                    msg.push_str(&format!(
+                        " Note: {} already held open task {busy_id} before this one; \
+                         cancel_task or reassign_task it first if piling on was not intended.",
+                        p.target
+                    ));
+                }
+                msg
+            }
+        }
+    }
+
+    #[tool(
+        description = "Conductor only: cancel any open task (pending, overdue, in_review, rework, or blocked), permanently. Accepts several task_ids at once, comma or space separated, so a sweep of stale work is one call rather than one per id. A task that already finished, errored, was cancelled, or was abandoned is reported as already terminal rather than an error: cancelling it again is a no-op you can safely include in a sweep, not a mistake. Say why in reason; it is kept on the task, so the history says what happened rather than only that it stopped."
+    )]
+    fn cancel_task(&self, Parameters(p): Parameters<CancelArgs>) -> String {
+        if let Err(refusal) = self.require_conductor() {
+            return refusal;
+        }
+        let ids = parse_task_ids(&p.task_ids);
+        if ids.is_empty() {
+            return "Refused: name at least one task_id.".to_string();
+        }
+        let mut out = String::new();
+        for (id, outcome) in self.shared.cancel_tasks(&ids, &p.reason) {
+            let line = match outcome {
+                CancelOutcome::Cancelled => format!("{id}: cancelled."),
+                CancelOutcome::AlreadyTerminal => {
+                    format!("{id}: already finished, so there was nothing to cancel.")
+                }
+                CancelOutcome::NotFound => format!("{id}: no such task."),
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[tool(
+        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending or overdue task to a different live session: this retypes the same brief into the new target's terminal and resets its dispatch clock, the same as a fresh dispatch. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, or is the same as what is already there, naming why."
+    )]
+    fn reassign_task(&self, Parameters(p): Parameters<ReassignArgs>) -> String {
+        if let Err(refusal) = self.require_conductor() {
+            return refusal;
+        }
+        let target = (!p.target.is_empty()).then_some(p.target.as_str());
+        let reviewer = (!p.reviewer.is_empty()).then_some(p.reviewer.as_str());
+        match self.shared.reassign_task(&p.task_id, target, reviewer) {
+            Ok((task, delivered)) if target.is_some() && delivered => format!(
+                "Task '{}' reassigned to {}: redelivered and reset to pending.",
+                task.id, task.target
             ),
-            Ok(o) if o.delivered => format!(
-                "Dispatched to {} as task {} with NO review: nobody else is live to check it.                  Poll get_task_result with that id.",
-                p.target, o.task_id
+            Ok((task, _)) if target.is_some() => format!(
+                "Task '{}' reassigned to {} but redelivery failed (could not write to that                  session) â€” status is 'error'.",
+                task.id, task.target
             ),
-            Ok(o) => format!(
-                "Task {} recorded for {} but delivery failed (could not write to that session) â€” status is 'error'.",
-                o.task_id, p.target
+            Ok((task, _)) => format!(
+                "Task '{}' reassigned to reviewer {}.",
+                task.id, task.reviewer
+            ),
+            Err(ReassignError::NotFound) => format!("No task '{}'.", p.task_id),
+            Err(ReassignError::NotOpenForRetarget) => "Refused: target only applies to a                  pending or overdue task. Use reviewer for an in_review or rework task."
+                .to_string(),
+            Err(ReassignError::NotOpenForReview) => "Refused: reviewer only applies to an                  in_review or rework task. Use target for a pending or overdue task."
+                .to_string(),
+            Err(ReassignError::AmbiguousChange) => "Refused: set exactly one of target or                  reviewer, matching the task's current status."
+                .to_string(),
+            Err(ReassignError::SameTarget) => "Refused: that is already the target.".to_string(),
+            Err(ReassignError::SameReviewer) => {
+                "Refused: that is already the reviewer.".to_string()
+            }
+            Err(ReassignError::ReviewerIsTarget) => {
+                "Refused: the reviewer cannot be the session that did the work.".to_string()
+            }
+            Err(ReassignError::NotLive(who)) => format!(
+                "Refused: no live session '{who}'. Call list_sessions for valid names."
             ),
         }
     }
@@ -2037,7 +2580,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, or at the timeout with a note of what is still running. A timeout does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so waiting again is fine. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open."
+        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, at the timeout with a note of what is still running, or within about 45-55 seconds either way: this host's own MCP transport does not reliably survive a longer single call, so a wait this size is one call in a short series, not the whole wait. A timeout is not a failure and does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so simply call this again with the same task_ids to keep waiting. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open."
     )]
     async fn wait_for_tasks(&self, Parameters(p): Parameters<WaitArgs>) -> String {
         let me = self.author();
@@ -2318,9 +2861,10 @@ Pantheon gives exactly one session the conductor role, and the user assigns it; 
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
 - Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
 - dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
-- wait_for_tasks blocks until the ids you name are finished, so you do not have to guess an interval and poll. Dispatch the whole fan-out, then wait on it once. "I will report when it lands" is only true if you actually wait; otherwise nothing brings you back.
+- wait_for_tasks blocks until the ids you name are finished, so you do not have to guess an interval and poll. Dispatch the whole fan-out, then wait on it once. "I will report when it lands" is only true if you actually wait; otherwise nothing brings you back. A single call returns within about 45-55 seconds either way, finished or not: that is one call in a short series, not the whole wait, so a timeout just means call it again with the same ids.
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
 - A task reported as blocked is waiting on YOU, not on the agent. Answer it with answer_question(task_id, answer) and the agent starts moving again. wait_for_tasks returns early when one appears, precisely so you can answer without watching for it.
+- If a target already holds open work, dispatch tells you so rather than silently piling a second brief on top of the first. cancel_task closes any open task with a reason, in bulk if you give it several ids. reassign_task changes a pending or overdue task's target (redelivering the brief) or an in_review/rework task's reviewer, so a stuck or gone session does not leave the work stranded.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Pantheon session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
 
@@ -2506,15 +3050,16 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::{
-        abandon_lost, age, answer_pending, append_record, ask_pending, bearer_matches, busy_label,
-        choose_reviewer, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
-        human_ms, injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
-        mint_session_token, open_question, oversize_refusal, parse_task_ids, render_task,
-        render_task_summary, review_pending, select_tasks, still_open, task_for_dispatcher,
-        validate_path_component, wait_timeout, AgentSession, AskError, Entry, Notifier, Shared,
-        StoreRecord, Task, TaskAccessError, MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED,
-        STATUS_ABANDONED, STATUS_BLOCKED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS,
-        WAIT_MAX_SECS,
+        abandon_lost, age, answer_pending, append_record, ask_pending, attribute_open_tasks,
+        bearer_matches, busy_label, cancel_pending, choose_reviewer, conductor_briefing,
+        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
+        is_terminal, load_brain, mark_pending_error, mint_session_token, open_question,
+        open_task_for_target, oversize_refusal, parse_task_ids, reassign_pending, render_task,
+        render_task_summary, review_pending, reviewing_label, select_tasks, status_tag, still_open,
+        task_for_dispatcher, validate_path_component, wait_timeout, AgentSession, AskError,
+        CancelOutcome, Entry, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
+        MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, STATUS_BLOCKED,
+        TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -2548,6 +3093,7 @@ mod tests {
             reviewer: reviewer.into(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             done_ms: None,
         }]
     }
@@ -2676,6 +3222,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }
     }
 
@@ -2943,6 +3490,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -2968,6 +3516,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
         };
@@ -3016,6 +3565,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
@@ -3048,6 +3598,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }];
 
         assert_eq!(
@@ -3072,6 +3623,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }];
 
         assert_eq!(
@@ -3151,6 +3703,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }];
         assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
@@ -3171,6 +3724,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
         }];
@@ -3192,6 +3746,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         };
 
         let mut pending = base.clone();
@@ -3224,6 +3779,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -3252,6 +3808,7 @@ mod tests {
                 reviewer: String::new(),
                 findings: String::new(),
                 exchanges: Vec::new(),
+                reviewer_gone: false,
                 ts_ms: 0,
                 done_ms: None,
             }];
@@ -3277,6 +3834,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
         }];
@@ -3313,6 +3871,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
             ts_ms: 2,
             done_ms: None,
         };
@@ -3350,6 +3909,7 @@ mod tests {
             reviewer: "sess-3".into(),
             findings: String::new(),
             exchanges: Vec::new(),
+            reviewer_gone: false,
         }
     }
 
@@ -3715,20 +4275,91 @@ mod tests {
     }
 
     #[test]
-    fn abandon_lost_covers_every_open_status_not_just_pending() {
-        // A pane can die while its work sits in review or rework just as easily
-        // as while it is running. Those are open too, so they are equally stuck.
+    fn abandon_lost_covers_every_status_whose_actor_is_the_target() {
+        // A pane can die while a rework fix sits open just as easily as while
+        // pending or overdue work is running: in all three the target is the
+        // one who has to act, so the target's death is what ends them.
         let mut tasks = vec![
             task_at("t1", "pending", 0),
             task_at("t2", "overdue", 0),
-            task_at("t3", "in_review", 0),
-            task_at("t4", "rework", 0),
+            task_at("t3", "rework", 0),
         ];
 
         let changed = abandon_lost(&mut tasks, &[], 1_000);
 
-        assert_eq!(changed.len(), 4);
+        assert_eq!(changed.len(), 3);
         assert!(tasks.iter().all(|t| t.status == STATUS_ABANDONED));
+    }
+
+    #[test]
+    fn abandon_lost_never_abandons_in_review_even_when_its_target_is_gone() {
+        // The submitted work already exists once it is in_review; the
+        // reviewer is the actor now, not the target, so the target dying must
+        // not erase a result the reviewer has not even looked at yet. This is
+        // the bug the reviewer-liveness fix replaced: before it, a target
+        // that closed its pane right after a clean submission could discard
+        // work nobody had rejected.
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-9".to_string()]; // reviewer live, target ("sess-2") gone
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert!(changed.is_empty());
+        assert_eq!(tasks[0].status, "in_review");
+    }
+
+    #[test]
+    fn abandon_lost_flags_a_dead_reviewer_instead_of_abandoning_the_task() {
+        // The other half of the same fix, from the other direction: a
+        // reviewer that no longer exists is the failure `abandon_lost` used
+        // to miss entirely, because it only ever checked the target. The
+        // work still exists, so this is a flag for the conductor to act on
+        // (reassign_task), not an abandonment.
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-2".to_string()]; // target live, reviewer gone
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            tasks[0].status, "in_review",
+            "not abandoned: the submitted work still exists"
+        );
+        assert!(tasks[0].reviewer_gone);
+    }
+
+    #[test]
+    fn abandon_lost_clears_reviewer_gone_once_the_reviewer_is_live_again() {
+        // A stale flag is its own kind of dishonest roster, the same failure
+        // this whole mechanism exists to fix on the target side.
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        tasks[0].reviewer_gone = true;
+        let live = vec!["sess-2".to_string(), "sess-9".to_string()];
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert_eq!(changed.len(), 1);
+        assert!(!tasks[0].reviewer_gone);
+    }
+
+    #[test]
+    fn abandon_lost_flags_reviewer_gone_on_rework_without_abandoning_the_target() {
+        // rework still keeps its target-liveness check (the implementer is
+        // the actor), but a reviewer it will eventually resubmit to can be
+        // gone too, and that is worth surfacing now rather than only after
+        // the fix is resubmitted into a dead end.
+        let mut tasks = vec![task_at("t1", "rework", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-2".to_string()]; // target live, reviewer gone
+
+        let changed = abandon_lost(&mut tasks, &live, 1_000);
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(tasks[0].status, "rework");
+        assert!(tasks[0].reviewer_gone);
     }
 
     #[test]
@@ -3780,10 +4411,11 @@ mod tests {
 
     #[test]
     fn abandoning_keeps_a_result_the_agent_already_reported() {
-        // Work submitted for review, then the pane died. The submission is the
-        // valuable part and overwriting it with the abandonment notice would
-        // throw away the only thing the task produced.
-        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        // Work sent back for rework, then the implementer's pane died. The
+        // reviewer's findings and the agent's own report are the valuable
+        // part, and overwriting them with the abandonment notice would throw
+        // away the only record of what happened.
+        let mut tasks = vec![task_at("t1", "rework", 0)];
         tasks[0].result = "found three bugs in the lexer".into();
 
         abandon_lost(&mut tasks, &[], 1_000);
@@ -4126,5 +4758,436 @@ mod tests {
         // early on it by a separate path, because the conductor has to act.
         let tasks = vec![task_with("t1", STATUS_BLOCKED)];
         assert_eq!(still_open(&tasks, &["t1".to_string()]), vec!["t1"]);
+    }
+
+    // ---- attribute_open_tasks: busy vs reviewing ----
+
+    #[test]
+    fn attribute_open_tasks_counts_in_review_against_the_reviewer() {
+        let mut reviewed = task_at("t1", "in_review", 1_000);
+        reviewed.reviewer = "sess-9".into();
+        let tasks = vec![reviewed];
+
+        let (busy, reviewing) = attribute_open_tasks(&tasks, 5_000);
+
+        assert!(
+            busy.is_empty(),
+            "the target already submitted; it is not busy"
+        );
+        assert_eq!(reviewing, vec![("sess-9".to_string(), 4_000)]);
+    }
+
+    #[test]
+    fn attribute_open_tasks_counts_everything_else_against_the_target() {
+        let tasks = vec![
+            task_at("t1", "pending", 1_000),
+            task_at("t2", "rework", 1_000),
+        ];
+
+        let (busy, reviewing) = attribute_open_tasks(&tasks, 5_000);
+
+        assert_eq!(busy.len(), 2);
+        assert!(busy.iter().all(|(who, _)| who == "sess-2"));
+        assert!(reviewing.is_empty());
+    }
+
+    #[test]
+    fn reviewing_label_reads_differently_from_busy_label() {
+        assert_eq!(reviewing_label(None), "");
+        assert_eq!(reviewing_label(Some(90_000)), " [reviewing 1m]");
+        // Distinct wording is the point: a conductor scanning the roster has
+        // to be able to tell a pane holding its own work from one reviewing
+        // someone else's without reading closely.
+        assert_ne!(reviewing_label(Some(90_000)), busy_label(Some(90_000)));
+    }
+
+    // ---- open_task_for_target: dispatch's "already busy" note ----
+
+    #[test]
+    fn open_task_for_target_finds_an_open_task_for_that_target() {
+        let tasks = vec![task_at("t1", "pending", 0)];
+        assert_eq!(
+            open_task_for_target(&tasks, "sess-2"),
+            Some("t1".to_string())
+        );
+    }
+
+    #[test]
+    fn open_task_for_target_ignores_finished_work_and_other_targets() {
+        let mut done = task_at("t1", "done", 0);
+        done.target = "sess-2".into();
+        let mut elsewhere = task_at("t2", "pending", 0);
+        elsewhere.target = "sess-3".into();
+        let tasks = vec![done, elsewhere];
+
+        assert_eq!(open_task_for_target(&tasks, "sess-2"), None);
+    }
+
+    // ---- reviewer_gone rendering ----
+
+    #[test]
+    fn status_tag_is_unchanged_when_the_reviewer_is_not_gone() {
+        assert_eq!(status_tag(&task_at("t1", "pending", 0)), "pending");
+    }
+
+    #[test]
+    fn render_task_flags_a_task_with_a_gone_reviewer() {
+        let mut t = reviewed_task("in_review");
+        t.reviewer_gone = true;
+
+        let rendered = render_task(&t);
+
+        assert!(
+            rendered.starts_with("[in_review, reviewer gone]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reassign_task"), "{rendered}");
+    }
+
+    #[test]
+    fn render_task_summary_flags_a_task_with_a_gone_reviewer() {
+        let mut t = reviewed_task("rework");
+        t.reviewer_gone = true;
+
+        let rendered = render_task_summary(&t);
+
+        assert!(
+            rendered.starts_with("[rework, reviewer gone]"),
+            "{rendered}"
+        );
+    }
+
+    // ---- cancel_pending ----
+
+    #[test]
+    fn cancel_pending_cancels_an_open_task_with_a_reason() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let outcome = cancel_pending(&mut tasks, "t1", "superseded by a later brief", 9_000);
+
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert_eq!(tasks[0].status, "cancelled");
+        assert_eq!(tasks[0].done_ms, Some(9_000));
+        assert!(tasks[0].result.contains("superseded by a later brief"));
+    }
+
+    #[test]
+    fn cancel_pending_covers_every_open_status() {
+        for status in ["pending", "overdue", "in_review", "rework", STATUS_BLOCKED] {
+            let mut tasks = vec![task_at("t1", status, 0)];
+            assert_eq!(
+                cancel_pending(&mut tasks, "t1", "", 0),
+                CancelOutcome::Cancelled,
+                "{status} should be cancellable"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_pending_reports_a_terminal_task_as_already_terminal_not_an_error() {
+        let mut tasks = vec![task_at("t1", "done", 0)];
+
+        let outcome = cancel_pending(&mut tasks, "t1", "", 0);
+
+        assert_eq!(outcome, CancelOutcome::AlreadyTerminal);
+        assert_eq!(
+            tasks[0].status, "done",
+            "a terminal task must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_reports_an_unknown_id() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        assert_eq!(
+            cancel_pending(&mut tasks, "nope", "", 0),
+            CancelOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn cancel_pending_keeps_a_result_already_submitted() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].result = "found two bugs".into();
+
+        cancel_pending(&mut tasks, "t1", "not needed after all", 0);
+
+        assert!(tasks[0].result.contains("found two bugs"));
+        assert!(tasks[0].result.contains("not needed after all"));
+    }
+
+    #[test]
+    fn cancel_pending_without_a_reason_still_says_who_cancelled_it() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        cancel_pending(&mut tasks, "t1", "", 0);
+        assert!(tasks[0].result.contains("Cancelled by the conductor"));
+    }
+
+    // ---- reassign_pending ----
+
+    #[test]
+    fn reassign_pending_retargets_a_pending_task_and_resets_its_clock() {
+        let mut tasks = vec![task_at("t1", "pending", 1_000)];
+        let live = vec!["sess-5".to_string()];
+
+        let task = reassign_pending(&mut tasks, "t1", Some("sess-5"), None, &live, 9_000).unwrap();
+
+        assert_eq!(task.target, "sess-5");
+        assert_eq!(task.status, "pending");
+        assert_eq!(task.ts_ms, 9_000);
+        assert!(task.result.contains("sess-2"));
+        assert!(task.result.contains("sess-5"));
+    }
+
+    #[test]
+    fn reassign_pending_retargets_an_overdue_task_too() {
+        let mut tasks = vec![task_at("t1", "overdue", 1_000)];
+        let live = vec!["sess-5".to_string()];
+
+        let task = reassign_pending(&mut tasks, "t1", Some("sess-5"), None, &live, 9_000).unwrap();
+
+        assert_eq!(
+            task.status, "pending",
+            "a fresh delivery is pending again, not still overdue"
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_a_target_that_is_not_live() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let err = reassign_pending(&mut tasks, "t1", Some("sess-5"), None, &[], 0).unwrap_err();
+
+        assert_eq!(err, ReassignError::NotLive("sess-5".to_string()));
+        assert_eq!(
+            tasks[0].target, "sess-2",
+            "a refused reassignment must not mutate the task"
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_the_same_target() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        let live = vec!["sess-2".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", Some("sess-2"), None, &live, 0).unwrap_err(),
+            ReassignError::SameTarget
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_to_retarget_work_already_submitted() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        let live = vec!["sess-5".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", Some("sess-5"), None, &live, 0).unwrap_err(),
+            ReassignError::NotOpenForRetarget
+        );
+    }
+
+    #[test]
+    fn reassign_pending_hands_in_review_work_to_a_new_reviewer() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        tasks[0].reviewer_gone = true;
+        let live = vec!["sess-5".to_string()];
+
+        let task = reassign_pending(&mut tasks, "t1", None, Some("sess-5"), &live, 0).unwrap();
+
+        assert_eq!(task.reviewer, "sess-5");
+        assert_eq!(
+            task.status, "in_review",
+            "reassigning the reviewer does not change the status"
+        );
+        assert!(
+            !task.reviewer_gone,
+            "the newly named reviewer was just checked live"
+        );
+        assert!(task.result.contains("sess-9"));
+        assert!(task.result.contains("sess-5"));
+    }
+
+    #[test]
+    fn reassign_pending_hands_rework_to_a_new_reviewer_too() {
+        let mut tasks = vec![task_at("t1", "rework", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-5".to_string()];
+
+        let task = reassign_pending(&mut tasks, "t1", None, Some("sess-5"), &live, 0).unwrap();
+
+        assert_eq!(task.reviewer, "sess-5");
+        assert_eq!(task.status, "rework");
+    }
+
+    #[test]
+    fn reassign_pending_refuses_a_reviewer_that_is_not_live() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", None, Some("sess-5"), &[], 0).unwrap_err(),
+            ReassignError::NotLive("sess-5".to_string())
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_the_same_reviewer() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-9".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", None, Some("sess-9"), &live, 0).unwrap_err(),
+            ReassignError::SameReviewer
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_the_target_as_its_own_reviewer() {
+        let mut tasks = vec![task_at("t1", "in_review", 0)];
+        tasks[0].reviewer = "sess-9".into();
+        let live = vec!["sess-2".to_string()]; // sess-2 is the task's target
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", None, Some("sess-2"), &live, 0).unwrap_err(),
+            ReassignError::ReviewerIsTarget
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_to_reassign_a_reviewer_on_pending_work() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        let live = vec!["sess-5".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", None, Some("sess-5"), &live, 0).unwrap_err(),
+            ReassignError::NotOpenForReview
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_when_neither_field_is_given() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", None, None, &["sess-5".to_string()], 0).unwrap_err(),
+            ReassignError::AmbiguousChange
+        );
+    }
+
+    #[test]
+    fn reassign_pending_refuses_both_fields_at_once() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        let live = vec!["sess-5".to_string(), "sess-6".to_string()];
+        assert_eq!(
+            reassign_pending(&mut tasks, "t1", Some("sess-5"), Some("sess-6"), &live, 0)
+                .unwrap_err(),
+            ReassignError::AmbiguousChange
+        );
+    }
+
+    #[test]
+    fn reassign_pending_reports_an_unknown_id() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        assert_eq!(
+            reassign_pending(
+                &mut tasks,
+                "nope",
+                Some("sess-5"),
+                None,
+                &["sess-5".to_string()],
+                0
+            )
+            .unwrap_err(),
+            ReassignError::NotFound
+        );
+    }
+
+    // ---- note_session: a reconnected pane's kind must not go stale ----
+
+    #[test]
+    fn note_session_records_a_new_session() {
+        let (shared, _dir) = shared_for_test();
+        shared.note_session("sess-9", "codex");
+
+        let sessions = shared.sessions_snapshot();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].kind, "codex");
+    }
+
+    #[test]
+    fn note_session_refreshes_the_kind_when_a_pane_reconnects_differently() {
+        let (shared, dir) = shared_for_test();
+        shared.note_session("sess-1", "codex");
+
+        shared.note_session("sess-1", "claude");
+
+        let sessions = shared.sessions_snapshot();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a reconnect must not duplicate the roster entry"
+        );
+        assert_eq!(sessions[0].kind, "claude");
+
+        // Persisted, not just held in memory: a reload must see the refresh.
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.sessions.len(), 1);
+        assert_eq!(reloaded.sessions[0].kind, "claude");
+    }
+
+    #[test]
+    fn note_session_is_a_no_op_when_the_kind_has_not_changed() {
+        let (shared, dir) = shared_for_test();
+        shared.note_session("sess-1", "codex");
+        shared.note_session("sess-1", "codex");
+
+        // Only one record should have been appended; the file it would have
+        // grown is the cheapest way to see a silent extra write.
+        let contents = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    // ---- Shared::cancel_tasks / Shared::reassign_task ----
+
+    #[test]
+    fn shared_cancel_tasks_persists_each_outcome() {
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+        shared.tasks.lock().unwrap().push(task_at("t2", "done", 0));
+
+        let results = shared.cancel_tasks(
+            &["t1".to_string(), "t2".to_string(), "nope".to_string()],
+            "cleanup",
+        );
+
+        assert_eq!(results[0], ("t1".to_string(), CancelOutcome::Cancelled));
+        assert_eq!(
+            results[1],
+            ("t2".to_string(), CancelOutcome::AlreadyTerminal)
+        );
+        assert_eq!(results[2], ("nope".to_string(), CancelOutcome::NotFound));
+
+        let reloaded = load_brain(dir.path());
+        let t1 = reloaded.tasks.iter().find(|t| t.id == "t1").unwrap();
+        assert_eq!(t1.status, "cancelled");
+    }
+
+    #[test]
+    fn shared_reassign_task_refuses_a_reviewer_that_is_not_live() {
+        // in_review, not pending: `shared_for_test`'s engine reports nothing
+        // live, so a pending task's target would be reconciled to abandoned
+        // before reassign_pending ever ran. in_review is exempt from that
+        // sweep (see abandon_lost), so this is the status that actually
+        // reaches the reviewer-liveness check being tested here.
+        let (shared, _dir) = shared_for_test();
+        let mut t = task_at("t1", "in_review", 0);
+        t.reviewer = "sess-9".into();
+        shared.tasks.lock().unwrap().push(t);
+
+        let err = shared
+            .reassign_task("t1", None, Some("sess-5"))
+            .unwrap_err();
+
+        assert_eq!(err, ReassignError::NotLive("sess-5".to_string()));
     }
 }

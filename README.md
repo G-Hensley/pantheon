@@ -143,8 +143,13 @@ alone: the agent never declares a name and cannot claim another's.
 
 Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
 `get_shared_context`, `search_context`, `list_sessions`, `dispatch` (conductor
-only), `complete_task`, `get_task_result`, `wait_for_tasks`, `ask_conductor`,
-`answer_question` (conductor only), `set_session_identity`.
+only), `cancel_task` (conductor only), `reassign_task` (conductor only),
+`complete_task`, `review_task`, `get_task_result`, `wait_for_tasks`,
+`ask_conductor`, `answer_question` (conductor only), `set_session_identity`.
+`cancel_task` closes any open task with a reason, several at once if you name
+them together. `reassign_task` moves a pending or overdue task to a new
+target (redelivering the brief) or hands an in_review or rework task to a new
+reviewer, so a stuck or gone session never leaves work stranded.
 
 ## How agents are briefed
 
@@ -178,11 +183,15 @@ with no `task_id` returns every task that conductor dispatched in one call.
 
 `wait_for_tasks` is the other half. It blocks until the ids it is given reach a
 terminal state, then returns the same results, so a conductor with nothing else
-queued does not have to guess a polling interval. It defaults to a ten minute
-wait and is capped at thirty minutes. A timeout says so explicitly and cancels
+queued does not have to guess a polling interval. It defaults to 45 seconds and
+is capped at 55, sized to the host's own MCP transport rather than to how long a
+task actually takes: measured 2026-09-03, a Claude Code pane's transport kills
+the call somewhere between 45 and 110 seconds, so a call this size is one in a
+short series, not the whole wait. A timeout says so explicitly and cancels
 nothing: the agents keep working and their results are still accepted, so
-waiting again is fine. A pane that dies mid-wait ends the wait rather than
-holding it open, because its task becomes `abandoned`.
+calling `wait_for_tasks` again with the same ids is the normal way to keep
+waiting. A pane that dies mid-wait ends the wait rather than holding it open,
+because its task becomes `abandoned`.
 
 Dispatch used to be one-way, so an agent that hit a genuine ambiguity mid-task
 could only guess, stall, or ask the human in its own terminal. With five panes
