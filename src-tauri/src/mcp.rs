@@ -1147,7 +1147,13 @@ impl Shared {
     /// measured 2026-09-03, with no way to close them at all. A conductor
     /// clearing that pile one id per call is a conductor that gives up before
     /// finishing.
+    ///
+    /// Takes `delivery` exclusively, the same way `set_halted` does: without
+    /// it, a cancel could land between a delivery path's status check and
+    /// its `submit_to` call, cancelling a task that gets typed into a
+    /// terminal anyway a moment later.
     fn cancel_tasks(&self, ids: &[String], reason: &str) -> Vec<(String, CancelOutcome)> {
+        let _delivery = self.delivery.write().unwrap();
         let now = Self::now_ms();
         let mut any_cancelled = false;
         let results = self.mutate_and_journal(|tasks| {
@@ -1183,16 +1189,23 @@ impl Shared {
     /// carried entirely by the `reviewer` field, the same way it is when
     /// `dispatch_task` first chooses one.
     ///
-    /// Three rounds landed on this shape. Holding `tasks` across the
+    /// Four rounds landed on this shape. Holding `tasks` across the
     /// mutation and its journal append is still what makes the record order
-    /// agree with the mutation order (`mutate_and_journal`), but a third
+    /// agree with the mutation order (`mutate_and_journal`), but the third
     /// round found that holding `tasks` across `submit_to` too, on top of
     /// closing the halt race, stalled every other completion, review, and
-    /// cancellation behind a PTY write. Delivery now runs after the task
-    /// lock is released, under `delivery` instead: a shared hold blocks
-    /// `set_halted`'s exclusive one (and the reverse), so Stop still cannot
-    /// land between the eligibility check and the write, without the task
-    /// mutex ever being held across it.
+    /// cancellation behind a PTY write. Delivery runs under `delivery`
+    /// instead: a shared hold blocks `set_halted` and `cancel_tasks`'s
+    /// exclusive one (and the reverse), so Stop or a cancel still cannot
+    /// land mid-decision, without the task mutex ever being held across the
+    /// write. The fourth round found the remaining gap: `delivery.read()`
+    /// was taken only for the write itself, after the retarget mutation had
+    /// already happened, so a Stop landing between the halted check above
+    /// and the mutation could still turn an overdue or abandoned task
+    /// pending after the halt, with nothing left to ever deliver it. The
+    /// gate is now held from before the mutation through the write, so the
+    /// halt check, the mutation, its journal, and the write are all one
+    /// section nothing else can interleave with.
     fn reassign_task(
         &self,
         caller: &str,
@@ -1203,13 +1216,23 @@ impl Shared {
         // Retargeting redelivers into the new target's terminal, the same as
         // dispatch, so it is gated by Stop the same way dispatch is. Handing
         // a task to a new reviewer types nothing into any terminal and is
-        // not subject to it.
+        // not subject to it. This first check is cheap and early, but is not
+        // itself what closes the race: the gate below is.
         if new_target.is_some() && self.is_halted() {
             return Err(ReassignError::Halted);
         }
         let live = self.reconcile_abandoned();
         let retargeting = new_target.is_some();
         let now = Self::now_ms();
+
+        // Held from here through the write: `set_halted` and `cancel_tasks`
+        // both take `delivery` exclusively before they touch a task, so
+        // once this is held, neither can act on this task, or flip
+        // `halted`, until it releases.
+        let delivery_gate = self.delivery.read().unwrap();
+        if retargeting && self.is_halted() {
+            return Err(ReassignError::Halted);
+        }
 
         let task = self.mutate_and_journal(|tasks| {
             match reassign_pending(tasks, id, caller, new_target, new_reviewer, &live, now) {
@@ -1223,42 +1246,25 @@ impl Shared {
             return Ok((task, true));
         }
 
-        // Shared: blocks `set_halted`'s exclusive hold, and is blocked by
-        // it, so nothing here can straddle a Stop landing mid-decision.
-        let delivery_gate = self.delivery.read().unwrap();
-        let current = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned();
-        let deliverable = match &current {
-            Some(t) => !self.is_halted() && t.status == "pending",
-            None => false,
-        };
-        if !deliverable {
-            drop(delivery_gate);
-            return Ok((current.unwrap_or(task), false));
-        }
-        let current = current.expect("checked above: deliverable implies Some");
         // Same delivery path `dispatch_task` uses, so a reassigned brief
         // looks to the new target exactly like a fresh dispatch: typed into
-        // its terminal, Enter sent separately.
-        let injection = dispatch_prompt(&current.from, &current.id, &current.task);
-        let delivered = self.engine.submit_to(&current.target, &injection);
+        // its terminal, Enter sent separately. Still under `delivery_gate`,
+        // so nothing can have cancelled this task or flipped halted since
+        // the mutation just journaled it pending.
+        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
+        let delivered = self.engine.submit_to(&task.target, &injection);
         drop(delivery_gate);
         let result = if delivered {
-            current
+            task
         } else {
-            self.mark_delivery_failed(&current.id);
+            self.mark_delivery_failed(&task.id);
             self.tasks
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|t| t.id == current.id)
+                .find(|t| t.id == task.id)
                 .cloned()
-                .unwrap_or(current)
+                .unwrap_or(task)
         };
         Ok((result, delivered))
     }
@@ -5793,6 +5799,112 @@ mod tests {
         assert_eq!(t.status, STATUS_ABANDONED);
         let reloaded = load_brain(dir.path());
         assert_eq!(reloaded.tasks[0].status, STATUS_ABANDONED);
+    }
+
+    // ---- fifth round: the delivery gate covers the mutation, and cancel_tasks takes it too ----
+    //
+    // Two gaps the fourth round's gate left open. `reassign_task` only took
+    // `delivery` for the write itself, after the retarget mutation had
+    // already happened and been journaled: a Stop landing between the
+    // top-level `is_halted` check and the mutation could still turn an
+    // overdue or abandoned task pending after the halt, because
+    // `set_halted`'s own cancel loop only ever touches tasks that are
+    // already "pending" and so never sees one retargeted after it has
+    // already run. And `cancel_tasks` never took the gate at all, so a
+    // cancel could still land between a delivery path's status check and
+    // its `submit_to` call. Fixed by moving `reassign_task`'s
+    // `delivery.read()` to before the mutation, and giving `cancel_tasks`
+    // the same exclusive hold `set_halted` already has.
+
+    #[test]
+    fn reassign_task_cannot_mutate_a_task_while_a_delivery_holds_the_gate() {
+        // Same mechanism, same technique, as
+        // `set_halted_cannot_run_while_a_delivery_holds_the_gate`, but
+        // anchored at the point that changed this round: the gate now
+        // covers `reassign_task`'s own mutation, not only its write, so
+        // holding it here must block `set_halted` from starting at all --
+        // not just from finishing. An overdue task is used deliberately:
+        // `set_halted`'s cancel loop would never touch it even if it did
+        // run, which is exactly why the mutation itself has to be inside
+        // the gate rather than left to race it.
+        let (shared, dir) = shared_for_test();
+        // Through `add_task`, not a raw push, so the journal already holds
+        // an "overdue" record for `t1` to compare the final one against:
+        // `set_halted`'s cancel loop skips this task entirely, so nothing
+        // else would ever journal it if this test's own setup did not.
+        shared.add_task(task_at("t1", "overdue", 0));
+
+        let started = Arc::new(AtomicBool::new(false));
+        let delivering = shared.delivery.read().unwrap();
+
+        let halting = thread::spawn({
+            let shared = shared.clone();
+            let started = started.clone();
+            move || {
+                started.store(true, Ordering::SeqCst);
+                shared.set_halted(true);
+            }
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !shared.is_halted(),
+            "set_halted must not run while reassign_task's gate is held, even before its own mutation"
+        );
+        assert_eq!(shared.tasks.lock().unwrap()[0].status, "overdue");
+
+        drop(delivering);
+        halting.join().unwrap();
+        assert!(shared.is_halted());
+
+        // set_halted's cancel loop never touches an overdue task, so this
+        // one is exactly where it started: the point of holding the gate
+        // through the mutation is that reassign_task, not set_halted, is
+        // the only thing that gets to decide what happens to it next.
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "overdue");
+    }
+
+    #[test]
+    fn cancel_tasks_cannot_run_while_a_delivery_holds_the_gate() {
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
+
+        let started = Arc::new(AtomicBool::new(false));
+        let delivering = shared.delivery.read().unwrap();
+
+        let cancelling = thread::spawn({
+            let shared = shared.clone();
+            let started = started.clone();
+            move || {
+                started.store(true, Ordering::SeqCst);
+                shared.cancel_tasks(&["t1".to_string()], "no longer needed")
+            }
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            shared.tasks.lock().unwrap()[0].status,
+            "pending",
+            "cancel_tasks must not run while a delivery holds the gate"
+        );
+
+        drop(delivering);
+        let results = cancelling.join().unwrap();
+
+        assert_eq!(results[0], ("t1".to_string(), CancelOutcome::Cancelled));
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "cancelled");
     }
 
     // ---- note_session: a reconnected pane's kind must not go stale ----
