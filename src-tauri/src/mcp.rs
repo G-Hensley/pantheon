@@ -1133,25 +1133,29 @@ impl Shared {
     /// finishing.
     fn cancel_tasks(&self, ids: &[String], reason: &str) -> Vec<(String, CancelOutcome)> {
         let now = Self::now_ms();
-        let results: Vec<(String, CancelOutcome)> = {
-            let mut tasks = self.tasks.lock().unwrap();
-            ids.iter()
-                .map(|id| (id.clone(), cancel_pending(&mut tasks, id, reason, now)))
-                .collect()
-        };
-        let changed: Vec<Task> = {
-            let tasks = self.tasks.lock().unwrap();
-            results
-                .iter()
-                .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
-                .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
-                .collect()
-        };
+        // Mutate, decide what changed, and journal it, all under one lock
+        // hold: the same fix as `reassign_task`, for the same reason. A
+        // second writer for one of these same ids (`set_halted` chief
+        // among them) can only ever see this batch's outcome as already
+        // committed, never mid-flight between the mutation and the append.
+        let mut tasks = self.tasks.lock().unwrap();
+        let results: Vec<(String, CancelOutcome)> = ids
+            .iter()
+            .map(|id| (id.clone(), cancel_pending(&mut tasks, id, reason, now)))
+            .collect();
+        let changed: Vec<Task> = results
+            .iter()
+            .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
+            .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
+            .collect();
         if !changed.is_empty() {
             let dir = self.dir.lock().unwrap().clone();
-            for task in changed {
-                let _ = append_record(&dir, &StoreRecord::Task(task));
+            for task in &changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
             }
+        }
+        drop(tasks);
+        if !changed.is_empty() {
             self.app.emit("conductor-changed");
         }
         results
@@ -1170,6 +1174,23 @@ impl Shared {
     /// nothing is typed into a terminal for that: a reviewer's assignment is
     /// carried entirely by the `reviewer` field, the same way it is when
     /// `dispatch_task` first chooses one.
+    ///
+    /// The mutation, the journal append, and (when retargeting) the terminal
+    /// write all happen inside one hold of the `tasks` lock. Two earlier,
+    /// narrower fixes each closed half of the same race and left the other
+    /// open: capturing the mutation snapshot from inside the lock stopped
+    /// `persist_task` from re-reading a cancellation in its place, but the
+    /// journal append still happened after release, so `set_halted` could
+    /// still cancel and journal first, leaving a "pending" record on top of
+    /// a "cancelled" one; re-checking the status right before delivery
+    /// stopped a stale brief from being typed after a halt already seen, but
+    /// not one landing in the gap the re-check itself left open. One lock
+    /// held across all four steps closes both at once: `set_halted` cancels
+    /// under this same lock, so it cannot run until this whole section
+    /// releases it, by which point the journal already agrees with the
+    /// mutation and delivery has already happened or been skipped. The PTY
+    /// write in `submit_to` is one small write, and the Enter is sent from
+    /// its own thread, so nothing slow runs while the lock is held.
     fn reassign_task(
         &self,
         caller: &str,
@@ -1186,61 +1207,42 @@ impl Shared {
         }
         let live = self.reconcile_abandoned();
         let retargeting = new_target.is_some();
-        // Captured from inside the same lock acquisition as the mutation,
-        // not re-read afterward: `persist_task` re-reads under a fresh lock,
-        // and a `set_halted` landing in the gap between release and re-read
-        // would make it snapshot the cancellation instead of the transition
-        // that actually happened here, losing the pending record entirely.
-        let task = {
-            let mut tasks = self.tasks.lock().unwrap();
-            reassign_pending(
-                &mut tasks,
-                id,
-                caller,
-                new_target,
-                new_reviewer,
-                &live,
-                Self::now_ms(),
-            )?
-        };
-        {
-            let dir = self.dir.lock().unwrap().clone();
-            let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
-        }
-        self.app.emit("conductor-changed");
+        let now = Self::now_ms();
+
+        let mut tasks = self.tasks.lock().unwrap();
+        let task = reassign_pending(&mut tasks, id, caller, new_target, new_reviewer, &live, now)?;
+
+        let dir = self.dir.lock().unwrap().clone();
+        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
 
         if !retargeting {
+            drop(tasks);
+            self.app.emit("conductor-changed");
             return Ok((task, true));
         }
-        // Re-read immediately before typing into a terminal, this close to
-        // delivery rather than trusting the snapshot above: `set_halted`
-        // cancels every pending task synchronously as part of setting the
-        // flag, so a Stop that lands anywhere in the window between the
-        // mutation and here has already turned this task's own status into
-        // something other than "pending" by the time this reads it. Skip
-        // delivery rather than type a brief for work that no longer exists.
-        let current = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == id)
-            .cloned();
-        let Some(current) = current else {
-            return Ok((task, false));
+
+        // Same delivery path `dispatch_task` uses, so a reassigned brief
+        // looks to the new target exactly like a fresh dispatch: typed into
+        // its terminal, Enter sent separately. Still under the lock taken
+        // above, so nothing can have changed this task's status since the
+        // mutation just journaled.
+        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
+        let delivered = self.engine.submit_to(&task.target, &injection);
+        let result = if delivered {
+            task
+        } else {
+            mark_pending_error(&mut tasks, &task.id, now);
+            let failed = tasks
+                .iter()
+                .find(|t| t.id == task.id)
+                .cloned()
+                .unwrap_or(task);
+            let _ = append_record(&dir, &StoreRecord::Task(failed.clone()));
+            failed
         };
-        if !reassignment_still_deliverable(&current.status) {
-            return Ok((current, false));
-        }
-        // Same delivery path `dispatch_task` uses, so a reassigned brief looks
-        // to the new target exactly like a fresh dispatch: typed into its
-        // terminal, Enter sent separately.
-        let injection = dispatch_prompt(&current.from, &current.id, &current.task);
-        let delivered = self.engine.submit_to(&current.target, &injection);
-        if !delivered {
-            self.mark_delivery_failed(&current.id);
-        }
-        Ok((current, delivered))
+        drop(tasks);
+        self.app.emit("conductor-changed");
+        Ok((result, delivered))
     }
 }
 
@@ -1887,18 +1889,6 @@ fn reassign_pending(
     // The reviewer named here was just checked live, by the call above.
     t.reviewer_gone = false;
     Ok(t.clone())
-}
-
-/// Whether a just-retargeted task is still safe to deliver, checked against
-/// its status immediately before the terminal write rather than the
-/// snapshot taken when it was retargeted. `set_halted` cancels every
-/// pending task synchronously as part of setting the flag, so a Stop
-/// landing anywhere between the retarget mutation and this check has
-/// already turned the task's own status into something other than
-/// "pending" by the time it is read; delivering anyway would type a brief
-/// for work the record already says is over.
-fn reassignment_still_deliverable(status: &str) -> bool {
-    status == "pending"
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
@@ -3251,15 +3241,18 @@ mod tests {
         conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
         injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
         mint_session_token, open_question, open_task_for_target, oversize_refusal, parse_task_ids,
-        reassign_pending, reassignment_still_deliverable, render_open_task_summaries, render_task,
-        render_task_summary, review_pending, reviewing_label, select_tasks, status_tag, still_open,
-        task_for_dispatcher, validate_path_component, wait_timeout, AgentSession, AskError,
-        CancelOutcome, Entry, Exchange, Notifier, ReassignError, Shared, StoreRecord, Task,
-        TaskAccessError, MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED,
-        STATUS_BLOCKED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
+        reassign_pending, render_open_task_summaries, render_task, render_task_summary,
+        review_pending, reviewing_label, select_tasks, status_tag, still_open, task_for_dispatcher,
+        validate_path_component, wait_timeout, AgentSession, AskError, CancelOutcome, Entry,
+        Exchange, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
+        MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, STATUS_BLOCKED,
+        TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn a_free_pane_carries_no_busy_marker() {
@@ -5541,37 +5534,72 @@ mod tests {
         );
     }
 
-    // ---- reassignment_still_deliverable: halt race across the lock, second round ----
+    // ---- halt race across the lock, third round: one synchronization boundary ----
+    //
+    // Round two closed the race with a snapshot captured inside the lock
+    // plus a pre-delivery status re-check (`reassignment_still_deliverable`,
+    // now gone). That fixed the read `persist_task` used to do, but left two
+    // gaps of its own: the journal append for the mutation still happened
+    // after the lock was released, so `set_halted` could still cancel and
+    // journal first; and the re-check itself read the status through a
+    // second, separate lock acquisition, leaving the same kind of gap one
+    // step later. `reassign_task` and `cancel_tasks` now hold the `tasks`
+    // lock across the mutation, the journal append, and (for a retarget)
+    // delivery, so there is no window left for anything to land in between.
 
     #[test]
-    fn reassignment_still_deliverable_allows_a_task_still_pending() {
-        assert!(reassignment_still_deliverable("pending"));
-    }
+    fn set_halted_cannot_touch_a_task_whose_reassignment_holds_the_lock() {
+        // The fix is exactly this lock: `reassign_task` now holds `tasks`
+        // across its mutation, its journal append, and delivery, so
+        // `set_halted`'s cancel loop -- which needs that same lock --
+        // cannot run until that whole section releases it. This test
+        // cannot pause `reassign_task` itself mid-body to prove the exact
+        // interleaving end to end: `engine` is a concrete `SessionManager`
+        // here, not a trait object, so there is no seam to freeze it at the
+        // `submit_to` call, the same gap already noted on
+        // `a_refused_dispatch_charges_nothing_and_records_nothing`. What is
+        // testable, and is the actual mechanism the fix relies on, is that
+        // holding the same lock `reassign_task` holds blocks `set_halted`
+        // exactly as `reassign_task`'s own hold would.
+        let (shared, dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", "pending", 0));
 
-    #[test]
-    fn reassignment_still_deliverable_refuses_a_task_a_race_already_cancelled() {
-        // Finding 2, second round: `set_halted` cancels every pending task
-        // synchronously as part of setting the flag, so a Stop landing
-        // between the retarget mutation and the pre-delivery check leaves
-        // exactly this status for the check to see. Asserting against the
-        // state the race would actually leave behind, rather than trying to
-        // simulate the race itself, mirrors
-        // `mark_pending_error_does_not_overwrite_a_cancelled_task`.
-        assert!(!reassignment_still_deliverable("cancelled"));
-    }
+        let started = Arc::new(AtomicBool::new(false));
+        let guard = shared.tasks.lock().unwrap();
 
-    #[test]
-    fn reassignment_still_deliverable_refuses_every_other_status_too() {
-        for status in [
-            "overdue",
-            "done",
-            "error",
-            "in_review",
-            "rework",
-            STATUS_ABANDONED,
-        ] {
-            assert!(!reassignment_still_deliverable(status), "{status}");
+        let halting = thread::spawn({
+            let shared = shared.clone();
+            let started = started.clone();
+            move || {
+                started.store(true, Ordering::SeqCst);
+                shared.set_halted(true);
+            }
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
         }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            guard.iter().find(|t| t.id == "t1").unwrap().status,
+            "pending",
+            "set_halted must not touch this task while its lock is held elsewhere"
+        );
+
+        drop(guard);
+        halting.join().unwrap();
+
+        assert_eq!(
+            shared.tasks.lock().unwrap()[0].status,
+            "cancelled",
+            "set_halted must still run once the lock is free"
+        );
+        let reloaded = load_brain(dir.path());
+        assert_eq!(reloaded.tasks[0].status, "cancelled");
     }
 
     // ---- note_session: a reconnected pane's kind must not go stale ----
