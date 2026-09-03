@@ -14,7 +14,7 @@ export function SessionLauncher({
   onClose,
   project,
 }: {
-  onPick: (t: SessionType, isolate: boolean) => void;
+  onPick: (t: SessionType, isolate: boolean, model?: string) => void;
   onClose: () => void;
   project: string | null;
 }) {
@@ -30,6 +30,7 @@ export function SessionLauncher({
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(false);
+  const [models, setModels] = useState<Map<string, string>>(new Map());
 
   useEffect(() => {
     let current = true;
@@ -74,12 +75,36 @@ export function SessionLauncher({
       if (e.key === "Escape") onClose();
       const n = Number(e.key);
       if (n >= 1 && n <= SESSION_TYPES.length) {
-        onPick(SESSION_TYPES[n - 1], effectiveIsolate);
+        const selected = SESSION_TYPES[n - 1];
+        const model = models.get(selected.id) || undefined;
+        onPick(selected, effectiveIsolate, model);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onPick, onClose, effectiveIsolate]);
+  }, [onPick, onClose, effectiveIsolate, models]);
+
+  // Track model per session type, remembered in localStorage
+  useEffect(() => {
+    for (const t of SESSION_TYPES) {
+      if (t.modelFlag) {
+        try {
+          const stored = readStored(`model:${t.id}`);
+          if (stored !== null) setModels(prev => new Map(prev).set(t.id, stored));
+        } catch {/* ignore */}
+      }
+    }
+    // Sync write-back on state changes
+    return () => {
+      for (const t of SESSION_TYPES) {
+        if (t.modelFlag) {
+          try {
+            writeStored(`model:${t.id}`, models.get(t.id) || "");
+          } catch {/* ignore */}
+        }
+      }
+    };
+  }, [models]);
 
   return (
     <div className="launcher-backdrop" onClick={onClose}>
@@ -90,12 +115,17 @@ export function SessionLauncher({
             <button
               key={t.id}
               className="launcher-item"
-              onClick={() => onPick(t, effectiveIsolate)}
+              onClick={() => onPick(t, effectiveIsolate, models.get(t.id))}
             >
               <span className="dot" style={{ background: t.color }} />
               <span className="ll-label">{t.label}</span>
               <span className="ll-cmd">
                 {t.program} {t.args.join(" ")}
+                {t.modelFlag && (
+                  <span className="ll-model">
+                    {models.get(t.id) || ""}
+                  </span>
+                )}
               </span>
               <kbd className="ll-key">{i + 1}</kbd>
             </button>

@@ -107,7 +107,7 @@ fn conductor_briefing(peers: &[String]) -> String {
     } else {
         format!(
             "Live sessions you can dispatch to: {}.",
-            // Just id and model. `roster_lines` also carries brain= and the
+            // Just id, kind, and model. `roster_lines` also carries brain= and the
             // conductor marker, which are useful in list_sessions output but are
             // noise in a line the user has to read and type around; the agent can
             // call list_sessions for the full picture.
@@ -141,10 +141,15 @@ pub struct Entry {
     pub room: String, // which brain this belongs to
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct AgentSession {
     pub name: String,
     pub kind: String,
+    /// The model id the user selected at launch, or empty when none was given.
+    /// Empty is a deliberate distinction from "unknown": an empty string means
+    /// the user chose not to pass one, and the CLI picked its own default.
+    #[serde(default)]
+    pub model: String,
 }
 
 /// One dispatched unit of work, from the conductor to another session.
@@ -548,12 +553,13 @@ impl Shared {
 
     /// Record a session the app already knows about (dedicated endpoint), so it
     /// shows up in list_sessions without the agent announcing itself.
-    pub fn note_session(&self, name: &str, kind: &str) {
+    pub fn note_session(&self, name: &str, kind: &str, model: &str) {
         let mut s = self.sessions.lock().unwrap();
         if !s.iter().any(|a| a.name == name) {
             let session = AgentSession {
                 name: name.to_string(),
                 kind: kind.to_string(),
+                model: model.to_string(),
             };
             let dir = self.dir.lock().unwrap().clone();
             let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
@@ -629,7 +635,17 @@ impl Shared {
                          do not dispatch]"
                     );
                 }
-                format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
+                let model_segment = identified
+                    .iter()
+                    .find(|a| &a.name == id)
+                    .map(|a| a.model.clone())
+                    .unwrap_or_default();
+                let model_str = if model_segment.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({model_segment})")
+                };
+                format!("- {id} ({kind}) brain={room}{role}{model_str}{}", busy_label(busy))
             })
             .collect()
     }
@@ -1758,6 +1774,7 @@ impl BrainHandler {
         let session = AgentSession {
             name: p.name.clone(),
             kind: p.kind.clone(),
+            model: String::new(),
         };
         *self.identity.lock().unwrap() = Some(session.clone());
         // Replace rather than append: an agent that identifies twice should not
@@ -1852,7 +1869,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
+        description = "List the other AI agents live in this workspace right now, with their CLI kind, model (if one was set at launch), brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -3302,6 +3319,7 @@ mod tests {
         let session = AgentSession {
             name: "sess-1".into(),
             kind: "codex".into(),
+            model: String::new(),
         };
         let pending = Task {
             id: "task-1".into(),

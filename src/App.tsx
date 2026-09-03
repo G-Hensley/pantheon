@@ -31,17 +31,7 @@ import { brainColorMap } from "./lib/brains";
 import { readStored, writeStored } from "./lib/storage";
 import "./App.css";
 
-type PaneStatus = "running" | "exited";
-type Pane = {
-  id: string;
-  type: SessionType;
-  status: PaneStatus;
-  brain: string;
-  isolate: boolean;
-  // Where an isolated pane's worktree is, once the backend reports it. Persisted
-  // so the pane can be put back into that same worktree after a restart.
-  worktree?: SavedWorktree;
-};
+// PaneStatus type removed as it's unused after Pane type cleanup
 
 function App() {
   // The panes that were open when the app was last closed. Read once, before the
@@ -234,9 +224,19 @@ function App() {
   }, [panes]);
   const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
 
-  function addSession(type: SessionType, isolate = false) {
+  interface Pane {
+  id: string;
+  type: SessionType;
+  status: string;
+  brain: string;
+  isolate: boolean;
+  model?: string;
+  worktree?: SavedWorktree;
+}
+
+  function addSession(type: SessionType, isolate = false, model?: string) {
     const id = `sess-${++counter.current}`;
-    setPanes((p) => [...p, { id, type, status: "running", brain: "main", isolate }]);
+    setPanes((p) => [...p, { id, type, status: "running", brain: "main", isolate, model }]);
     setAgentBrain(id, "main").catch(() => {});
     setLauncherOpen(false);
   }
@@ -546,16 +546,17 @@ function App() {
           ✕
         </button>
                   </div>
-                  <TerminalPane
-                    sessionId={p.id}
-                    type={p.type}
-                    isolate={p.isolate}
-                    cwd={project ?? undefined}
-                    reuseWorktree={p.worktree}
-                    onExit={markExited}
-                    onIsolationChange={setPaneIsolation}
-                    onSpawnError={noteSpawnFailure}
-                  />
+<TerminalPane
+                     sessionId={p.id}
+                     type={p.type}
+                     isolate={p.isolate}
+                     cwd={project ?? undefined}
+                     reuseWorktree={p.worktree}
+                     model={p.model}
+                     onExit={markExited}
+                     onIsolationChange={setPaneIsolation}
+                     onSpawnError={noteSpawnFailure}
+                   />
                 </section>
               );
             })
