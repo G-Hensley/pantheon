@@ -490,7 +490,11 @@ share one mechanism rather than grow two.
 `reviewer`, `complete_task` moves it to `in_review` rather than `done`, and only
 `review_task` from that reviewer closes it or sends it back as `rework`.
 `dispatch` picks a reviewer unless one is named or review is explicitly waived,
-and `get_task_result` says which. Evidence: `review_task` in
+and `get_task_result` says which. What shipped is the lifecycle, not the
+cross-model rule in this heading: `choose_reviewer` requires only a different
+live session id, never compares CLI or model, and may pick the conductor. A
+reviewer of a different kind is still the conductor's job to name. Evidence:
+`review_task` in
 `src-tauri/src/mcp.rs`, and the `get_task_result` tool description there, which
 spells out what `in_review` and `rework` mean to a conductor.
 
@@ -680,8 +684,10 @@ by a task drawer that shows every open task without truncating its brief, gives
 `blocked`, `pending`, `overdue`, `in_review`, `rework`, and terminal work their
 own treatment, focuses the target pane from a task, and bounds finished history.
 Evidence: `src/components/TaskDrawer.tsx` and `TaskDrawer.test.tsx`, whose tests
-prove a sixth concurrent task stays visible and that `blocked` is shown only
-for a task holding an open question. Design in
+prove a sixth concurrent task stays visible and that a blocked task renders
+first. The drawer renders `blocked` from `task.status` alone; that the status
+is set only for a task holding an open question is a backend invariant, covered
+by the lifecycle tests in `mcp.rs`, not by the component test. Design in
 `docs/design/conductor-task-surface/increment-1.md`.
 
 The conductor bar is an at-a-glance view only while the fan-out is small.
