@@ -33,6 +33,17 @@ import "./App.css";
 
 // PaneStatus type removed as it's unused after Pane type cleanup
 
+type PaneStatus = "running" | "exited";
+type Pane = {
+  id: string;
+  type: SessionType;
+  status: PaneStatus;
+  brain: string;
+  isolate: boolean;
+  model?: string;
+  worktree?: SavedWorktree;
+};
+
 function App() {
   // The panes that were open when the app was last closed. Read once, before the
   // first render, so the CLIs come back with the window instead of after it.
@@ -131,6 +142,7 @@ function App() {
         typeId: p.type.id,
         brain: p.brain,
         isolate: p.isolate,
+        model: p.model,
         worktree: p.worktree,
       })),
     );
@@ -222,17 +234,7 @@ function App() {
     set.sort((a, b) => (a === "main" ? -1 : b === "main" ? 1 : 0));
     return set;
   }, [panes]);
-  const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
-
-  interface Pane {
-  id: string;
-  type: SessionType;
-  status: string;
-  brain: string;
-  isolate: boolean;
-  model?: string;
-  worktree?: SavedWorktree;
-}
+const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
 
   function addSession(type: SessionType, isolate = false, model?: string) {
     const id = `sess-${++counter.current}`;

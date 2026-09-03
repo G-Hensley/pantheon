@@ -212,6 +212,7 @@ export function TerminalPane({
         // one over anyway would ask the backend for a contradiction.
         reuseWorktree: withIsolation ? reuseWorktree : undefined,
         model: model && model.length > 0 ? model : undefined,
+        modelFlag: type.modelFlag,
       }).catch((e) => {
         const message = spawnErrorText(e);
         writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);

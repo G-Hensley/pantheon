@@ -61,7 +61,7 @@ export function spawnSession(
   args: string[],
   rows: number,
   cols: number,
-  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree; model?: string },
+  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree; model?: string; modelFlag?: string },
 ): Promise<void> {
   return invoke("spawn_session", {
     sessionId,
@@ -74,6 +74,7 @@ export function spawnSession(
     isolate: opts?.isolate,
     reuseWorktree: opts?.reuseWorktree,
     model: opts?.model,
+    modelFlag: opts?.modelFlag,
   });
 }
 

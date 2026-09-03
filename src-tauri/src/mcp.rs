@@ -635,17 +635,12 @@ impl Shared {
                          do not dispatch]"
                     );
                 }
-                let model_segment = identified
+                let model_display = identified
                     .iter()
                     .find(|a| &a.name == id)
-                    .map(|a| a.model.clone())
-                    .unwrap_or_default();
-                let model_str = if model_segment.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({model_segment})")
-                };
-                format!("- {id} ({kind}) brain={room}{role}{model_str}{}", busy_label(busy))
+                    .map(|a| a.model.as_str())
+                    .unwrap_or("model unknown");
+                format!("- {id} ({kind}, {model_display}) brain={room}{role}{}", busy_label(busy))
             })
             .collect()
     }
@@ -1771,10 +1766,23 @@ impl BrainHandler {
             }
             return format!("Already identified as '{b}' â€” Pantheon knows this session.");
         }
+        // Preserve the model the session was launched with: an agent that
+        // re-identifies must not lose the model that was set at spawn, because
+        // the roster would drop it and the conductor would see a different
+        // pane than the one that actually exists.
+        let existing_model = self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.name == p.name)
+            .map(|a| a.model.clone())
+            .unwrap_or_default();
         let session = AgentSession {
             name: p.name.clone(),
             kind: p.kind.clone(),
-            model: String::new(),
+            model: existing_model,
         };
         *self.identity.lock().unwrap() = Some(session.clone());
         // Replace rather than append: an agent that identifies twice should not

@@ -30,21 +30,18 @@ export function SessionLauncher({
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(false);
-  const [models, setModels] = useState<Map<string, string>>(new Map());
-
-  useEffect(() => {
-    let current = true;
-    setInitError(null);
-    setIsRepo(project ? null : true);
-    if (project) {
-      projectIsRepo(project)
-        .then((answer) => current && setIsRepo(answer))
-        .catch(() => current && setIsRepo(false));
+  
+  // Initialize models state from localStorage once
+  const [models, setModels] = useState<Map<string, string>>(() => {
+    const initial = new Map<string, string>();
+    for (const t of SESSION_TYPES) {
+      if (t.modelFlag) {
+        const stored = readStored(`model:${t.id}`);
+        initial.set(t.id, stored || "");
+      }
     }
-    return () => {
-      current = false;
-    };
-  }, [project]);
+    return initial;
+  });
 
   const effectiveIsolate = isolate && isRepo !== false;
 
@@ -84,26 +81,13 @@ export function SessionLauncher({
     return () => window.removeEventListener("keydown", onKey);
   }, [onPick, onClose, effectiveIsolate, models]);
 
-  // Track model per session type, remembered in localStorage
+  // Sync model changes to localStorage when models change
   useEffect(() => {
-    for (const t of SESSION_TYPES) {
-      if (t.modelFlag) {
-        try {
-          const stored = readStored(`model:${t.id}`);
-          if (stored !== null) setModels(prev => new Map(prev).set(t.id, stored));
-        } catch {/* ignore */}
-      }
+    for (const [id, value] of models.entries()) {
+      try {
+        writeStored(`model:${id}`, value);
+      } catch {/* ignore */}
     }
-    // Sync write-back on state changes
-    return () => {
-      for (const t of SESSION_TYPES) {
-        if (t.modelFlag) {
-          try {
-            writeStored(`model:${t.id}`, models.get(t.id) || "");
-          } catch {/* ignore */}
-        }
-      }
-    };
   }, [models]);
 
   return (
@@ -122,7 +106,17 @@ export function SessionLauncher({
               <span className="ll-cmd">
                 {t.program} {t.args.join(" ")}
                 {t.modelFlag && (
-                  <span className="ll-model">
+                  <span>
+                    <input
+                      type="text"
+                      value={models.get(t.id) || ""}
+                      onChange={(e) => {
+                        const newModels = new Map(models);
+                        newModels.set(t.id, e.target.value);
+                        setModels(newModels);
+                      }}
+                      className="ll-model-input"
+                    />
                     {models.get(t.id) || ""}
                   </span>
                 )}

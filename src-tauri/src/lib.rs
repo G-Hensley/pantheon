@@ -177,16 +177,19 @@ fn is_codex(program: &str) -> bool {
 /// `openrouter/` is paid. Local providers (ollama, llama.cpp, lmstudio, etc.)
 /// never match `openrouter/` and are therefore always allowed.
 ///
-/// Empty model is allowed (the CLI picks its own default).
+/// The id is trimmed first so a leading or trailing space — the kind of thing a
+/// paste or a quoted shell argument leaves behind — cannot silently downgrade a
+/// paid id to a free one. Empty model is allowed (the CLI picks its own default).
 fn is_paid_openrouter_model(model: &str) -> bool {
-    if model.is_empty() {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    if !model.starts_with("openrouter/") {
+    if !trimmed.starts_with("openrouter/") {
         return false;
     }
     // Strip the leading "openrouter/" prefix, then check the remainder.
-    let stripped = &model["openrouter/".len()..];
+    let stripped = &trimmed["openrouter/".len()..];
     if stripped == "free" {
         return false;
     }
@@ -992,6 +995,10 @@ async fn spawn_session(
     // Optional model override (e.g., "openrouter/free"). If provided, the
     // corresponding flag is prepended to args.
     model: Option<String>,
+    // The model flag to use (e.g., "--model" for claude, "-m" for codex/opencode).
+    // Comes from the frontend's SessionType definition so there's a single
+    // source of truth for which CLI uses which flag.
+    model_flag: Option<String>,
 ) -> Result<(), SpawnError> {
     // Refuse a session id that is already live. Inserting over one would replace
     // the handle without killing the process or removing its worktree, orphaning
@@ -1112,18 +1119,12 @@ async fn spawn_session(
             )));
         }
 
-        // Prepend the model flag to the command when provided and when this CLI supports it.
-        if let Some(ref m) = model {
-            if program == "claude" {
-                args.insert(0, "--model".to_string());
-                args.insert(1, m.clone());
-            } else if program == "codex" {
-                args.insert(0, "-m".to_string());
-                args.insert(1, m.clone());
-            } else if program == "opencode" {
-                args.insert(0, "-m".to_string());
-                args.insert(1, m.clone());
-            }
+        // Prepend the model flag and model to the command when both are provided.
+        // The model_flag comes from the frontend's SessionType definition, so
+        // there's a single source of truth for which CLI uses which flag.
+        if let (Some(ref m), Some(ref flag)) = (model, model_flag) {
+            args.insert(0, flag.clone());
+            args.insert(1, m.clone());
         }
 
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
@@ -2234,5 +2235,16 @@ mod tests {
         assert!(!is_paid_openrouter_model("llama"));
         assert!(!is_paid_openrouter_model("lmstudio/mistral"));
         assert!(!is_paid_openrouter_model(""));
+    }
+
+    #[test]
+    fn free_model_guard_trims_whitespace_before_check() {
+        // A pasted or quoted model id with surrounding whitespace must not be
+        // silently downgraded from paid to free.
+        assert!(is_paid_openrouter_model(" openrouter/claude-sonnet-4"));
+        assert!(is_paid_openrouter_model("openrouter/claude-sonnet-4 "));
+        assert!(is_paid_openrouter_model("\topenrouter/gpt-4o\n"));
+        // Free-tier with whitespace is still free.
+        assert!(!is_paid_openrouter_model(" openrouter/free "));
     }
 }
