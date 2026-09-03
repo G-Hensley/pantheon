@@ -14,7 +14,7 @@ export function SessionLauncher({
   onClose,
   project,
 }: {
-  onPick: (t: SessionType, isolate: boolean) => void;
+  onPick: (t: SessionType, isolate: boolean, model?: string) => void;
   onClose: () => void;
   project: string | null;
 }) {
@@ -30,20 +30,18 @@ export function SessionLauncher({
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(false);
-
-  useEffect(() => {
-    let current = true;
-    setInitError(null);
-    setIsRepo(project ? null : true);
-    if (project) {
-      projectIsRepo(project)
-        .then((answer) => current && setIsRepo(answer))
-        .catch(() => current && setIsRepo(false));
+  
+  // Initialize models state from localStorage once
+  const [models, setModels] = useState<Map<string, string>>(() => {
+    const initial = new Map<string, string>();
+    for (const t of SESSION_TYPES) {
+      if (t.modelFlag) {
+        const stored = readStored(`model:${t.id}`);
+        initial.set(t.id, stored || "");
+      }
     }
-    return () => {
-      current = false;
-    };
-  }, [project]);
+    return initial;
+  });
 
   const effectiveIsolate = isolate && isRepo !== false;
 
@@ -74,12 +72,23 @@ export function SessionLauncher({
       if (e.key === "Escape") onClose();
       const n = Number(e.key);
       if (n >= 1 && n <= SESSION_TYPES.length) {
-        onPick(SESSION_TYPES[n - 1], effectiveIsolate);
+        const selected = SESSION_TYPES[n - 1];
+        const model = models.get(selected.id) || undefined;
+        onPick(selected, effectiveIsolate, model);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onPick, onClose, effectiveIsolate]);
+  }, [onPick, onClose, effectiveIsolate, models]);
+
+  // Sync model changes to localStorage when models change
+  useEffect(() => {
+    for (const [id, value] of models.entries()) {
+      try {
+        writeStored(`model:${id}`, value);
+      } catch {/* ignore */}
+    }
+  }, [models]);
 
   return (
     <div className="launcher-backdrop" onClick={onClose}>
@@ -90,12 +99,27 @@ export function SessionLauncher({
             <button
               key={t.id}
               className="launcher-item"
-              onClick={() => onPick(t, effectiveIsolate)}
+              onClick={() => onPick(t, effectiveIsolate, models.get(t.id))}
             >
               <span className="dot" style={{ background: t.color }} />
               <span className="ll-label">{t.label}</span>
               <span className="ll-cmd">
                 {t.program} {t.args.join(" ")}
+                {t.modelFlag && (
+                  <span>
+                    <input
+                      type="text"
+                      value={models.get(t.id) || ""}
+                      onChange={(e) => {
+                        const newModels = new Map(models);
+                        newModels.set(t.id, e.target.value);
+                        setModels(newModels);
+                      }}
+                      className="ll-model-input"
+                    />
+                    {models.get(t.id) || ""}
+                  </span>
+                )}
               </span>
               <kbd className="ll-key">{i + 1}</kbd>
             </button>
