@@ -147,9 +147,10 @@ only), `cancel_task` (conductor only), `reassign_task` (conductor only),
 `complete_task`, `review_task`, `get_task_result`, `wait_for_tasks`,
 `ask_conductor`, `answer_question` (conductor only), `set_session_identity`.
 `cancel_task` closes any open task with a reason, several at once if you name
-them together. `reassign_task` moves a pending or overdue task to a new
-target (redelivering the brief) or hands an in_review or rework task to a new
-reviewer, so a stuck or gone session never leaves work stranded.
+them together. `reassign_task` moves a pending, overdue, or already-abandoned
+task to a new live target (redelivering the brief), or hands an in_review or
+rework task to a new live reviewer, so a session that is stuck, gone, or
+already given up on does not have to leave the work stranded.
 
 ## How agents are briefed
 
@@ -191,7 +192,12 @@ short series, not the whole wait. A timeout says so explicitly and cancels
 nothing: the agents keep working and their results are still accepted, so
 calling `wait_for_tasks` again with the same ids is the normal way to keep
 waiting. A pane that dies mid-wait ends the wait rather than holding it open,
-because its task becomes `abandoned`.
+because its task becomes `abandoned`, a terminal state like any other finish.
+That does not cover a task already `in_review`: the submitted work already
+exists, so its target dying does not abandon it, and a dead reviewer is
+flagged on the task rather than ending it. A wait on that task instead runs to
+its own timeout, whose message lists every task still open, flag included, so
+a stuck review is visible even though nothing has finished it.
 
 Dispatch used to be one-way, so an agent that hit a genuine ambiguity mid-task
 could only guess, stall, or ask the human in its own terminal. With five panes
