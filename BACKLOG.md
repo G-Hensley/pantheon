@@ -484,7 +484,7 @@ Interacts with the `wait_for_tasks` entry above: both are about a conductor and
 a pane needing to communicate between dispatch and completion, and they should
 share one mechanism rather than grow two.
 
-## Nothing enforces cross-model review, so "done" means self-certified
+## Nothing enforced cross-model review, so "done" meant self-certified
 
 **Shipped, task d575h4, in PR #16 (`3efebac`); the cross-model rule and the
 delivery gap this section named both shipped later in Phase 2 of
