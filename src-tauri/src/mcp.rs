@@ -1097,7 +1097,7 @@ impl Shared {
         // Before the budget and before the task is recorded, like every other
         // refusal here: a dispatch naming an impossible reviewer should cost
         // nothing and leave nothing to collect.
-        let reviewer = choose_reviewer(reviewer, from, target, &live)?;
+        let reviewer = choose_reviewer(reviewer, from, target, &live, &self.sessions_snapshot())?;
 
         // Built before the gate because the size rule needs the finished
         // injection, and the id is part of what it measures. Nothing here
@@ -1762,11 +1762,22 @@ pub const REVIEW_WAIVED: &str = "none";
 /// wrote the brief is the reader least likely to notice it was misread. The
 /// dispatcher is still a fine reviewer, and is the intended case for a
 /// conductor checking work from a different model.
+///
+/// An unnamed reviewer also prefers a session whose CLI *kind* differs from
+/// the target's, before falling back to any other live session. This is
+/// `CONTRIBUTING.md`'s "Review before you commit" rule ("route to a
+/// **different-model** reviewer") applied automatically: before this, a
+/// conductor that omitted `reviewer` could get the target's own kind back,
+/// which enforces the review gate without enforcing the reason it exists.
+/// Naming a reviewer explicitly still bypasses this preference entirely,
+/// same as it already bypasses the third-party-over-dispatcher tie-break:
+/// an explicit choice is the conductor doing the job this defaults for.
 fn choose_reviewer(
     requested: &str,
     from: &str,
     target: &str,
     live: &[String],
+    sessions: &[AgentSession],
 ) -> Result<String, String> {
     if requested == REVIEW_WAIVED {
         return Ok(String::new());
@@ -1788,10 +1799,37 @@ fn choose_reviewer(
         return Ok(requested.to_string());
     }
 
-    let third_party = live.iter().find(|s| *s != target && *s != from);
-    let dispatcher = live.iter().find(|s| *s != target && *s == from);
-    match third_party.or(dispatcher) {
-        Some(reviewer) => Ok(reviewer.clone()),
+    // The existing third-party-over-dispatcher tie-break, applied first to
+    // whichever candidates share the preference (a different kind than the
+    // target), then, if that group is empty, to every live candidate. Kept
+    // as one closure so the tie-break itself is written once rather than
+    // twice.
+    let pick = |candidates: &[String]| -> Option<String> {
+        let third_party = candidates.iter().find(|s| *s != target && *s != from);
+        let dispatcher = candidates.iter().find(|s| *s != target && *s == from);
+        third_party.or(dispatcher).cloned()
+    };
+
+    let kind_of = |name: &str| -> &str {
+        sessions
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.kind.as_str())
+            .unwrap_or("")
+    };
+    // An empty kind means "unidentified", not "different". Treating it as a
+    // real kind would make an unidentified session look preferable to a
+    // same-kind one that has actually announced itself, which is backwards:
+    // there is no evidence it differs at all.
+    let target_kind = kind_of(target);
+    let different_kind: Vec<String> = live
+        .iter()
+        .filter(|s| !target_kind.is_empty() && !kind_of(s).is_empty() && kind_of(s) != target_kind)
+        .cloned()
+        .collect();
+
+    match pick(&different_kind).or_else(|| pick(live)) {
+        Some(reviewer) => Ok(reviewer),
         // A workspace with nobody else in it. Refusing the dispatch would make
         // a solo pane unusable, so this waives and the caller says so out loud.
         None => Ok(String::new()),
@@ -2604,7 +2642,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already holds an open task, this still delivers the new brief on top, but the response names the older task id so you can cancel_task or reassign_task it first rather than stacking work silently."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already holds an open task, this still delivers the new brief on top, but the response names the older task id so you can cancel_task or reassign_task it first rather than stacking work silently."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -4361,7 +4399,7 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok("sess-3".to_string()),
             "a third party is preferred over the conductor who wrote the brief"
         );
@@ -4374,7 +4412,7 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into()];
 
         assert_eq!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok("sess-1".to_string())
         );
     }
@@ -4387,7 +4425,7 @@ mod tests {
         let live = vec!["sess-2".to_string()];
 
         assert_eq!(
-            choose_reviewer("", "sess-2", "sess-2", &live),
+            choose_reviewer("", "sess-2", "sess-2", &live, &[]),
             Ok(String::new())
         );
     }
@@ -4397,12 +4435,12 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer(REVIEW_WAIVED, "sess-1", "sess-2", &live),
+            choose_reviewer(REVIEW_WAIVED, "sess-1", "sess-2", &live, &[]),
             Ok(String::new()),
             "an explicit waiver is honoured"
         );
         assert_ne!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok(String::new()),
             "but silence is not a waiver"
         );
@@ -4413,16 +4451,16 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer("sess-3", "sess-1", "sess-2", &live),
+            choose_reviewer("sess-3", "sess-1", "sess-2", &live, &[]),
             Ok("sess-3".to_string())
         );
         // The conductor reviewing is explicitly fine.
         assert_eq!(
-            choose_reviewer("sess-1", "sess-1", "sess-2", &live),
+            choose_reviewer("sess-1", "sess-1", "sess-2", &live, &[]),
             Ok("sess-1".to_string())
         );
 
-        let self_review = choose_reviewer("sess-2", "sess-1", "sess-2", &live).unwrap_err();
+        let self_review = choose_reviewer("sess-2", "sess-1", "sess-2", &live, &[]).unwrap_err();
         assert!(
             self_review.contains("cannot review its own work"),
             "{self_review}"
@@ -4430,8 +4468,52 @@ mod tests {
         // And it names the escape hatch, or the conductor is stuck guessing.
         assert!(self_review.contains(REVIEW_WAIVED), "{self_review}");
 
-        let dead = choose_reviewer("sess-9", "sess-1", "sess-2", &live).unwrap_err();
+        let dead = choose_reviewer("sess-9", "sess-1", "sess-2", &live, &[]).unwrap_err();
         assert!(dead.contains("no live session 'sess-9'"), "{dead}");
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_prefers_a_different_cli_kind_than_the_target() {
+        // sess-3 is the same kind as the target; sess-4 is not. The plain
+        // third-party-over-dispatcher tie-break would have picked sess-3,
+        // which enforces the review gate without enforcing the reason
+        // CONTRIBUTING.md wants it: a different model actually looking.
+        let live = vec!["sess-1".to_string(), "sess-3".into(), "sess-4".into()];
+        let sessions = vec![
+            agent("sess-2", "claude"), // the target
+            agent("sess-3", "claude"),
+            agent("sess-4", "codex"),
+        ];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-4".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_falls_back_to_the_same_kind_when_no_other_kind_is_live() {
+        let live = vec!["sess-1".to_string(), "sess-3".into()];
+        let sessions = vec![agent("sess-2", "claude"), agent("sess-3", "claude")];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-3".to_string()),
+            "no different-kind candidate exists, so the old rule still applies"
+        );
+    }
+
+    #[test]
+    fn a_named_reviewer_is_unaffected_by_the_kind_preference() {
+        // Naming a reviewer is the conductor doing the job the preference is
+        // a default for; it must not be second-guessed by kind.
+        let live = vec!["sess-1".to_string(), "sess-3".into()];
+        let sessions = vec![agent("sess-2", "claude"), agent("sess-3", "claude")];
+
+        assert_eq!(
+            choose_reviewer("sess-3", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-3".to_string())
+        );
     }
 
     #[test]

@@ -232,6 +232,11 @@ exchange is kept on the task, so an answer given once is not asked again.
   A pane that fails its liveness probe for any other reason is reported alive:
   being slow to notice a death costs a wait, being wrong about one costs the
   result.
+- An unnamed reviewer prefers a live session running a different CLI kind than
+  the target, falling back to any other live session only when no such
+  candidate exists. That is `CONTRIBUTING.md`'s cross-model review rule
+  applied automatically rather than left to the conductor to remember; naming
+  a reviewer explicitly is unaffected by it.
 - A worktree branch is deleted only when it has no commits of its own, so
   committed agent work is never silently discarded. Cleanup also refuses to
   remove a dirty worktree, preserving uncommitted changes on disk.
