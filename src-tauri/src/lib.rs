@@ -537,12 +537,7 @@ impl SessionManager {
     /// Kill every session — used on window close so no agent process is orphaned
     /// and no worktree is left behind.
     fn kill_all(&self) {
-        let handles = self
-            .sessions
-            .lock()
-            .unwrap()
-            .drain()
-            .collect::<Vec<_>>();
+        let handles = self.sessions.lock().unwrap().drain().collect::<Vec<_>>();
         let trees = self
             .headless
             .lock()
@@ -1178,8 +1173,7 @@ async fn spawn_session(
                 rollback.server = Some(server);
                 let model_str = model.as_deref().unwrap_or("");
                 shared.note_session(&session_id, &program, model_str);
-                let (args, env) =
-                    agent_mcp_wiring(&program, &session_id, &url, Some(&token));
+                let (args, env) = agent_mcp_wiring(&program, &session_id, &url, Some(&token));
                 (
                     args,
                     env,
@@ -1249,12 +1243,7 @@ async fn spawn_session(
             )));
         }
 
-        let cmd = build_command(
-            &launch.program,
-            &launch.args,
-            &launch.cwd,
-            &launch.env,
-        );
+        let cmd = build_command(&launch.program, &launch.args, &launch.cwd, &launch.env);
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave); // so the reader hits EOF when the child exits
 
@@ -1595,11 +1584,11 @@ pub fn run() {
 mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
-        delivery_allowance_ms, is_agent_cli, is_codex, migrate_legacy_dir, ready_to_submit,
-        resolve_isolation, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
-        IsolationReason, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS,
-        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
-        is_paid_openrouter_model,
+        delivery_allowance_ms, is_agent_cli, is_codex, is_paid_openrouter_model,
+        migrate_legacy_dir, ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
+        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
+        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
 
@@ -2359,14 +2348,18 @@ mod tests {
     fn free_model_guard_refuses_paid_openrouter_id() {
         assert!(is_paid_openrouter_model("openrouter/claude-sonnet-4"));
         assert!(is_paid_openrouter_model("openrouter/gpt-4o"));
-        assert!(is_paid_openrouter_model("openrouter/anthropic/claude-3-5-sonnet"));
+        assert!(is_paid_openrouter_model(
+            "openrouter/anthropic/claude-3-5-sonnet"
+        ));
     }
 
     #[test]
     fn free_model_guard_allows_free_openrouter_ids() {
         assert!(!is_paid_openrouter_model("openrouter/free"));
         assert!(!is_paid_openrouter_model("openrouter/openrouter/free"));
-        assert!(!is_paid_openrouter_model("openrouter/anthropic/claude-3-5-sonnet:free"));
+        assert!(!is_paid_openrouter_model(
+            "openrouter/anthropic/claude-3-5-sonnet:free"
+        ));
         assert!(!is_paid_openrouter_model("openrouter/any-model:free"));
     }
 
