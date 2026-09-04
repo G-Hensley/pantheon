@@ -582,17 +582,11 @@ it.
 
 **The model is now acquired, but not routed on.** `SESSION_TYPES` in
 `src/lib/ipc.ts:35-41` gives each CLI a `modelFlag` (`--model` for claude, `-m`
-for codex and opencode), `src-tauri/src/lib.rs:995-998` accepts an optional
-`model` override and prepends the flag, and `note_session` stores it so
-`roster_lines` prints it as `- {id} ({kind}, {model})` (mcp.rs:604, 704-711).
-What is still open is the capability profile and the routing decision.
-
-Two places currently overstate what is known, which is worth correcting whether
-or not the larger item is built. The `list_sessions` tool description advertises
-"their model/CLI, brain", and the comment at `src-tauri/src/mcp.rs:110` says
-"Just id and model". Both describe the roster's `(opencode)` as a model; it is
-the `SessionType.label` from the launcher. A conductor reading either
-description reasonably believes it has information it does not have.
+for codex and opencode), `src-tauri/src/lib.rs:995-998` declares the optional
+`model` override and `src-tauri/src/lib.rs:1122-1127` prepends the flag, and
+`note_session` (`src-tauri/src/mcp.rs:788`) stores it so the roster prints it
+as `- {id} ({kind}, {model})` (`src-tauri/src/mcp.rs:915-916`). What is still
+open is the capability profile and the routing decision.
 
 **Confirmed the expensive way, 2026-08-13.** Three tasks were dispatched to
 sess-4 (codex), sess-6 (opencode) and sess-8 (opencode). sess-8 was a local
