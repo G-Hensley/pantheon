@@ -484,19 +484,25 @@ Interacts with the `wait_for_tasks` entry above: both are about a conductor and
 a pane needing to communicate between dispatch and completion, and they should
 share one mechanism rather than grow two.
 
-## Nothing enforces cross-model review, so "done" means self-certified
+## Nothing enforced cross-model review, so "done" meant self-certified
 
-**Shipped, task d575h4, in PR #16 (`3efebac`).** A task now carries a
+**Shipped, task d575h4, in PR #16 (`3efebac`); the cross-model rule and the
+delivery gap this section named both shipped later in Phase 2 of
+`docs/plans/2026-09-03-pantheon-repair.md`.** A task now carries a
 `reviewer`, `complete_task` moves it to `in_review` rather than `done`, and only
 `review_task` from that reviewer closes it or sends it back as `rework`.
 `dispatch` picks a reviewer unless one is named or review is explicitly waived,
-and `get_task_result` says which. What shipped is the lifecycle, not the
-cross-model rule in this heading: `choose_reviewer` requires only a different
-live session id, never compares CLI or model, and may pick the conductor. A
-reviewer of a different kind is still the conductor's job to name. Evidence:
-`review_task` in
-`src-tauri/src/mcp.rs`, and the `get_task_result` tool description there, which
-spells out what `in_review` and `rework` mean to a conductor.
+and `get_task_result` says which. `choose_reviewer` now prefers a live session
+running a different CLI kind than the target before falling back to any other
+live session, closing the cross-model gap this heading named; a reviewer of
+the same kind is still possible only when no other kind is live. Both halves
+of the review result are also delivered rather than left for the conductor to
+relay: `complete_task` types a review request straight into the reviewer's
+pane, and a rejected `review_task` types a rework notice into the target's,
+each readable in full through `get_task_result`, which the task's target and
+reviewer may now call by id and not only its dispatcher. Evidence:
+`choose_reviewer`, `review_request_notice`, `rework_notice`, and
+`task_for_reader` in `src-tauri/src/mcp.rs`, and their tests.
 
 The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
 you commit") lays out six steps: implement, route to a **different-model**
@@ -544,6 +550,26 @@ board to be useful.
 Related: `IMPROVEMENT-AUDIT.md`'s task-board sketch (explicitly marked "the
 design is still open") is the only other place this appears, and it is a
 drawing rather than a plan.
+
+## Dispatch to a busy pane typed the new brief over the running one
+
+**Shipped, Phase 2 of `docs/plans/2026-09-03-pantheon-repair.md`.** Measured
+2026-09-03: `dispatch_precheck` checked halted, self-dispatch, target
+liveness, and injection size, never whether the target already had open work,
+so a second brief landed in the pane mid-task and both instructions ended up
+in whatever the running agent was reading. A dispatch to an occupied pane
+(target of a pending, overdue, rework, or blocked task, or reviewer of an
+in_review one) now creates the task with status `queued` instead of typing it,
+naming which task it is queued behind and at what position; each pane holds
+at most `QUEUE_CAP` (3) queued briefs, a fourth refused with the reason and
+the queued ids, nothing journaled for the refusal. Whenever a pane stops being
+occupied, whatever is next for it (an undelivered review request or rework
+notice first, then the oldest queued brief, FIFO) is delivered through the
+same path automatically, gated against halted and against typing into a pane
+that is still occupied. `cancel_task` and `reassign_task` both work on a
+queued task. Evidence: `queue_predecessor`, `queue_cap_refusal`,
+`next_delivery_for`, `occupying_task`, and `Shared::drain_pane` in
+`src-tauri/src/mcp.rs`, and their tests.
 
 ## Model-aware dispatch
 

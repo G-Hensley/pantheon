@@ -4,7 +4,7 @@
 // tool handlers touch app state directly (same process), and each write emits a
 // `context-changed` event so the sidebar updates live.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -71,11 +71,18 @@ fn oversize_refusal(injection: &str) -> Option<String> {
     })
 }
 
+/// Collapse CR/LF into spaces so an injected message stays on one terminal
+/// line. Embedded CR/LF characters can become unintended submit events in a
+/// target CLI. Preserves all other whitespace, because quoted commands and
+/// code fragments may depend on it. Shared by every message Pantheon types
+/// into a pane: a dispatch brief, a retarget, a review request, a rework
+/// notice.
+fn single_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
-    // Keep the injection on one terminal line. Embedded CR/LF characters can
-    // become unintended submit events in a target CLI. Preserve all other
-    // whitespace because quoted commands and code fragments may depend on it.
-    let task = task.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let task = single_line(task);
 
     // Deliberately lean. Every byte spent here is a byte the brief cannot
     // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
@@ -84,6 +91,68 @@ fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
         "[pantheon] Task from conductor '{conductor}' (task_id {task_id}): {task} \
          When done, call the pantheon complete_task tool with task_id \"{task_id}\" \
          and your result."
+    )
+}
+
+/// Truncate `s` to at most `max_bytes`, on a char boundary, marking the cut.
+/// Byte-based to match `MAX_INJECTION_BYTES`, which measures the same way.
+fn truncate_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes.saturating_sub(3);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+/// Build an injection from a fixed wrapper and one variable part, shrinking
+/// the variable part to fit `MAX_INJECTION_BYTES` rather than refusing.
+///
+/// This is the other half of size handling from `oversize_refusal`: a
+/// dispatch has a caller to hand a refusal back to, but a review request or
+/// rework notice is typed in on its own, by `drain_pane`, with nobody on
+/// the line to refuse to. Truncating instead is safe here specifically
+/// because the full text stays reachable by id through `get_task_result`:
+/// nothing is actually lost, only what reaches the terminal is shortened.
+fn fit_injection(build: impl Fn(&str) -> String, variable: &str) -> String {
+    let full = build(variable);
+    match injection_overage(&full) {
+        None => full,
+        Some(over) => {
+            let trimmed = truncate_bytes(variable, variable.len().saturating_sub(over));
+            build(&trimmed)
+        }
+    }
+}
+
+/// What a reviewer's terminal receives when a task reaches them for review.
+fn review_request_notice(id: &str, target: &str, brief: &str) -> String {
+    let brief = single_line(&truncate_chars(brief, TASK_ECHO_CHARS));
+    fit_injection(
+        |v| {
+            format!(
+                "[pantheon] Review task {id} from {target}: {v} Call the pantheon \
+                 get_task_result tool with that id for the result, then review_task with \
+                 verdict approve or rework."
+            )
+        },
+        &brief,
+    )
+}
+
+/// What a target's terminal receives when its reviewer sends a task back.
+fn rework_notice(id: &str, reviewer: &str, findings: &str) -> String {
+    let findings = single_line(&truncate_chars(findings, TASK_ECHO_CHARS));
+    fit_injection(
+        |v| {
+            format!(
+                "[pantheon] Task {id} sent back by {reviewer}: {v} Fix, then call the \
+                 pantheon complete_task tool again with task_id \"{id}\"."
+            )
+        },
+        &findings,
     )
 }
 
@@ -225,6 +294,20 @@ pub struct Task {
     /// honest answer before the first sweep has looked.
     #[serde(default)]
     pub reviewer_gone: bool,
+    /// Whether the message this task owes its own pane has reached it: the
+    /// review request for an `in_review` task (to `reviewer`), or the rework
+    /// notice for a `rework` task (to `target`). Meaningless, and left
+    /// `true`, for every other status: there is nothing to notify about.
+    ///
+    /// `serde(default)` loads every task written before this field as
+    /// `false`: "not yet delivered". That is the honest answer for an
+    /// `in_review` or `rework` task from before Pantheon had any delivery
+    /// mechanism at all, and it is also the useful one, closing what
+    /// BACKLOG.md's "review request was never delivered" entry named: a
+    /// workspace upgrading mid-run retries exactly the notifications that
+    /// never had anywhere to go.
+    #[serde(default)]
+    pub notice_delivered: bool,
 }
 
 /// One question from a working agent and the conductor's answer to it.
@@ -258,6 +341,20 @@ pub const STATUS_ABANDONED: &str = "abandoned";
 /// The status a task holds while its agent waits on an answer from the
 /// conductor. Open, not terminal: the agent is alive and the work is unfinished.
 pub const STATUS_BLOCKED: &str = "blocked";
+
+/// The status a freshly dispatched (or redirected) task holds while its
+/// target pane is occupied: recorded, but not yet typed into any terminal.
+/// Open, not terminal, and deliberately not counted as "busy" the way
+/// `pending` is (see `attribute_open_tasks`), because nothing is running
+/// yet for it to be slow at. `drain_pane` is what moves a task off this
+/// status once its pane is free.
+pub const STATUS_QUEUED: &str = "queued";
+
+/// How many tasks may sit queued behind one pane at once. A ceiling for the
+/// same reason `MAX_DISPATCHES` and `MAX_QUESTIONS_PER_TASK` are: a
+/// conductor that keeps dispatching to a pane that never catches up should
+/// be told to stop and reconsider, not let the queue grow without limit.
+const QUEUE_CAP: usize = 3;
 
 /// How many questions one task may put to the conductor.
 ///
@@ -385,10 +482,11 @@ const WAIT_MAX_SECS: u64 = 55;
 /// and costs one non-blocking probe per pane per pass.
 const WAIT_POLL_MS: u64 = 2000;
 
-/// A task record was created and delivery was attempted. `delivered` is false
-/// when the prompt could not be written to the target's terminal â€” the task
-/// still exists, in "error" status, rather than vanishing silently the way a
-/// failed dispatch used to.
+/// A task record was created, and either typed in or queued. `delivered` is
+/// false both when the target was occupied (`queued` is `true`) and when the
+/// prompt could not be written to a free target's terminal (`queued` is
+/// `false` and the task exists in "error" status), so check `queued` to tell
+/// the two apart.
 #[derive(Clone, Debug, Serialize)]
 pub struct DispatchOutcome {
     pub task_id: String,
@@ -397,15 +495,19 @@ pub struct DispatchOutcome {
     /// conductor usually did not choose this: omitting a reviewer picks one,
     /// and a conductor that is not told which cannot follow up.
     pub reviewer: String,
-    /// The id of a task the target already held open, if it did. Dispatch does
-    /// NOT refuse on this: it types the new brief in on top of the old one
-    /// exactly as before, because holding the queue for a future queue
-    /// (BACKLOG.md's per-pane queue item) is a bigger change than Phase 1
-    /// makes. What changes is that the conductor is told, rather than
-    /// discovering it later as a brief the target never seemed to act on:
-    /// naming the id gives it something to act on, cancel_task or
-    /// reassign_task, before piling on more work.
+    /// The id of the task this one is queued behind, set exactly when
+    /// `queued` is `true`. Before the per-pane queue existed, a dispatch to
+    /// an occupied target still typed the new brief in on top of the old
+    /// one; this field named the older task so the conductor could act on
+    /// it. Queueing closed that gap, and this now names what the new task
+    /// is actually waiting on.
     pub already_busy: Option<String>,
+    /// True when this dispatch was held rather than typed in immediately,
+    /// because the target pane was occupied.
+    pub queued: bool,
+    /// 1-based position in the target's queue, set exactly when `queued` is
+    /// `true`.
+    pub queue_position: Option<usize>,
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
@@ -503,6 +605,16 @@ pub struct Shared {
     engine: Arc<crate::SessionManager>,
     /// Which agent (if any) is the conductor. Set by the app, never self-claimed.
     conductor: Mutex<Option<String>>,
+    /// Panes whose MCP endpoint has actually received a request since their
+    /// most recent spawn: the CLI is up, reading its terminal, and this is
+    /// not merely a live PTY that could still be mid-boot. `note_session`
+    /// runs before the PTY and its engine handle even exist, and a live
+    /// process still starting up cannot receive typed input either, so
+    /// neither is proof a pane can be delivered to; a connection is.
+    /// `drain_pane` refuses to attempt anything against a pane not in this
+    /// set. Cleared on respawn (`note_session`) so a stale connection from a
+    /// prior incarnation of the same pane id cannot mark the new one ready.
+    connected: Mutex<HashSet<String>>,
     /// Global kill-switch for all dispatch.
     halted: Mutex<bool>,
     tasks: Mutex<Vec<Task>>,
@@ -515,6 +627,38 @@ pub struct Shared {
     /// blocked PTY write stalls other deliveries but never a completion,
     /// review, or cancellation.
     delivery: RwLock<()>,
+    /// One mutex per pane, handed out by `pane_delivery_lock`. `delivery`
+    /// above is a single `RwLock` shared by every delivery path, and
+    /// `RwLock::read` lets any number of readers run at once by design, so
+    /// it only ever excludes Stop and cancel (the writers) from a delivery
+    /// path, never one delivery path from another: two concurrent drains of
+    /// the same pane could both select the same candidate before either
+    /// promoted it, and a fresh dispatch could see a pane as free in the
+    /// same window, landing concurrently with, and out of order with, a
+    /// drain that had already picked its queue head but not yet delivered
+    /// it. `drain_pane`, `dispatch_task`, and `reassign_task`'s own delivery
+    /// all hold the lock for their pane across the whole "decide what this
+    /// pane gets next, then send it" section, so only one of them can ever
+    /// be inside that section for a given pane at a time. Entries are never
+    /// removed: a project has few, long-lived pane names, so the map does
+    /// not grow without bound.
+    pane_delivery: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// A test-only pause point, absent from every non-test build (the field
+    /// does not exist at all outside `#[cfg(test)]`, so this costs nothing
+    /// in production). `hit_test_seam` calls the hook, if one is set, at a
+    /// handful of internal boundaries a real race would need to land on:
+    /// after `drain_pane` selects a candidate, after `enqueue_within_cap`'s
+    /// cap check passes, and after `drain_pane` acquires its pane lock. A
+    /// test sets a hook with `set_test_seam` that blocks the calling thread
+    /// (a channel receive, not a sleep), giving the test explicit control
+    /// over when each thread is allowed past that boundary instead of
+    /// hoping the scheduler happens to interleave two threads there. See
+    /// the sixth-round tests below for why: a barrier at a function's
+    /// entrance, or a sleep assumed long enough for another thread to reach
+    /// a lock, both let the unfixed code pass by accident when the OS
+    /// schedules the two threads sequentially instead of concurrently.
+    #[cfg(test)]
+    test_seam: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl Shared {
@@ -526,14 +670,46 @@ impl Shared {
     }
 
     /// Re-point storage (the user picked a different project) and rehydrate it.
+    ///
+    /// A live pane's identity must survive the switch. `set_project` restores
+    /// panes and records their real kind (`note_session`) before the frontend
+    /// calls this, so the sessions held in memory at this instant are correct
+    /// for whichever panes are actually running; the new dir's own journal may
+    /// still say whatever it last recorded for those names. `merge_live_identity`
+    /// keeps this call's in-memory truth for every name that is live and lets
+    /// the journal stand for everything else, so a pane spawned into the old
+    /// dir does not read back the previous project's CLI once the new one
+    /// loads. See `merge_live_identity` for the rule itself and why it is a
+    /// pure helper rather than inline here.
     pub fn set_dir(&self, dir: PathBuf) {
         let brain = load_brain(&dir);
-        *self.dir.lock().unwrap() = dir;
+        let live = self.live_ids();
+        let (sessions, changed) =
+            merge_live_identity(&self.sessions_snapshot(), &brain.sessions, &live);
+        *self.dir.lock().unwrap() = dir.clone();
         *self.entries.lock().unwrap() = brain.entries;
-        *self.sessions.lock().unwrap() = brain.sessions;
+        *self.sessions.lock().unwrap() = sessions;
         *self.tasks.lock().unwrap() = brain.tasks;
+        // Same semantics as `note_session`: append one record per session that
+        // actually changed, to the dir just loaded, so the correction is not
+        // lost the next time this project's journal is read.
+        for session in &changed {
+            let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
+        }
         self.app.emit("context-changed");
         self.app.emit("conductor-changed");
+        // The tasks just loaded may hold a queued brief on a pane that is
+        // already connected, or an undelivered review request or rework
+        // notice for one, left over from before the project switched.
+        // Nothing else sweeps for that, so this is the moment to. Swept by
+        // `connected`, not `live`: a live pane can still be mid-boot with no
+        // engine handle yet, which `drain_pane` would refuse anyway (see
+        // `is_connected`), so sweeping `live` here would mostly cost a
+        // lock-and-no-op per pane for no benefit.
+        let connected: Vec<String> = self.connected.lock().unwrap().iter().cloned().collect();
+        for id in &connected {
+            self.drain_pane(id);
+        }
     }
 
     /// The brain a given agent name is currently in. Defaults to "main".
@@ -601,6 +777,13 @@ impl Shared {
     /// model can change on a relaunch with a different flag; a roster line
     /// that still named the old CLI or model was actively misleading a
     /// conductor about what it was dispatching to.
+    ///
+    /// Called at MCP-wiring time in `spawn_session`, before the PTY and its
+    /// engine handle exist. An earlier version drained the pane from here;
+    /// that meant every restart errored each restored pane's queue at spawn
+    /// time, against a handle the engine did not have yet. This clears
+    /// `connected` instead: whatever readiness the last incarnation of this
+    /// pane earned is stale the moment a fresh one is about to start.
     pub fn note_session(&self, name: &str, kind: &str, model: &str) {
         let to_persist = {
             let mut s = self.sessions.lock().unwrap();
@@ -628,10 +811,18 @@ impl Shared {
                 }
             }
         };
-        let Some(session) = to_persist else { return };
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Session(session));
-        self.app.emit("context-changed");
+        if let Some(session) = to_persist {
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Session(session));
+            self.app.emit("context-changed");
+        }
+        // This runs before the PTY and its engine handle exist (see
+        // spawn_session), so it is not proof the pane can be delivered to:
+        // it is the opposite, a fresh incarnation about to start that must
+        // not inherit whatever connected status the last one earned.
+        // `mark_connected` is what actually notices the pane is back and
+        // drains it, once its MCP endpoint hears from it again.
+        self.connected.lock().unwrap().remove(name);
     }
 
     // ---- conductor ----
@@ -657,10 +848,8 @@ impl Shared {
         // listed exactly like an idle one, so a conductor picks it again and
         // waits on a result that is not coming. The open task and its age are
         // the cheapest honest signal available here.
-        let (open_for, in_review_for) = {
-            let tasks = self.tasks.lock().unwrap();
-            attribute_open_tasks(&tasks, now)
-        };
+        let tasks = self.tasks_snapshot();
+        let (open_for, in_review_for) = attribute_open_tasks(&tasks, now);
         // Held sessions, not live ones: a pane whose process has died is still
         // worth a line, marked dead, because a conductor that simply stops
         // seeing it cannot tell a pane that died from one that was never there,
@@ -706,10 +895,24 @@ impl Shared {
                     .find(|a| &a.name == id)
                     .map(|a| a.model.as_str())
                     .unwrap_or("model unknown");
+                let depth = queued_ids_for(&tasks, id).len();
+                // Folded into whichever label already exists (busy, since a
+                // queue only ever holds tasks queued behind the pane's own
+                // work, never behind a review it is doing); a standalone
+                // bracket only when the pane has neither.
+                let (busy_str, reviewing_str) = if busy.is_some() {
+                    (
+                        append_queued(busy_label(busy), depth),
+                        reviewing_label(reviewing),
+                    )
+                } else {
+                    (
+                        busy_label(busy),
+                        append_queued(reviewing_label(reviewing), depth),
+                    )
+                };
                 format!(
-                    "- {id} ({kind}, {model_display}) brain={room}{role}{}{}",
-                    busy_label(busy),
-                    reviewing_label(reviewing)
+                    "- {id} ({kind}, {model_display}) brain={room}{role}{busy_str}{reviewing_str}"
                 )
             })
             .collect()
@@ -803,32 +1006,132 @@ impl Shared {
         })
     }
 
-    /// Stop halts all dispatch immediately; clearing it also refreshes the budget.
+    /// The mutex that serializes "decide what `pane` gets next, then send
+    /// it" against every other delivery path for that same pane. See
+    /// `pane_delivery` for why this exists alongside `delivery`. Entries
+    /// are created on first use and never removed.
+    fn pane_delivery_lock(&self, pane: &str) -> Arc<Mutex<()>> {
+        self.pane_delivery
+            .lock()
+            .unwrap()
+            .entry(pane.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Install a test-only pause hook; see `test_seam`. `hook` runs on
+    /// whichever thread reaches the boundary, synchronously, so a hook that
+    /// blocks (a channel receive) pauses that thread there until the test
+    /// releases it.
+    #[cfg(test)]
+    fn set_test_seam(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.test_seam.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Call the test hook, if one is set, with `label` naming which
+    /// boundary this is. A no-op with nothing installed, which is every
+    /// call outside a test that opts in with `set_test_seam`.
+    #[cfg(test)]
+    fn hit_test_seam(&self, label: &str) {
+        let hook = self.test_seam.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(label);
+        }
+    }
+
+    /// The production twin of the `#[cfg(test)]` version above: the field
+    /// it would read does not exist in this build, so this inlines to
+    /// nothing.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn hit_test_seam(&self, _label: &str) {}
+
+    /// Check `target`'s queued depth against `QUEUE_CAP`, charge the
+    /// dispatch budget, and push the new task, all in the same `tasks`-lock
+    /// hold: a separate check-then-act let two concurrent dispatches each
+    /// observe the same depth one below the cap, each pass, and together
+    /// push it two over. The budget charge sits between the cap check and
+    /// the push, in that order, so a refusal from either still costs
+    /// nothing and journals nothing, matching every other dispatch
+    /// precheck; the cap is checked first so a queue-full refusal never
+    /// spends a unit of budget it is about to hand back unused. `build`
+    /// gets whether `target` is occupied, since that decides the new
+    /// task's status (`pending` vs queued) and can only be answered
+    /// honestly from inside this same lock hold too, for the same reason.
+    /// Returns the task as created, whether it landed occupied, and its
+    /// target's queued depth afterward (position in line, when occupied).
+    ///
+    /// Called directly by tests as well as by `dispatch_task`: the method
+    /// itself needs a live target, which `shared_for_test`'s engine can
+    /// never report (see `a_refused_dispatch_charges_nothing_and_records_nothing`),
+    /// so this is the only way the cap's atomicity is exercised here.
+    fn enqueue_within_cap(
+        &self,
+        target: &str,
+        build: impl FnOnce(bool) -> Task,
+    ) -> Result<(Task, bool, usize), String> {
+        self.mutate_and_journal(|tasks| {
+            let queued_ids = queued_ids_for(tasks, target);
+            if let Some(refusal) = queue_cap_refusal(&queued_ids) {
+                return (Err(refusal), Vec::new());
+            }
+            // Test-only pause point, between the cap check just passed and
+            // the push below, both still under this same `tasks` lock hold;
+            // see `test_seam`.
+            self.hit_test_seam("enqueue_within_cap");
+            if !self.take_dispatch_budget() {
+                return (
+                    Err("dispatch budget exhausted for this run.".to_string()),
+                    Vec::new(),
+                );
+            }
+            let occupied = is_occupied(tasks, target);
+            let t = build(occupied);
+            tasks.push(t.clone());
+            let queue_len = queued_ids_for(tasks, target).len();
+            (Ok((t.clone(), occupied, queue_len)), vec![t])
+        })
+    }
+
+    /// Stop halts all dispatch immediately; clearing it also refreshes the
+    /// budget and resumes delivery, since a pane could have been freed
+    /// while halted with nothing able to act on it (`drain_pane` refuses to
+    /// type while halted).
     pub fn set_halted(&self, v: bool) {
-        // Exclusive: a delivery path holding `delivery` as a reader is
-        // between its own eligibility check and its `submit_to` call, and
-        // must not have this land in between. Taking this here, not
-        // `tasks`, is what keeps that guarantee without ever holding
-        // `tasks` across a PTY write.
-        let _delivery = self.delivery.write().unwrap();
-        *self.halted.lock().unwrap() = v;
-        if v {
-            let now = Self::now_ms();
-            self.mutate_and_journal(|tasks| {
-                let mut changed = Vec::new();
-                for t in tasks.iter_mut() {
-                    if t.status == "pending" {
-                        t.status = "cancelled".to_string();
-                        t.done_ms = Some(now);
-                        changed.push(t.clone());
+        {
+            // Exclusive: a delivery path holding `delivery` as a reader is
+            // between its own eligibility check and its `submit_to` call, and
+            // must not have this land in between. Taking this here, not
+            // `tasks`, is what keeps that guarantee without ever holding
+            // `tasks` across a PTY write. Scoped so the guard is dropped
+            // before the resume sweep below, which takes its own read lock.
+            let _delivery = self.delivery.write().unwrap();
+            *self.halted.lock().unwrap() = v;
+            if v {
+                let now = Self::now_ms();
+                self.mutate_and_journal(|tasks| {
+                    let mut changed = Vec::new();
+                    for t in tasks.iter_mut() {
+                        // A queued task is exactly as stopped by Stop as a
+                        // pending one: neither has been typed anywhere yet.
+                        if t.status == "pending" || t.status == STATUS_QUEUED {
+                            t.status = "cancelled".to_string();
+                            t.done_ms = Some(now);
+                            changed.push(t.clone());
+                        }
                     }
-                }
-                ((), changed)
-            });
-        } else {
-            *self.dispatches.lock().unwrap() = 0;
+                    ((), changed)
+                });
+            } else {
+                *self.dispatches.lock().unwrap() = 0;
+            }
         }
         self.app.emit("conductor-changed");
+        if !v {
+            for id in self.live_ids() {
+                self.drain_pane(&id);
+            }
+        }
     }
 
     pub fn is_halted(&self) -> bool {
@@ -847,14 +1150,6 @@ impl Shared {
         }
         *n += 1;
         true
-    }
-
-    fn add_task(&self, t: Task) {
-        self.mutate_and_journal(|tasks| {
-            tasks.push(t.clone());
-            ((), vec![t])
-        });
-        self.app.emit("conductor-changed");
     }
 
     /// Ids of panes whose agent process is still running.
@@ -910,6 +1205,9 @@ impl Shared {
         live
     }
 
+    /// Approving or rejecting both end `caller`'s occupancy as this task's
+    /// reviewer, so its pane is drained either way; a rejection also owes
+    /// the target a rework notice, drained on its pane too.
     fn review_task(
         &self,
         caller: &str,
@@ -921,6 +1219,10 @@ impl Shared {
             review_pending(tasks, caller, id, approved, findings, Self::now_ms())
         })?;
         self.app.emit("context-changed");
+        self.drain_pane(caller);
+        if task.status == "rework" {
+            self.drain_pane(&task.target);
+        }
         Ok(task)
     }
 
@@ -967,11 +1269,20 @@ impl Shared {
     /// Returns the task, so the caller can tell the agent what actually
     /// happened to it. "Result recorded" is the wrong thing to say when the
     /// work has gone to a reviewer and is not finished.
+    ///
+    /// Finishing always ends `caller`'s own occupancy as this task's target,
+    /// so its pane is drained; when the work went to a reviewer, that
+    /// reviewer's pane is drained too, to try delivering the review request
+    /// immediately rather than leaving it for the next unrelated event.
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<Task, TaskAccessError> {
         let task = self.mutate_task_and_journal(id, |tasks| {
             finish_pending(tasks, caller, id, result, Self::now_ms())
         })?;
         self.app.emit("conductor-changed");
+        self.drain_pane(caller);
+        if task.status == "in_review" {
+            self.drain_pane(&task.reviewer);
+        }
         Ok(task)
     }
 
@@ -1000,7 +1311,7 @@ impl Shared {
         self.reconcile_abandoned();
         let now = Self::now_ms();
         self.mutate_and_journal(|tasks| {
-            let t = match task_for_dispatcher(tasks, caller, id) {
+            let t = match task_for_reader(tasks, caller, id) {
                 Ok(t) => t,
                 Err(e) => return (Err(e), Vec::new()),
             };
@@ -1052,13 +1363,15 @@ impl Shared {
     /// calling this, and `human_dispatch` has no agent identity to check it
     /// against â€” the human already decided who to promote.
     ///
-    /// The task record is created in "pending" status BEFORE `submit_to` is
-    /// called. That closes the original race while still allowing an unusually
-    /// fast target to complete the task as soon as it receives the prompt.
-    /// The gap that left open, from before Phase 1, is between that creation
-    /// and the write: `add_task` and the delivery decision both happen while
-    /// holding `delivery` as a reader, so `set_halted` cannot cancel this
-    /// task in between without this call seeing it before it types anything.
+    /// The task record is created in "pending" (or, when the target is
+    /// occupied, "queued") status BEFORE `submit_to` is called. That closes
+    /// the original race while still allowing an unusually fast target to
+    /// complete the task as soon as it receives the prompt. The gap that
+    /// left open, from before Phase 1, is between that creation and the
+    /// write: the occupancy check, the task creation, and the delivery
+    /// decision all happen while holding `delivery` as a reader, so
+    /// `set_halted` cannot cancel this task in between without this call
+    /// seeing it before it types anything.
     pub fn dispatch_task(
         &self,
         from: &str,
@@ -1077,7 +1390,7 @@ impl Shared {
         // Before the budget and before the task is recorded, like every other
         // refusal here: a dispatch naming an impossible reviewer should cost
         // nothing and leave nothing to collect.
-        let reviewer = choose_reviewer(reviewer, from, target, &live)?;
+        let reviewer = choose_reviewer(reviewer, from, target, &live, &self.sessions_snapshot())?;
 
         // Built before the gate because the size rule needs the finished
         // injection, and the id is part of what it measures. Nothing here
@@ -1088,33 +1401,64 @@ impl Shared {
         let injection = dispatch_prompt(from, &id, task);
         dispatch_precheck(self.is_halted(), from, target, target_is_live, &injection)?;
 
-        if !self.take_dispatch_budget() {
-            return Err("dispatch budget exhausted for this run.".to_string());
-        }
-
-        // Read before this dispatch's own task is added, so it can only ever
-        // name work that predates this call. Not a refusal: Phase 2's per-pane
-        // queue is where holding the brief instead of typing it belongs. For
-        // now the target still gets the new brief typed in on top, and the
-        // conductor gets told there was already something there, rather than
-        // finding out only when the first brief's result never comes.
-        let already_busy = open_task_for_target(&self.tasks.lock().unwrap(), target);
-
+        // Held from here through the write (when there is one): `set_halted`
+        // and `cancel_tasks` both take `delivery` exclusively before they
+        // touch a task, so once this is held, neither can act until it
+        // releases. `pane_delivery_lock(target)` is the second, narrower
+        // exclusion this needs on top of that: `delivery` only ever keeps
+        // Stop and cancel out, since any number of readers (this dispatch,
+        // a concurrent one, drain_pane) can hold it at once, so without the
+        // per-pane lock too, a dispatch landing while drain_pane had
+        // already picked this target's queue head but not yet promoted it
+        // would see the pane as free and deliver at the same time, out of
+        // order. See `pane_delivery`.
         let delivery_gate = self.delivery.read().unwrap();
-        self.add_task(Task {
+        let pane_lock = self.pane_delivery_lock(target);
+        let pane_gate = pane_lock.lock().unwrap();
+
+        // The queue cap and the dispatch budget are both checked inside
+        // `enqueue_within_cap`, atomically with the task's creation; see
+        // its doc comment for why a separate check beforehand (this
+        // function's previous shape) let two concurrent dispatches both
+        // pass the same stale depth.
+        let now = Self::now_ms();
+        let (_, occupied, queue_len) = match self.enqueue_within_cap(target, |occupied| Task {
             id: id.clone(),
             from: from.to_string(),
             target: target.to_string(),
             task: task.to_string(),
-            status: "pending".to_string(),
+            status: if occupied { STATUS_QUEUED } else { "pending" }.to_string(),
             result: String::new(),
-            ts_ms: Self::now_ms(),
+            ts_ms: now,
             reviewer: reviewer.clone(),
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
             done_ms: None,
-        });
+            notice_delivered: true,
+        }) {
+            Err(refusal) => {
+                drop(pane_gate);
+                drop(delivery_gate);
+                return Err(refusal);
+            }
+            Ok(v) => v,
+        };
+        self.app.emit("conductor-changed");
+
+        if occupied {
+            drop(pane_gate);
+            drop(delivery_gate);
+            return Ok(DispatchOutcome {
+                task_id: id,
+                delivered: false,
+                reviewer,
+                already_busy: queue_predecessor(&self.tasks.lock().unwrap(), target),
+                queued: true,
+                queue_position: Some(queue_len),
+            });
+        }
+
         // Typed into the target's terminal, so the human sees every
         // instruction. Submit Enter separately: Codex and Claude Code treat
         // text+CR in one PTY write as a paste and can leave it waiting in
@@ -1126,6 +1470,7 @@ impl Shared {
         } else {
             self.engine.submit_to(target, &injection)
         };
+        drop(pane_gate);
         drop(delivery_gate);
         if !delivered {
             self.mark_delivery_failed(&id);
@@ -1134,7 +1479,9 @@ impl Shared {
             task_id: id,
             delivered,
             reviewer,
-            already_busy,
+            already_busy: None,
+            queued: false,
+            queue_position: None,
         })
     }
 
@@ -1152,11 +1499,15 @@ impl Shared {
     /// it, a cancel could land between a delivery path's status check and
     /// its `submit_to` call, cancelling a task that gets typed into a
     /// terminal anyway a moment later.
+    ///
+    /// Cancelling a task can end its target's or its reviewer's occupancy
+    /// (a queued task cancels out of the queue without occupying anyone, so
+    /// draining it is a harmless no-op), so every distinct pane touched by a
+    /// cancelled task is drained afterwards, once `delivery` is released.
     fn cancel_tasks(&self, ids: &[String], reason: &str) -> Vec<(String, CancelOutcome)> {
-        let _delivery = self.delivery.write().unwrap();
+        let delivery_gate = self.delivery.write().unwrap();
         let now = Self::now_ms();
-        let mut any_cancelled = false;
-        let results = self.mutate_and_journal(|tasks| {
+        let (results, changed) = self.mutate_and_journal(|tasks| {
             let results: Vec<(String, CancelOutcome)> = ids
                 .iter()
                 .map(|id| (id.clone(), cancel_pending(tasks, id, reason, now)))
@@ -1166,11 +1517,20 @@ impl Shared {
                 .filter(|(_, outcome)| *outcome == CancelOutcome::Cancelled)
                 .filter_map(|(id, _)| tasks.iter().find(|t| &t.id == id).cloned())
                 .collect();
-            any_cancelled = !changed.is_empty();
-            (results, changed)
+            ((results, changed.clone()), changed)
         });
-        if any_cancelled {
+        if !changed.is_empty() {
             self.app.emit("conductor-changed");
+        }
+        drop(delivery_gate);
+        let mut drained: Vec<&str> = Vec::new();
+        for t in &changed {
+            for pane in [t.target.as_str(), t.reviewer.as_str()] {
+                if !pane.is_empty() && !drained.contains(&pane) {
+                    drained.push(pane);
+                    self.drain_pane(pane);
+                }
+            }
         }
         results
     }
@@ -1189,7 +1549,7 @@ impl Shared {
     /// carried entirely by the `reviewer` field, the same way it is when
     /// `dispatch_task` first chooses one.
     ///
-    /// Four rounds landed on this shape. Holding `tasks` across the
+    /// Five rounds landed on this shape. Holding `tasks` across the
     /// mutation and its journal append is still what makes the record order
     /// agree with the mutation order (`mutate_and_journal`), but the third
     /// round found that holding `tasks` across `submit_to` too, on top of
@@ -1206,6 +1566,28 @@ impl Shared {
     /// gate is now held from before the mutation through the write, so the
     /// halt check, the mutation, its journal, and the write are all one
     /// section nothing else can interleave with.
+    ///
+    /// A retarget that lands on an occupied pane is held the same way a
+    /// fresh dispatch is: `reassign_pending` still moves it to `pending`
+    /// (fresh delivery, fresh clock), but if the new target turns out to be
+    /// occupied this flips it straight on to `queued` instead of typing over
+    /// whatever that pane is doing, and `delivered` comes back `false`. The
+    /// pane the task moved *off* of is drained afterwards, since retargeting
+    /// away is one of the ways a pane stops being occupied.
+    ///
+    /// The fifth round found two more gaps in that occupied branch
+    /// specifically. It used to drop `delivery_gate` before its own second
+    /// mutation (the flip to `queued`), reopening the exact window the
+    /// fourth round had just closed for the first one: a Stop or a cancel
+    /// landing there could cancel the task, and the unconditional flip that
+    /// followed would overwrite that, resurrecting it. The gate now spans
+    /// both mutations, and the flip itself is conditional
+    /// (`requeue_if_still_pending`) on nothing else having already decided
+    /// the task's fate. And the occupancy read plus both branches now also
+    /// hold `pane_delivery_lock(&task.target)`, the same lock `drain_pane`
+    /// and `dispatch_task` hold for their own decide-then-send section:
+    /// `delivery_gate` alone never excluded those from each other, since any
+    /// number of readers can hold it at once. See `pane_delivery`.
     fn reassign_task(
         &self,
         caller: &str,
@@ -1224,6 +1606,21 @@ impl Shared {
         let live = self.reconcile_abandoned();
         let retargeting = new_target.is_some();
         let now = Self::now_ms();
+
+        // Captured before the mutation, so there is something to drain
+        // afterwards if this retarget moves work off it. A reviewer
+        // reassignment types nothing into any terminal, so it never frees a
+        // pane and this stays `None` for that branch.
+        let previous_target = if retargeting {
+            self.tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.target.clone())
+        } else {
+            None
+        };
 
         // Held from here through the write: `set_halted` and `cancel_tasks`
         // both take `delivery` exclusively before they touch a task, so
@@ -1246,28 +1643,235 @@ impl Shared {
             return Ok((task, true));
         }
 
-        // Same delivery path `dispatch_task` uses, so a reassigned brief
-        // looks to the new target exactly like a fresh dispatch: typed into
-        // its terminal, Enter sent separately. Still under `delivery_gate`,
-        // so nothing can have cancelled this task or flipped halted since
-        // the mutation just journaled it pending.
-        let injection = dispatch_prompt(&task.from, &task.id, &task.task);
-        let delivered = self.engine.submit_to(&task.target, &injection);
-        drop(delivery_gate);
-        let result = if delivered {
-            task
-        } else {
-            self.mark_delivery_failed(&task.id);
-            self.tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.id == task.id)
-                .cloned()
-                .unwrap_or(task)
+        // Held from here alongside `delivery_gate`, for the new target:
+        // `delivery_gate` only ever keeps Stop and cancel out, since any
+        // number of readers (this call, a concurrent dispatch, drain_pane)
+        // can hold it at once, so without this too, the occupancy read
+        // below and whichever branch acts on it could interleave with one
+        // of those on the same pane. See `pane_delivery`.
+        let pane_lock = self.pane_delivery_lock(&task.target);
+        let pane_gate = pane_lock.lock().unwrap();
+
+        // Occupancy of the NEW target, checked while still under both gates
+        // so nothing else can change what "occupied" means between this
+        // read and whichever branch below acts on it. `excluding` the
+        // task's own id matters here: `reassign_pending` just set its
+        // status to `pending` against this very target, which would
+        // otherwise make `occupying_task` see the task as occupying the
+        // pane it is about to be delivered to.
+        let occupied = {
+            let tasks = self.tasks.lock().unwrap();
+            occupying_task(&tasks, &task.target, &task.id).is_some()
         };
+
+        let (result, delivered) = if occupied {
+            // `delivery_gate` stays held through this mutation, not dropped
+            // before it: dropping early let Stop or cancel take the gate in
+            // the gap and cancel this task, and the unconditional flip to
+            // `queued` that used to run here would then overwrite that
+            // cancellation, resurrecting the task after it was stopped. The
+            // gate now spans both mutations, so nothing can land in that
+            // gap at all; `requeue_if_still_pending`'s own condition is the
+            // second half of the fix, for anything that could still have
+            // changed the task's fate before this call ever reached here.
+            let queued = self.mutate_and_journal(|tasks| {
+                match requeue_if_still_pending(tasks, &task.id, &task.target) {
+                    Some(t) => (t.clone(), vec![t.clone()]),
+                    None => (
+                        tasks
+                            .iter()
+                            .find(|t| t.id == task.id)
+                            .cloned()
+                            .unwrap_or_else(|| task.clone()),
+                        Vec::new(),
+                    ),
+                }
+            });
+            drop(pane_gate);
+            drop(delivery_gate);
+            (queued, false)
+        } else {
+            // Same delivery path `dispatch_task` uses, so a reassigned brief
+            // looks to the new target exactly like a fresh dispatch: typed
+            // into its terminal, Enter sent separately. Still under both
+            // gates, so nothing can have cancelled this task, flipped
+            // halted, or raced it onto the same pane since the mutation
+            // just journaled it pending.
+            let injection = dispatch_prompt(&task.from, &task.id, &task.task);
+            let delivered = self.engine.submit_to(&task.target, &injection);
+            drop(pane_gate);
+            drop(delivery_gate);
+            let result = if delivered {
+                task
+            } else {
+                self.mark_delivery_failed(&task.id);
+                self.tasks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t.id == task.id)
+                    .cloned()
+                    .unwrap_or(task)
+            };
+            (result, delivered)
+        };
+
+        if let Some(old_target) = previous_target {
+            self.drain_pane(&old_target);
+        }
         Ok((result, delivered))
     }
+
+    /// Deliver the next thing waiting for `pane`'s terminal, if the pane is
+    /// free to receive it: an undelivered review request or rework notice,
+    /// or the head of its dispatch queue (see `next_delivery_for`). A no-op
+    /// when the pane is occupied, halted, or has nothing pending, which is
+    /// the overwhelmingly common case, since almost every call to this
+    /// frees nothing up.
+    ///
+    /// Called after every mutation that can end a pane's occupancy: a task
+    /// finishing, being reviewed either way, cancelled, or moved off the
+    /// pane by a retarget. `delivery` is held across the read that decides
+    /// what to send and the `submit_to` that sends it, same as `dispatch_task`
+    /// and `reassign_task`, so a Stop cannot land in between; the tasks lock
+    /// is taken twice, briefly, for the read and for the write, and never
+    /// held across the PTY write itself. `pane_delivery_lock(pane)` is held
+    /// across that same span too, so a second, concurrent drain of this
+    /// pane (or a dispatch or reassign landing on it) cannot select the
+    /// same candidate this call already picked, or act on the pane while
+    /// this call still has one reserved; see `pane_delivery`.
+    fn drain_pane(&self, pane: &str) {
+        let delivery_gate = self.delivery.read().unwrap();
+        if self.is_halted() {
+            return;
+        }
+        // A pane that has not connected since its most recent spawn has no
+        // engine handle yet, or has one but the CLI has not finished
+        // booting and would lose the bytes either way. Neither is a failed
+        // delivery: there was no delivery to fail, so nothing here may
+        // become `error` or count a notice as attempted. Leave it queued
+        // (or undelivered) for the next trigger, which fires once the pane
+        // actually connects; see `mark_connected`.
+        if !self.is_connected(pane) {
+            return;
+        }
+        let pane_lock = self.pane_delivery_lock(pane);
+        let pane_gate = pane_lock.lock().unwrap();
+        let candidate = {
+            let tasks = self.tasks.lock().unwrap();
+            next_delivery_for(&tasks, pane).cloned()
+        };
+        let Some(task) = candidate else {
+            return;
+        };
+        // Test-only pause point: past selection, still holding `pane_gate`,
+        // before submit_to or the post-submit journal below; see
+        // `test_seam`.
+        self.hit_test_seam("drain_pane");
+
+        let is_dispatch = task.status == STATUS_QUEUED;
+        let text = if is_dispatch {
+            dispatch_prompt(&task.from, &task.id, &task.task)
+        } else if task.status == "rework" {
+            rework_notice(&task.id, &task.reviewer, &task.findings)
+        } else {
+            review_request_notice(&task.id, &task.target, &task.task)
+        };
+        let delivered = self.engine.submit_to(pane, &text);
+        let now = Self::now_ms();
+
+        self.mutate_and_journal(|tasks| {
+            let Some(t) = tasks.iter_mut().find(|t| t.id == task.id) else {
+                return ((), Vec::new());
+            };
+            if is_dispatch {
+                if delivered {
+                    t.status = "pending".to_string();
+                    t.ts_ms = now;
+                } else {
+                    t.status = "error".to_string();
+                    t.done_ms = Some(now);
+                }
+            } else if delivered {
+                t.notice_delivered = true;
+            }
+            // A failed notice leaves `notice_delivered` false so the next
+            // drain of this pane retries it; nothing else changes.
+            ((), vec![t.clone()])
+        });
+        drop(pane_gate);
+        drop(delivery_gate);
+        self.app.emit("conductor-changed");
+    }
+
+    /// Whether `pane` has connected to its MCP endpoint since its most
+    /// recent spawn. See the `connected` field doc for why this, and not
+    /// liveness or a recorded identity, is what gates `drain_pane`.
+    fn is_connected(&self, pane: &str) -> bool {
+        self.connected.lock().unwrap().contains(pane)
+    }
+
+    /// Record that a pane's MCP endpoint just received a request from it,
+    /// and drain whatever was waiting on that. Call this from the actual
+    /// connection points: the dedicated endpoint's per-session handler
+    /// factory (one call per new session on that port) and
+    /// `set_session_identity` on the shared endpoint. Not from
+    /// `note_session`, which runs at spawn time before the PTY or its
+    /// engine handle exist and is not evidence of anything reachable.
+    pub fn mark_connected(&self, pane: &str) {
+        self.connected.lock().unwrap().insert(pane.to_string());
+        self.drain_pane(pane);
+    }
+}
+
+/// Carry a live pane's kind/model forward across a `set_dir` switch, letting
+/// only a genuinely dead name fall back to whatever the new journal says.
+///
+/// `old` is the sessions held in memory right before the switch; `new` is
+/// what `load_brain` just read from the dir being switched to. For every
+/// name in `live`, `old` wins: it reflects `note_session` or
+/// `set_session_identity` calls the app already made for the pane that is
+/// actually running, while `new` may be stale (a different project's
+/// journal, or this project's own journal from before the pane's current
+/// CLI connected). A name not in `live` is left entirely to `new`, since
+/// nothing contradicts the journal for a pane that is not there to be wrong
+/// about.
+///
+/// Returns the merged roster plus exactly the entries that differ from
+/// `new`, so the caller can persist only those, the same "refresh when
+/// different" rule `note_session` already applies. Pure (no lock, no I/O),
+/// so the merge itself is testable without a live `Shared` or a running
+/// pane, which the test fixture's engine cannot provide (it reports nothing
+/// live).
+fn merge_live_identity(
+    old: &[AgentSession],
+    new: &[AgentSession],
+    live: &[String],
+) -> (Vec<AgentSession>, Vec<AgentSession>) {
+    let mut merged = new.to_vec();
+    let mut changed = Vec::new();
+    for prior in old {
+        if !live.iter().any(|id| id == &prior.name) {
+            continue;
+        }
+        match merged.iter_mut().find(|s| s.name == prior.name) {
+            Some(existing) => {
+                if existing.kind != prior.kind || existing.model != prior.model {
+                    existing.kind = prior.kind.clone();
+                    existing.model = prior.model.clone();
+                    changed.push(existing.clone());
+                }
+            }
+            // Live per the engine, but the new journal has never heard of it
+            // (a brand-new project). Carry the in-memory record forward
+            // rather than dropping a pane the roster already knows.
+            None => {
+                merged.push(prior.clone());
+                changed.push(prior.clone());
+            }
+        }
+    }
+    (merged, changed)
 }
 
 /// Age a single task in place: still-pending past the threshold becomes
@@ -1283,21 +1887,94 @@ impl Shared {
 /// tells a conductor to stop waiting and consider another target. A pane that
 /// took a task and went silent was previously indistinguishable from an idle
 /// one, and got picked again.
-/// The id of a task the given target is actually busy on, if any. Pure over a
-/// task list so `dispatch`'s "already busy" note is testable without a live
-/// `Shared`. The oldest match is not singled out here the way `roster_lines`
-/// singles out the oldest for its label; naming any one such task is enough
-/// to tell the conductor there was already something there.
-///
-/// `in_review` is deliberately excluded, matching `attribute_open_tasks`: the
-/// target already submitted and is free, so counting it here would tell a
-/// conductor to cancel_task or reassign_task work that is sitting with a
-/// reviewer, not with the target it is about to dispatch to.
-fn open_task_for_target(tasks: &[Task], target: &str) -> Option<String> {
-    tasks
+/// Every id queued for `pane`, oldest first. `ts_ms` is untouched while a
+/// task sits queued (see `drain_pane`, which resets it only on delivery), so
+/// it doubles as the position in line.
+fn queued_ids_for(tasks: &[Task], pane: &str) -> Vec<String> {
+    let mut queued: Vec<&Task> = tasks
         .iter()
-        .find(|t| t.target == target && is_open(&t.status) && t.status != "in_review")
-        .map(|t| t.id.clone())
+        .filter(|t| t.target == pane && t.status == STATUS_QUEUED)
+        .collect();
+    queued.sort_by_key(|t| t.ts_ms);
+    queued.into_iter().map(|t| t.id.clone()).collect()
+}
+
+/// Whichever task makes `pane` occupied right now: its own open work
+/// (`pending`, `overdue`, `rework`, or `blocked`), or the `in_review` task it
+/// is reviewing. `excluding` skips one id, so a task cannot be judged
+/// occupied by itself the moment its own status is what would occupy the
+/// pane (see `drain_pane` and `Shared::reassign_task`, which both check
+/// occupancy of a pane a task is *about* to notify or move to).
+fn occupying_task<'a>(tasks: &'a [Task], pane: &str, excluding: &str) -> Option<&'a Task> {
+    tasks.iter().find(|t| {
+        t.id != excluding
+            && ((t.target == pane
+                && matches!(
+                    t.status.as_str(),
+                    "pending" | "overdue" | "rework" | STATUS_BLOCKED
+                ))
+                || (t.reviewer == pane && t.status == "in_review"))
+    })
+}
+
+fn is_occupied(tasks: &[Task], pane: &str) -> bool {
+    occupying_task(tasks, pane, "").is_some()
+}
+
+/// The id of the task a fresh dispatch to `target` would be queued behind:
+/// the last task already in its queue, or whatever currently occupies the
+/// pane when the queue is still empty. `None` means the pane is free.
+fn queue_predecessor(tasks: &[Task], target: &str) -> Option<String> {
+    queued_ids_for(tasks, target)
+        .last()
+        .cloned()
+        .or_else(|| occupying_task(tasks, target, "").map(|t| t.id.clone()))
+}
+
+/// The refusal for a dispatch that would push `target`'s queue past
+/// `QUEUE_CAP`, or `None` to proceed. Pure over the ids already queued, for
+/// the same reason `dispatch_precheck` is pure: testable without a live
+/// `Shared`, and free to run before the budget is taken and before any task
+/// is recorded, since refusing here costs nothing, same as any other
+/// refused dispatch.
+fn queue_cap_refusal(queued_ids: &[String]) -> Option<String> {
+    if queued_ids.len() < QUEUE_CAP {
+        return None;
+    }
+    Some(format!(
+        "target's queue is full ({QUEUE_CAP} already queued: {}). cancel_task one of \
+         those first, or wait for the pane to catch up.",
+        queued_ids.join(", ")
+    ))
+}
+
+/// What `pane`'s terminal should receive next, if it is free to receive
+/// anything: an undelivered review request or rework notice ahead of a
+/// freshly queued dispatch, since that work already exists and someone is
+/// waiting on it, while a queued dispatch is new work that can wait one more
+/// turn. `None` when the pane is occupied or has nothing pending. Pure over
+/// the task list, so the ordering rule is testable without a live `Shared`
+/// or `drain_pane`'s PTY write.
+fn next_delivery_for<'a>(tasks: &'a [Task], pane: &str) -> Option<&'a Task> {
+    // A rework task occupies its target and an in_review task occupies its
+    // reviewer (see `occupying_task`), but that is exactly the task whose
+    // notice this function exists to deliver: it must not disqualify
+    // itself. Pick the candidate first, then check for occupancy by
+    // anything else.
+    let notice = tasks.iter().find(|t| {
+        !t.notice_delivered
+            && ((t.status == "rework" && t.target == pane)
+                || (t.status == "in_review" && t.reviewer == pane))
+    });
+    let candidate = notice.or_else(|| {
+        queued_ids_for(tasks, pane)
+            .first()
+            .and_then(|id| tasks.iter().find(|t| &t.id == id))
+    })?;
+    if occupying_task(tasks, pane, &candidate.id).is_some() {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Who holds an open task, and for how long: a session name paired with the
@@ -1315,10 +1992,18 @@ type AgeBySession = Vec<(String, u64)>;
 /// `[busy, OVERDUE]` forever after it had finished and handed the result off.
 /// Every other open status still names the target, who is the one actually
 /// holding the work.
+///
+/// `queued` is excluded from both buckets: nothing is running yet for it to
+/// be slow at, so folding it into "busy" would misreport a fresh queue
+/// entry's age as how long the pane has been working. `roster_lines` reports
+/// queue depth separately, as a count rather than an age.
 fn attribute_open_tasks(tasks: &[Task], now_ms: u64) -> (AgeBySession, AgeBySession) {
     let mut busy = Vec::new();
     let mut reviewing = Vec::new();
-    for t in tasks.iter().filter(|t| is_open(&t.status)) {
+    for t in tasks
+        .iter()
+        .filter(|t| is_open(&t.status) && t.status != STATUS_QUEUED)
+    {
         let age_ms = now_ms.saturating_sub(t.ts_ms);
         if t.status == "in_review" {
             reviewing.push((t.reviewer.clone(), age_ms));
@@ -1349,6 +2034,25 @@ fn reviewing_label(oldest_review_ms: Option<u64>) -> String {
         None => String::new(),
         Some(ms) => format!(" [reviewing {}]", human_ms(ms)),
     }
+}
+
+/// Fold a queue-depth note into an existing bracketed label (", N queued"
+/// before its closing `]`), or give it its own bracket when there is no
+/// other label to fold into. `depth` of 0 leaves `label` untouched. Used to
+/// turn "[busy 4m]" into "[busy 4m, 2 queued]" rather than adding a second,
+/// separate bracket, which reads as two unrelated facts instead of one.
+fn append_queued(label: String, depth: usize) -> String {
+    if depth == 0 {
+        return label;
+    }
+    let note = format!("{depth} queued");
+    if label.is_empty() {
+        return format!(" [{note}]");
+    }
+    let mut label = label;
+    label.truncate(label.len() - 1); // drop the trailing ']'
+    label.push_str(&format!(", {note}]"));
+    label
 }
 
 /// A duration a human reads at a glance. Roster lines are scanned, not parsed.
@@ -1631,6 +2335,11 @@ fn finish_pending(
                 t.done_ms = Some(now_ms);
                 t.reviewer_gone = false;
             }
+            // Reviewed work now owes its reviewer a notice; `Shared::finish_task`
+            // drains the reviewer's pane afterwards to try delivering it.
+            if t.status == "in_review" {
+                t.notice_delivered = false;
+            }
             Ok(())
         }
         None => Err(TaskAccessError::NotFound),
@@ -1668,6 +2377,12 @@ fn review_pending(
                 t.done_ms = Some(now_ms);
                 t.reviewer_gone = false;
             }
+            // A rejection now owes its target a rework notice;
+            // `Shared::review_task` drains the target's pane afterwards to
+            // try delivering it.
+            if t.status == "rework" {
+                t.notice_delivered = false;
+            }
             Ok(())
         }
         None => Err(TaskAccessError::NotFound),
@@ -1692,11 +2407,22 @@ pub const REVIEW_WAIVED: &str = "none";
 /// wrote the brief is the reader least likely to notice it was misread. The
 /// dispatcher is still a fine reviewer, and is the intended case for a
 /// conductor checking work from a different model.
+///
+/// An unnamed reviewer also prefers a session whose CLI *kind* differs from
+/// the target's, before falling back to any other live session. This is
+/// `CONTRIBUTING.md`'s "Review before you commit" rule ("route to a
+/// **different-model** reviewer") applied automatically: before this, a
+/// conductor that omitted `reviewer` could get the target's own kind back,
+/// which enforces the review gate without enforcing the reason it exists.
+/// Naming a reviewer explicitly still bypasses this preference entirely,
+/// same as it already bypasses the third-party-over-dispatcher tie-break:
+/// an explicit choice is the conductor doing the job this defaults for.
 fn choose_reviewer(
     requested: &str,
     from: &str,
     target: &str,
     live: &[String],
+    sessions: &[AgentSession],
 ) -> Result<String, String> {
     if requested == REVIEW_WAIVED {
         return Ok(String::new());
@@ -1718,17 +2444,49 @@ fn choose_reviewer(
         return Ok(requested.to_string());
     }
 
-    let third_party = live.iter().find(|s| *s != target && *s != from);
-    let dispatcher = live.iter().find(|s| *s != target && *s == from);
-    match third_party.or(dispatcher) {
-        Some(reviewer) => Ok(reviewer.clone()),
+    // The existing third-party-over-dispatcher tie-break, applied first to
+    // whichever candidates share the preference (a different kind than the
+    // target), then, if that group is empty, to every live candidate. Kept
+    // as one closure so the tie-break itself is written once rather than
+    // twice.
+    let pick = |candidates: &[String]| -> Option<String> {
+        let third_party = candidates.iter().find(|s| *s != target && *s != from);
+        let dispatcher = candidates.iter().find(|s| *s != target && *s == from);
+        third_party.or(dispatcher).cloned()
+    };
+
+    let kind_of = |name: &str| -> &str {
+        sessions
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.kind.as_str())
+            .unwrap_or("")
+    };
+    // An empty kind means "unidentified", not "different". Treating it as a
+    // real kind would make an unidentified session look preferable to a
+    // same-kind one that has actually announced itself, which is backwards:
+    // there is no evidence it differs at all.
+    let target_kind = kind_of(target);
+    let different_kind: Vec<String> = live
+        .iter()
+        .filter(|s| !target_kind.is_empty() && !kind_of(s).is_empty() && kind_of(s) != target_kind)
+        .cloned()
+        .collect();
+
+    match pick(&different_kind).or_else(|| pick(live)) {
+        Some(reviewer) => Ok(reviewer),
         // A workspace with nobody else in it. Refusing the dispatch would make
         // a solo pane unusable, so this waives and the caller says so out loud.
         None => Ok(String::new()),
     }
 }
 
-fn task_for_dispatcher<'a>(
+/// A single-id `get_task_result` lookup, open to the task's dispatcher,
+/// target, and reviewer. The no-id listing (`tasks_from`) stays
+/// dispatcher-only; this only widens who may read one task by its full id,
+/// which Phase 2 needs so a review request or rework notice can point its
+/// reader at `get_task_result` and have the call actually work.
+fn task_for_reader<'a>(
     tasks: &'a mut [Task],
     caller: &str,
     id: &str,
@@ -1737,7 +2495,7 @@ fn task_for_dispatcher<'a>(
         .iter_mut()
         .find(|task| task.id == id)
         .ok_or(TaskAccessError::NotFound)?;
-    if task.from != caller {
+    if task.from != caller && task.target != caller && task.reviewer != caller {
         return Err(TaskAccessError::Forbidden);
     }
     Ok(task)
@@ -1829,9 +2587,10 @@ enum ReassignError {
     TargetIsReviewer,
 }
 
-/// Retarget a pending/overdue task, or hand an in_review/rework task to a new
-/// reviewer. Exactly one of `new_target` / `new_reviewer` may be set, because
-/// which field a task accepts depends on its status.
+/// Retarget a pending, overdue, abandoned, or queued task, or hand an
+/// in_review/rework task to a new reviewer. Exactly one of `new_target` /
+/// `new_reviewer` may be set, because which field a task accepts depends on
+/// its status.
 ///
 /// Pure over the task list and the live roster, so the branching is testable
 /// without a live `Shared`. Redelivering the brief to a new target happens in
@@ -1859,7 +2618,10 @@ fn reassign_pending(
         .ok_or(ReassignError::NotFound)?;
 
     if let Some(target) = new_target {
-        if !matches!(t.status.as_str(), "pending" | "overdue" | STATUS_ABANDONED) {
+        if !matches!(
+            t.status.as_str(),
+            "pending" | "overdue" | STATUS_ABANDONED | STATUS_QUEUED
+        ) {
             return Err(ReassignError::NotOpenForRetarget);
         }
         if target == t.target {
@@ -1922,6 +2684,32 @@ fn reassign_pending(
     // The reviewer named here was just checked live, by the call above.
     t.reviewer_gone = false;
     Ok(t.clone())
+}
+
+/// Flip a task from `pending` back to `queued`, but only if it is still
+/// exactly what `Shared::reassign_task` just delivered: `pending`, and
+/// still aimed at `expected_target`. `None` for anything else, including
+/// an id that no longer exists, and leaves `tasks` untouched: something
+/// else (a cancel, a Stop) already decided this task's fate first, and
+/// this must not overwrite that decision, which is the bug this guards.
+/// See `Shared::reassign_task`'s occupied branch, the only caller.
+///
+/// Pure so the condition is testable directly: `reassign_task` itself
+/// needs a live new target, which `shared_for_test`'s engine can never
+/// report (see `reassign_pending_refuses_a_target_that_is_not_live`), so
+/// this is the only way this specific fix is exercised here.
+fn requeue_if_still_pending<'a>(
+    tasks: &'a mut [Task],
+    id: &str,
+    expected_target: &str,
+) -> Option<&'a Task> {
+    let t = tasks.iter_mut().find(|t| t.id == id)?;
+    if t.status == "pending" && t.target == expected_target {
+        t.status = STATUS_QUEUED.to_string();
+        Some(t)
+    } else {
+        None
+    }
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
@@ -2044,9 +2832,14 @@ fn is_open(status: &str) -> bool {
     // answer, so the work is neither progressing nor finished. A conductor
     // collecting results needs to see the difference, because this is the one
     // open state where it is the conductor that has to act.
+    // "queued" is open in a fourth way: recorded and real, but not yet typed
+    // into any terminal, so it must survive `wait_for_tasks` and a listing
+    // the same as any other unfinished task. `attribute_open_tasks`
+    // deliberately excludes it from the "busy" bucket despite this, since
+    // nothing is running yet for it to be slow at.
     matches!(
         status,
-        "pending" | "overdue" | "in_review" | "rework" | STATUS_BLOCKED
+        "pending" | "overdue" | "in_review" | "rework" | STATUS_BLOCKED | STATUS_QUEUED
     )
 }
 
@@ -2424,6 +3217,12 @@ impl BrainHandler {
             }
         }
         self.shared.app.emit("context-changed");
+        // The shared-endpoint counterpart to the dedicated endpoint's
+        // per-session handler factory: this call is itself the connection,
+        // proof the session is here and reading its terminal, which is
+        // exactly when a queued brief or an undelivered notice from before
+        // a restart or reconnect needs to reach it. See `mark_connected`.
+        self.shared.mark_connected(&p.name);
         format!(
             "Identity set to '{}' in brain '{}'",
             p.name,
@@ -2534,7 +3333,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already holds an open task, this still delivers the new brief on top, but the response names the older task id so you can cancel_task or reassign_task it first rather than stacking work silently."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -2553,36 +3352,35 @@ impl BrainHandler {
             .dispatch_task(&me, &p.target, &p.task, &p.reviewer)
         {
             Err(e) => format!("Refused: {e}"),
-            Ok(o) => {
-                let mut msg = if o.delivered && !o.reviewer.is_empty() {
-                    format!(
-                        "Dispatched to {} as task {}. {} will review it before it counts as done, so                          expect status 'in_review' before 'done'. Poll get_task_result with that id.",
-                        p.target, o.task_id, o.reviewer
-                    )
-                } else if o.delivered {
-                    format!(
-                        "Dispatched to {} as task {} with NO review: nobody else is live to check it.                          Poll get_task_result with that id.",
-                        p.target, o.task_id
-                    )
-                } else {
-                    format!(
-                        "Task {} recorded for {} but delivery failed (could not write to that session) â€” status is 'error'.",
-                        o.task_id, p.target
-                    )
-                };
-                // Not a refusal: the brief still went in on top of whatever was
-                // already there. Naming the older task is what lets the
-                // conductor act on it, with cancel_task or reassign_task,
-                // rather than finding out only when nothing comes back.
-                if let Some(busy_id) = &o.already_busy {
-                    msg.push_str(&format!(
-                        " Note: {} already held open task {busy_id} before this one; \
-                         cancel_task or reassign_task it first if piling on was not intended.",
-                        p.target
-                    ));
-                }
-                msg
+            Ok(o) if o.queued => {
+                let position = o.queue_position.unwrap_or(0);
+                let behind = o
+                    .already_busy
+                    .as_deref()
+                    .map(|id| format!(" behind {id}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} is occupied, so task {} is queued{behind} at position {position}. It \
+                     will be delivered automatically once the pane is free; no need to \
+                     re-dispatch it.",
+                    p.target, o.task_id
+                )
             }
+            Ok(o) if o.delivered && !o.reviewer.is_empty() => format!(
+                "Dispatched to {} as task {}. {} will review it before it counts as done, so \
+                 expect status 'in_review' before 'done'. Poll get_task_result with that id.",
+                p.target, o.task_id, o.reviewer
+            ),
+            Ok(o) if o.delivered => format!(
+                "Dispatched to {} as task {} with NO review: nobody else is live to check it. \
+                 Poll get_task_result with that id.",
+                p.target, o.task_id
+            ),
+            Ok(o) => format!(
+                "Task {} recorded for {} but delivery failed (could not write to that session), \
+                 so status is 'error'.",
+                o.task_id, p.target
+            ),
         }
     }
 
@@ -2613,7 +3411,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, or already-abandoned task to a different live session: this retypes the same brief into the new target's terminal and resets its dispatch clock, the same as a fresh dispatch, and is refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, that is the same as what is already there, or that would let one session both do the work and sign off on it, naming why."
+        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, queued, or already-abandoned task to a different live session: this resets its dispatch clock, the same as a fresh dispatch, and either types the brief into the new target's terminal or, if that pane is occupied, queues it there instead. Refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, that is the same as what is already there, or that would let one session both do the work and sign off on it, naming why."
     )]
     fn reassign_task(&self, Parameters(p): Parameters<ReassignArgs>) -> String {
         let target = (!p.target.is_empty()).then_some(p.target.as_str());
@@ -2635,7 +3433,7 @@ impl BrainHandler {
                 task.id, task.reviewer
             ),
             Err(ReassignError::NotFound) => format!("No task '{}'.", p.task_id),
-            Err(ReassignError::NotOpenForRetarget) => "Refused: target only applies to a pending, overdue, or abandoned task. Use reviewer for an in_review or rework task."
+            Err(ReassignError::NotOpenForRetarget) => "Refused: target only applies to a pending, overdue, abandoned, or queued task. Use reviewer for an in_review or rework task."
                 .to_string(),
             Err(ReassignError::NotOpenForReview) => "Refused: reviewer only applies to an in_review or rework task. Use target for a pending or overdue task."
                 .to_string(),
@@ -2716,14 +3514,15 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Only the dispatcher may call this for a given task; the agent that did the work cannot read its own task's record through this tool, so a conductor waiting on a review or a rework fix has to be the one who tells the target. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work. With a task_id, the dispatcher, the target, and the named reviewer may all read that one task in full: a review request or rework notice you receive points you back here. With no task_id, this returns every task YOU dispatched (open ones plus the most recently finished) in one call, so do that instead of polling ids one by one; that listing stays dispatcher-only. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. queued means it is recorded but has not been typed into its target's terminal yet, because that pane was occupied when it was dispatched; it will be delivered automatically. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
             return match self.shared.task_status(&self.author(), &p.task_id) {
                 Ok(t) => render_task(&t),
                 Err(TaskAccessError::Forbidden) => {
-                    "Refused: this task was dispatched by a different session.".to_string()
+                    "Refused: you are not the dispatcher, target, or reviewer of this task."
+                        .to_string()
                 }
                 Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
                 // `task_status` looks a task up without caring about its state,
@@ -2790,7 +3589,9 @@ impl BrainHandler {
             match self.shared.task_status(&me, id) {
                 Ok(_) => {}
                 Err(TaskAccessError::Forbidden) => {
-                    return format!("Refused: task '{id}' was dispatched by a different session.");
+                    return format!(
+                        "Refused: you are not the dispatcher, target, or reviewer of task '{id}'."
+                    );
                 }
                 Err(_) => {
                     return format!(
@@ -3192,7 +3993,13 @@ pub fn start_session_server(
             Err(_) => return,
         };
         let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
+            move || {
+                // This factory runs once per new MCP session on this port,
+                // which for a dedicated endpoint is the actual proof the CLI
+                // is up and reading its terminal; see `mark_connected`.
+                shared.mark_connected(&session_id);
+                Ok(BrainHandler::bound_to(shared.clone(), session_id.clone()))
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
@@ -3238,10 +4045,14 @@ pub fn start(
         name_to_room: Mutex::new(HashMap::new()),
         engine,
         conductor: Mutex::new(None),
+        connected: Mutex::new(HashSet::new()),
         halted: Mutex::new(false),
         tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
         delivery: RwLock::new(()),
+        pane_delivery: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        test_seam: Mutex::new(None),
     });
 
     // Bind synchronously so we can hand the port back before the server task runs.
@@ -3270,20 +4081,25 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::{
-        abandon_lost, age, answer_pending, append_record, ask_pending, attribute_open_tasks,
-        bearer_matches, blocked_wait_should_release, busy_label, cancel_pending, choose_reviewer,
-        conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
-        injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
-        mint_session_token, open_question, open_task_for_target, oversize_refusal, parse_task_ids,
-        reassign_pending, render_open_task_summaries, render_task, render_task_summary,
-        review_pending, reviewing_label, select_tasks, status_tag, still_open, task_for_dispatcher,
-        validate_path_component, wait_timeout, AgentSession, AskError, CancelOutcome, Entry,
-        Exchange, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
-        MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, STATUS_BLOCKED,
-        TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
+        abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
+        attribute_open_tasks, bearer_matches, blocked_wait_should_release, busy_label,
+        cancel_pending, choose_reviewer, conductor_briefing, dispatch_precheck, dispatch_prompt,
+        finish_pending, fit_injection, human_ms, injection_overage, is_occupied, is_open,
+        is_terminal, load_brain, mark_pending_error, merge_live_identity, mint_session_token,
+        next_delivery_for, occupying_task, open_question, oversize_refusal, parse_task_ids,
+        queue_cap_refusal, queue_predecessor, queued_ids_for, reassign_pending,
+        render_open_task_summaries, render_task, render_task_summary, requeue_if_still_pending,
+        review_pending, review_request_notice, reviewing_label, rework_notice, select_tasks,
+        single_line, status_tag, still_open, task_for_reader, truncate_bytes, truncate_chars,
+        validate_path_component, wait_timeout, AgentSession, AskError, BrainHandler, CancelOutcome,
+        Entry, Exchange, Identify, Notifier, Parameters, ReassignError, Shared, StoreRecord, Task,
+        TaskAccessError, MAX_QUESTIONS_PER_TASK, QUEUE_CAP, RECENT_FINISHED, REVIEW_WAIVED,
+        STATUS_ABANDONED, STATUS_BLOCKED, STATUS_QUEUED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::Duration;
@@ -3319,6 +4135,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             done_ms: None,
+            notice_delivered: true,
         }]
     }
 
@@ -3447,6 +4264,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }
     }
 
@@ -3589,10 +4407,13 @@ mod tests {
             name_to_room: Mutex::new(HashMap::new()),
             engine: Arc::new(crate::SessionManager::default()),
             conductor: Mutex::new(Some("sess-1".to_string())),
+            connected: Mutex::new(HashSet::new()),
             halted: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             dispatches: Mutex::new(0),
             delivery: RwLock::new(()),
+            pane_delivery: Mutex::new(HashMap::new()),
+            test_seam: Mutex::new(None),
         });
         // `app` owns the runtime the handle points at, so it has to outlive the
         // handle. Leaking it is cheaper than threading it through every caller
@@ -3716,6 +4537,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -3744,6 +4566,7 @@ mod tests {
             reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
+            notice_delivered: true,
         };
         assert!(render_task(&base).starts_with("[error]"));
     }
@@ -3791,6 +4614,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
@@ -3824,6 +4648,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }];
 
         assert_eq!(
@@ -3835,7 +4660,10 @@ mod tests {
     }
 
     #[test]
-    fn get_task_result_rejects_a_caller_other_than_the_dispatcher() {
+    fn get_task_result_allows_the_dispatcher_target_and_reviewer_but_no_one_else() {
+        // Phase 2: a task's target and reviewer can now read it by full id
+        // (the shape a review request or rework notice points them at), but
+        // a bystander still cannot.
         let mut tasks = vec![Task {
             id: "abc123".into(),
             from: "sess-1".into(),
@@ -3845,15 +4673,29 @@ mod tests {
             result: String::new(),
             ts_ms: 0,
             done_ms: None,
-            reviewer: String::new(),
+            reviewer: "sess-4".into(),
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }];
 
+        assert!(
+            task_for_reader(&mut tasks, "sess-1", "abc123").is_ok(),
+            "dispatcher"
+        );
+        assert!(
+            task_for_reader(&mut tasks, "sess-2", "abc123").is_ok(),
+            "target"
+        );
+        assert!(
+            task_for_reader(&mut tasks, "sess-4", "abc123").is_ok(),
+            "reviewer"
+        );
         assert_eq!(
-            task_for_dispatcher(&mut tasks, "sess-3", "abc123").unwrap_err(),
-            TaskAccessError::Forbidden
+            task_for_reader(&mut tasks, "sess-3", "abc123").unwrap_err(),
+            TaskAccessError::Forbidden,
+            "a bystander must still be refused"
         );
     }
 
@@ -3929,6 +4771,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }];
         assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
@@ -3952,6 +4795,7 @@ mod tests {
             reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
+            notice_delivered: true,
         }];
         assert!(!mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "cancelled");
@@ -3972,6 +4816,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         };
 
         let mut pending = base.clone();
@@ -4005,6 +4850,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -4036,6 +4882,7 @@ mod tests {
                 reviewer_gone: false,
                 ts_ms: 0,
                 done_ms: None,
+                notice_delivered: true,
             }];
             assert_eq!(
                 finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite", 0),
@@ -4062,6 +4909,7 @@ mod tests {
             reviewer_gone: false,
             ts_ms: 0,
             done_ms: None,
+            notice_delivered: true,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-3", "abc123", "stolen", 0),
@@ -4100,6 +4948,7 @@ mod tests {
             reviewer_gone: false,
             ts_ms: 2,
             done_ms: None,
+            notice_delivered: true,
         };
         let done = Task {
             status: "done".into(),
@@ -4136,6 +4985,7 @@ mod tests {
             findings: String::new(),
             exchanges: Vec::new(),
             reviewer_gone: false,
+            notice_delivered: true,
         }
     }
 
@@ -4290,7 +5140,7 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok("sess-3".to_string()),
             "a third party is preferred over the conductor who wrote the brief"
         );
@@ -4303,7 +5153,7 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into()];
 
         assert_eq!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok("sess-1".to_string())
         );
     }
@@ -4316,7 +5166,7 @@ mod tests {
         let live = vec!["sess-2".to_string()];
 
         assert_eq!(
-            choose_reviewer("", "sess-2", "sess-2", &live),
+            choose_reviewer("", "sess-2", "sess-2", &live, &[]),
             Ok(String::new())
         );
     }
@@ -4326,12 +5176,12 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer(REVIEW_WAIVED, "sess-1", "sess-2", &live),
+            choose_reviewer(REVIEW_WAIVED, "sess-1", "sess-2", &live, &[]),
             Ok(String::new()),
             "an explicit waiver is honoured"
         );
         assert_ne!(
-            choose_reviewer("", "sess-1", "sess-2", &live),
+            choose_reviewer("", "sess-1", "sess-2", &live, &[]),
             Ok(String::new()),
             "but silence is not a waiver"
         );
@@ -4342,16 +5192,16 @@ mod tests {
         let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
 
         assert_eq!(
-            choose_reviewer("sess-3", "sess-1", "sess-2", &live),
+            choose_reviewer("sess-3", "sess-1", "sess-2", &live, &[]),
             Ok("sess-3".to_string())
         );
         // The conductor reviewing is explicitly fine.
         assert_eq!(
-            choose_reviewer("sess-1", "sess-1", "sess-2", &live),
+            choose_reviewer("sess-1", "sess-1", "sess-2", &live, &[]),
             Ok("sess-1".to_string())
         );
 
-        let self_review = choose_reviewer("sess-2", "sess-1", "sess-2", &live).unwrap_err();
+        let self_review = choose_reviewer("sess-2", "sess-1", "sess-2", &live, &[]).unwrap_err();
         assert!(
             self_review.contains("cannot review its own work"),
             "{self_review}"
@@ -4359,8 +5209,52 @@ mod tests {
         // And it names the escape hatch, or the conductor is stuck guessing.
         assert!(self_review.contains(REVIEW_WAIVED), "{self_review}");
 
-        let dead = choose_reviewer("sess-9", "sess-1", "sess-2", &live).unwrap_err();
+        let dead = choose_reviewer("sess-9", "sess-1", "sess-2", &live, &[]).unwrap_err();
         assert!(dead.contains("no live session 'sess-9'"), "{dead}");
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_prefers_a_different_cli_kind_than_the_target() {
+        // sess-3 is the same kind as the target; sess-4 is not. The plain
+        // third-party-over-dispatcher tie-break would have picked sess-3,
+        // which enforces the review gate without enforcing the reason
+        // CONTRIBUTING.md wants it: a different model actually looking.
+        let live = vec!["sess-1".to_string(), "sess-3".into(), "sess-4".into()];
+        let sessions = vec![
+            agent("sess-2", "claude"), // the target
+            agent("sess-3", "claude"),
+            agent("sess-4", "codex"),
+        ];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-4".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_falls_back_to_the_same_kind_when_no_other_kind_is_live() {
+        let live = vec!["sess-1".to_string(), "sess-3".into()];
+        let sessions = vec![agent("sess-2", "claude"), agent("sess-3", "claude")];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-3".to_string()),
+            "no different-kind candidate exists, so the old rule still applies"
+        );
+    }
+
+    #[test]
+    fn a_named_reviewer_is_unaffected_by_the_kind_preference() {
+        // Naming a reviewer is the conductor doing the job the preference is
+        // a default for; it must not be second-guessed by kind.
+        let live = vec!["sess-1".to_string(), "sess-3".into()];
+        let sessions = vec![agent("sess-2", "claude"), agent("sess-3", "claude")];
+
+        assert_eq!(
+            choose_reviewer("sess-3", "sess-1", "sess-2", &live, &sessions),
+            Ok("sess-3".to_string())
+        );
     }
 
     #[test]
@@ -4502,18 +5396,20 @@ mod tests {
 
     #[test]
     fn abandon_lost_covers_every_status_whose_actor_is_the_target() {
-        // A pane can die while a rework fix sits open just as easily as while
-        // pending or overdue work is running: in all three the target is the
+        // A pane can die while a rework fix sits open, or while a task is
+        // still waiting behind the pane's queue, just as easily as while
+        // pending or overdue work is running: in all four the target is the
         // one who has to act, so the target's death is what ends them.
         let mut tasks = vec![
             task_at("t1", "pending", 0),
             task_at("t2", "overdue", 0),
             task_at("t3", "rework", 0),
+            task_at("t4", STATUS_QUEUED, 0),
         ];
 
         let changed = abandon_lost(&mut tasks, &[], 1_000);
 
-        assert_eq!(changed.len(), 3);
+        assert_eq!(changed.len(), 4);
         assert!(tasks.iter().all(|t| t.status == STATUS_ABANDONED));
     }
 
@@ -5068,35 +5964,51 @@ mod tests {
         assert_ne!(reviewing_label(Some(90_000)), busy_label(Some(90_000)));
     }
 
-    // ---- open_task_for_target: dispatch's "already busy" note ----
+    // ---- queue_predecessor: dispatch's "queued behind" note ----
 
     #[test]
-    fn open_task_for_target_finds_an_open_task_for_that_target() {
+    fn queue_predecessor_finds_an_open_task_for_that_target() {
         let tasks = vec![task_at("t1", "pending", 0)];
-        assert_eq!(
-            open_task_for_target(&tasks, "sess-2"),
-            Some("t1".to_string())
-        );
+        assert_eq!(queue_predecessor(&tasks, "sess-2"), Some("t1".to_string()));
     }
 
     #[test]
-    fn open_task_for_target_ignores_finished_work_and_other_targets() {
+    fn queue_predecessor_ignores_finished_work_and_other_targets() {
         let mut done = task_at("t1", "done", 0);
         done.target = "sess-2".into();
         let mut elsewhere = task_at("t2", "pending", 0);
         elsewhere.target = "sess-3".into();
         let tasks = vec![done, elsewhere];
 
-        assert_eq!(open_task_for_target(&tasks, "sess-2"), None);
+        assert_eq!(queue_predecessor(&tasks, "sess-2"), None);
     }
 
     #[test]
-    fn open_task_for_target_ignores_in_review_work_since_the_target_is_free() {
-        // attribute_open_tasks counts in_review against the reviewer, not
-        // the target, so the "already busy" note must agree: it would
-        // otherwise tell the conductor to cancel work that already landed.
-        let tasks = vec![task_at("t1", "in_review", 0)];
-        assert_eq!(open_task_for_target(&tasks, "sess-2"), None);
+    fn queue_predecessor_prefers_the_last_queued_task_over_the_occupying_one() {
+        // A fresh dispatch to an already-occupied pane with two already
+        // queued waits behind the most recent of those, not behind the
+        // task actually running: that is what "position in line" means.
+        let mut occupying = task_at("t1", "pending", 0);
+        occupying.target = "sess-2".into();
+        let mut q1 = task_at("t2", "queued", 10);
+        q1.target = "sess-2".into();
+        let mut q2 = task_at("t3", "queued", 20);
+        q2.target = "sess-2".into();
+        let tasks = vec![occupying, q1, q2];
+
+        assert_eq!(queue_predecessor(&tasks, "sess-2"), Some("t3".to_string()));
+    }
+
+    #[test]
+    fn queue_predecessor_finds_a_reviewer_occupied_pane_with_no_task_of_its_own() {
+        // A pane can be occupied purely as a reviewer, with no task
+        // targeting it directly.
+        let mut reviewing = task_at("t1", "in_review", 0);
+        reviewing.target = "sess-3".into();
+        reviewing.reviewer = "sess-2".into();
+        let tasks = vec![reviewing];
+
+        assert_eq!(queue_predecessor(&tasks, "sess-2"), Some("t1".to_string()));
     }
 
     // ---- reviewer_gone rendering ----
@@ -5692,9 +6604,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_add_task_journals_before_returning() {
+    fn shared_mutate_and_journal_writes_before_returning() {
         let (shared, dir) = shared_for_test();
-        shared.add_task(task_at("t1", "pending", 0));
+        let t = task_at("t1", "pending", 0);
+        shared.mutate_and_journal(|tasks| {
+            tasks.push(t.clone());
+            ((), vec![t])
+        });
         let reloaded = load_brain(dir.path());
         assert_eq!(reloaded.tasks.len(), 1);
         assert_eq!(reloaded.tasks[0].id, "t1");
@@ -5828,11 +6744,16 @@ mod tests {
         // run, which is exactly why the mutation itself has to be inside
         // the gate rather than left to race it.
         let (shared, dir) = shared_for_test();
-        // Through `add_task`, not a raw push, so the journal already holds
-        // an "overdue" record for `t1` to compare the final one against:
-        // `set_halted`'s cancel loop skips this task entirely, so nothing
-        // else would ever journal it if this test's own setup did not.
-        shared.add_task(task_at("t1", "overdue", 0));
+        // Through `mutate_and_journal`, not a raw push, so the journal
+        // already holds an "overdue" record for `t1` to compare the final
+        // one against: `set_halted`'s cancel loop skips this task entirely,
+        // so nothing else would ever journal it if this test's own setup
+        // did not.
+        let t1 = task_at("t1", "overdue", 0);
+        shared.mutate_and_journal(|tasks| {
+            tasks.push(t1.clone());
+            ((), vec![t1])
+        });
 
         let started = Arc::new(AtomicBool::new(false));
         let delivering = shared.delivery.read().unwrap();
@@ -5974,6 +6895,219 @@ mod tests {
         assert_eq!(contents.lines().count(), 1);
     }
 
+    #[test]
+    fn note_session_does_not_drain_a_pane_that_has_not_connected_yet() {
+        // note_session runs at MCP-wiring time in spawn_session, before the
+        // PTY or its engine handle exist. An earlier version drained from
+        // here, which meant a restart errored every restored pane's queue
+        // at spawn time, against a handle the engine did not have yet: a
+        // failed attempt that was never actually attempted. A queued task
+        // must survive this call untouched.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        shared.note_session("sess-2", "claude", "sonnet");
+
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn note_session_clears_connected_so_a_respawned_pane_must_reconnect() {
+        // The readiness flag resets on respawn: a pane already marked
+        // connected must go back to not-connected the moment note_session
+        // says a fresh incarnation is starting, so a stale connection from
+        // the last one cannot make the new one look ready before it is.
+        let (shared, _dir) = shared_for_test();
+        shared.mark_connected("sess-2");
+        assert!(shared.is_connected("sess-2"), "sanity: it was connected");
+
+        shared.note_session("sess-2", "claude", "sonnet");
+
+        assert!(!shared.is_connected("sess-2"));
+    }
+
+    #[test]
+    fn drain_pane_refuses_to_attempt_against_a_pane_that_has_never_connected() {
+        // Isolates the gate itself, independent of any trigger: even a
+        // direct drain_pane call must not touch a queued task ahead of a
+        // connection, which is the property the two note_session tests
+        // above and mark_connected's own test below all rest on.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        shared.drain_pane("sess-2");
+
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn mark_connected_is_what_actually_drains_a_pane() {
+        // The other half of the note_session fix: delivery is not gone,
+        // just moved to the moment a pane's MCP endpoint actually hears
+        // from it. shared_for_test's engine still reports nothing live, so
+        // the observable proof is the one the other drain-trigger tests
+        // use: a queued task flips to error on the attempted, failed
+        // delivery.
+        //
+        // What this does not, and cannot, show: the real wiring in
+        // start_session_server (the per-session handler factory) and the
+        // shared endpoint's set_session_identity are what actually call
+        // mark_connected in the running app; neither runs a live HTTP
+        // client against this fixture, so only mark_connected itself is
+        // exercised here, directly, standing in for both.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        assert!(!shared.is_connected("sess-2"), "sanity: not connected yet");
+
+        shared.mark_connected("sess-2");
+
+        assert!(shared.is_connected("sess-2"));
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    #[test]
+    fn set_session_identity_on_the_shared_endpoint_drains_the_pane() {
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        let handler = BrainHandler::new(shared.clone());
+
+        handler.set_session_identity(Parameters(Identify {
+            name: "sess-2".to_string(),
+            kind: "claude".to_string(),
+            room: String::new(),
+        }));
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    #[test]
+    fn set_dir_sweeps_every_connected_pane_not_bare_liveness() {
+        // Switched from live_ids() to `connected` specifically so this
+        // would stop being untestable: shared_for_test's engine always
+        // reports nothing live, but `connected` is ordinary state this
+        // fixture can drive directly, so the sweep itself is now exercised
+        // here rather than only trusted by inspection. The queued task has
+        // to live in the *new* dir's journal, because set_dir replaces
+        // `tasks` wholesale with whatever that journal holds; it is
+        // `connected` (in-memory, carried across the switch) that this
+        // test is proving actually gets swept.
+        let (shared, _old_dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+
+        let new_dir = tempfile::tempdir().expect("tempdir");
+        append_record(
+            new_dir.path(),
+            &StoreRecord::Task(task_at("t1", STATUS_QUEUED, 0)),
+        )
+        .unwrap();
+
+        shared.set_dir(new_dir.path().to_path_buf());
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    // ---- merge_live_identity: a pane's identity survives a set_dir switch ----
+    //
+    // Measured 2026-09-03 on the Phase 1 build: `set_dir` replaced `sessions`
+    // wholesale with the new journal's list, so a pane spawned before the
+    // switch (correct kind, in memory) went back to reading whatever the new
+    // journal last said about that name. Two panes spawned after the switch
+    // were fine, which is what pointed at `set_dir` rather than spawn itself.
+
+    fn agent(name: &str, kind: &str) -> AgentSession {
+        AgentSession {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            model: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_live_panes_identity_wins_over_the_new_journal() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "codex")];
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(
+            merged[0].kind, "claude",
+            "the live pane's real kind was dropped"
+        );
+        assert_eq!(
+            changed.len(),
+            1,
+            "the correction must be recorded to the new dir"
+        );
+        assert_eq!(changed[0].kind, "claude");
+    }
+
+    #[test]
+    fn a_dead_panes_identity_follows_the_journal() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "codex")];
+        let live: Vec<String> = Vec::new();
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(
+            merged[0].kind, "codex",
+            "a pane that is not live has nothing in memory to trust over the journal"
+        );
+        assert!(
+            changed.is_empty(),
+            "nothing changed, so nothing should be recorded"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_identity_records_nothing() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "claude")];
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(merged[0].kind, "claude");
+        assert!(
+            changed.is_empty(),
+            "old and new already agree; appending a record would be a no-op write"
+        );
+    }
+
+    #[test]
+    fn a_live_pane_missing_from_a_brand_new_journal_is_carried_forward() {
+        let old = vec![agent("sess-1", "claude")];
+        let new: Vec<AgentSession> = Vec::new();
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].kind, "claude");
+        assert_eq!(changed.len(), 1);
+    }
+
     // ---- Shared::cancel_tasks / Shared::reassign_task ----
 
     #[test]
@@ -6060,6 +7194,1012 @@ mod tests {
             err,
             ReassignError::NotLive("sess-5".to_string()),
             "halted should not be the reason this is refused"
+        );
+    }
+
+    // ---- occupying_task / is_occupied ----
+    //
+    // The rule the whole per-pane queue rests on: what makes a pane unsafe
+    // to type into right now.
+
+    #[test]
+    fn a_pane_with_its_own_pending_task_is_occupied() {
+        let tasks = vec![task_at("t1", "pending", 0)]; // target sess-2
+        assert!(is_occupied(&tasks, "sess-2"));
+        assert!(!is_occupied(&tasks, "sess-3"));
+    }
+
+    #[test]
+    fn every_status_that_holds_a_pane_occupies_it() {
+        for status in ["pending", "overdue", "rework", STATUS_BLOCKED] {
+            let tasks = vec![task_at("t1", status, 0)];
+            assert!(
+                is_occupied(&tasks, "sess-2"),
+                "{status} must occupy its target"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reviewer_reviewing_an_in_review_task_is_occupied() {
+        let mut t = task_at("t1", "in_review", 0);
+        t.reviewer = "sess-4".into();
+        let tasks = vec![t];
+
+        assert!(is_occupied(&tasks, "sess-4"), "the reviewer is occupied");
+        assert!(
+            !is_occupied(&tasks, "sess-2"),
+            "the target already submitted and is free"
+        );
+    }
+
+    #[test]
+    fn a_queued_task_does_not_occupy_its_own_target() {
+        // The load-bearing property: if a queued task occupied its own
+        // target, the queue could never drain.
+        let tasks = vec![task_at("t1", STATUS_QUEUED, 0)];
+        assert!(!is_occupied(&tasks, "sess-2"));
+    }
+
+    #[test]
+    fn a_done_task_does_not_occupy_anyone() {
+        let tasks = vec![task_at("t1", "done", 0)];
+        assert!(!is_occupied(&tasks, "sess-2"));
+    }
+
+    #[test]
+    fn occupying_task_can_exclude_a_task_from_judging_its_own_pane_occupied() {
+        // The case `drain_pane` and `reassign_task` both need: a task whose
+        // own status is what would occupy the pane must not count against
+        // itself when deciding whether to deliver or move it.
+        let tasks = vec![task_at("t1", "rework", 0)]; // target sess-2
+        assert!(occupying_task(&tasks, "sess-2", "").is_some());
+        assert!(
+            occupying_task(&tasks, "sess-2", "t1").is_none(),
+            "excluding the task itself must leave the pane looking free"
+        );
+    }
+
+    // ---- next_delivery_for: what a freed pane receives ----
+
+    #[test]
+    fn next_delivery_for_is_none_when_the_pane_is_occupied() {
+        let mut occupying = task_at("t1", "pending", 0);
+        occupying.target = "sess-2".into();
+        let mut queued = task_at("t2", STATUS_QUEUED, 5);
+        queued.target = "sess-2".into();
+        let tasks = vec![occupying, queued];
+
+        assert!(next_delivery_for(&tasks, "sess-2").is_none());
+    }
+
+    #[test]
+    fn next_delivery_for_is_none_when_nothing_is_pending() {
+        let tasks = vec![task_at("t1", "done", 0)];
+        assert!(next_delivery_for(&tasks, "sess-2").is_none());
+    }
+
+    #[test]
+    fn next_delivery_for_picks_the_oldest_queued_dispatch() {
+        let mut q1 = task_at("t1", STATUS_QUEUED, 10);
+        q1.target = "sess-2".into();
+        let mut q2 = task_at("t2", STATUS_QUEUED, 5);
+        q2.target = "sess-2".into();
+        let tasks = vec![q1, q2];
+
+        let next = next_delivery_for(&tasks, "sess-2").expect("something is pending");
+        assert_eq!(
+            next.id, "t2",
+            "the older of the two queued tasks goes first"
+        );
+    }
+
+    #[test]
+    fn next_delivery_for_prefers_an_undelivered_notice_over_a_queued_dispatch() {
+        // A review request or rework notice is already-done work someone is
+        // waiting on; a freshly queued dispatch is new work that can wait
+        // one more turn.
+        let mut notice = task_at("t1", "rework", 0);
+        notice.target = "sess-2".into();
+        notice.notice_delivered = false;
+        let mut queued = task_at("t2", STATUS_QUEUED, 0);
+        queued.target = "sess-2".into();
+        let tasks = vec![queued, notice];
+
+        let next = next_delivery_for(&tasks, "sess-2").expect("something is pending");
+        assert_eq!(next.id, "t1", "the rework notice must go first");
+    }
+
+    #[test]
+    fn next_delivery_for_ignores_a_notice_already_delivered() {
+        let mut notice = task_at("t1", "rework", 0);
+        notice.target = "sess-2".into();
+        notice.notice_delivered = true;
+        let tasks = vec![notice];
+
+        assert!(next_delivery_for(&tasks, "sess-2").is_none());
+    }
+
+    #[test]
+    fn next_delivery_for_finds_a_review_request_by_reviewer_not_target() {
+        let mut notice = task_at("t1", "in_review", 0);
+        notice.target = "sess-3".into();
+        notice.reviewer = "sess-2".into();
+        notice.notice_delivered = false;
+        let tasks = vec![notice];
+
+        let next = next_delivery_for(&tasks, "sess-2").expect("the reviewer's pane is free");
+        assert_eq!(next.id, "t1");
+    }
+
+    // ---- queued_ids_for / queue_cap_refusal ----
+
+    #[test]
+    fn queued_ids_for_orders_oldest_first_and_ignores_other_panes_and_statuses() {
+        let mut q_new = task_at("new", STATUS_QUEUED, 20);
+        q_new.target = "sess-2".into();
+        let mut q_old = task_at("old", STATUS_QUEUED, 5);
+        q_old.target = "sess-2".into();
+        let mut elsewhere = task_at("elsewhere", STATUS_QUEUED, 1);
+        elsewhere.target = "sess-3".into();
+        let mut pending = task_at("pending", "pending", 1);
+        pending.target = "sess-2".into();
+        let tasks = vec![q_new, q_old, elsewhere, pending];
+
+        assert_eq!(
+            queued_ids_for(&tasks, "sess-2"),
+            vec!["old".to_string(), "new".to_string()]
+        );
+    }
+
+    #[test]
+    fn queue_cap_refusal_allows_up_to_the_cap_and_refuses_at_it() {
+        let below: Vec<String> = (0..QUEUE_CAP - 1).map(|i| i.to_string()).collect();
+        assert_eq!(queue_cap_refusal(&below), None);
+
+        let at_cap: Vec<String> = (0..QUEUE_CAP).map(|i| i.to_string()).collect();
+        let refusal = queue_cap_refusal(&at_cap).expect("the cap must refuse");
+        assert!(refusal.contains("queue is full"), "{refusal}");
+        for id in &at_cap {
+            assert!(refusal.contains(id), "{refusal}");
+        }
+    }
+
+    // ---- append_queued: folding a queue-depth note into a roster label ----
+
+    #[test]
+    fn append_queued_is_a_no_op_at_zero_depth() {
+        assert_eq!(append_queued(" [busy 4m]".to_string(), 0), " [busy 4m]");
+        assert_eq!(append_queued(String::new(), 0), "");
+    }
+
+    #[test]
+    fn append_queued_folds_into_an_existing_bracket() {
+        assert_eq!(
+            append_queued(" [busy 4m]".to_string(), 2),
+            " [busy 4m, 2 queued]"
+        );
+    }
+
+    #[test]
+    fn append_queued_opens_its_own_bracket_when_there_is_no_other_label() {
+        assert_eq!(append_queued(String::new(), 2), " [2 queued]");
+    }
+
+    #[test]
+    fn single_line_folds_every_line_break_to_a_space() {
+        assert_eq!(single_line("a\r\nb\nc\rd"), "a b c d");
+    }
+
+    #[test]
+    fn truncate_chars_marks_a_cut_and_leaves_short_text_alone() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdef", 3), "abc...");
+    }
+
+    // ---- fit_injection / truncate_bytes: shrink rather than refuse ----
+
+    #[test]
+    fn fit_injection_leaves_a_short_message_untouched() {
+        let msg = fit_injection(|v| format!("wrapper: {v}"), "short");
+        assert_eq!(msg, "wrapper: short");
+    }
+
+    #[test]
+    fn fit_injection_shrinks_the_variable_part_to_fit() {
+        let long = "x".repeat(2000);
+        let msg = fit_injection(|v| format!("[pantheon] fixed wrapper: {v} end"), &long);
+
+        assert!(
+            injection_overage(&msg).is_none(),
+            "message is still {} bytes, over the limit",
+            msg.len()
+        );
+        assert!(msg.starts_with("[pantheon] fixed wrapper:"));
+        assert!(msg.ends_with("end"), "the fixed wrapper must survive whole");
+        assert!(msg.contains("..."), "the cut must be marked");
+    }
+
+    #[test]
+    fn truncate_bytes_cuts_on_a_char_boundary() {
+        // Each "é" is 2 bytes; a naive byte-index cut would land inside one
+        // and panic on a non-boundary slice.
+        let s = "é".repeat(20);
+        let truncated = truncate_bytes(&s, 10);
+        assert!(truncated.len() <= 10);
+        assert!(s.is_char_boundary(truncated.len() - 3) || truncated.len() < 3);
+    }
+
+    // ---- review_request_notice / rework_notice: delivered message shape ----
+
+    #[test]
+    fn review_request_notice_names_the_task_target_and_next_step() {
+        let msg = review_request_notice("abc123", "sess-2", "audit the parser");
+        assert!(!msg.contains(['\r', '\n']));
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("sess-2"));
+        assert!(msg.contains("audit the parser"));
+        assert!(msg.contains("get_task_result"));
+        assert!(msg.contains("review_task"));
+    }
+
+    #[test]
+    fn rework_notice_names_the_task_reviewer_and_next_step() {
+        let msg = rework_notice("abc123", "sess-4", "missing a test");
+        assert!(!msg.contains(['\r', '\n']));
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("sess-4"));
+        assert!(msg.contains("missing a test"));
+        assert!(msg.contains("complete_task"));
+    }
+
+    // ---- STATUS_QUEUED: a queued task is open but never counted as busy ----
+
+    #[test]
+    fn a_queued_task_is_open() {
+        assert!(is_open(STATUS_QUEUED));
+    }
+
+    #[test]
+    fn a_queued_task_stays_in_a_wait_and_renders_with_a_plain_status_tag() {
+        let t = task_at("t1", STATUS_QUEUED, 0);
+        assert_eq!(
+            still_open(&[t.clone()], &["t1".to_string()]),
+            vec!["t1".to_string()],
+            "wait_for_tasks must keep treating a queued task as still running"
+        );
+        assert!(render_task(&t).starts_with("[queued]"));
+    }
+
+    #[test]
+    fn attribute_open_tasks_excludes_queued_from_the_busy_bucket() {
+        let tasks = vec![task_at("t1", STATUS_QUEUED, 0)];
+        let (busy, reviewing) = attribute_open_tasks(&tasks, 1000);
+        assert!(busy.is_empty(), "a queued task has not started running");
+        assert!(reviewing.is_empty());
+    }
+
+    #[test]
+    fn cancel_pending_closes_a_queued_task() {
+        let mut tasks = vec![task_at("t1", STATUS_QUEUED, 0)];
+        assert_eq!(
+            cancel_pending(&mut tasks, "t1", "no longer needed", 500),
+            CancelOutcome::Cancelled
+        );
+        assert_eq!(tasks[0].status, "cancelled");
+    }
+
+    #[test]
+    fn reassign_pending_accepts_a_queued_task_for_retarget() {
+        let mut tasks = vec![task_at("t1", STATUS_QUEUED, 0)];
+        let live = vec!["sess-5".to_string()];
+
+        let t = reassign_pending(&mut tasks, "t1", "sess-1", Some("sess-5"), None, &live, 100)
+            .expect("a queued task may be retargeted");
+
+        assert_eq!(t.status, "pending", "fresh delivery, fresh status");
+        assert_eq!(t.target, "sess-5");
+        assert_eq!(t.ts_ms, 100, "fresh delivery, fresh clock");
+    }
+
+    // ---- finish_pending / review_pending: notice_delivered on transition ----
+
+    #[test]
+    fn finishing_reviewed_work_marks_its_review_request_undelivered() {
+        let mut tasks = dispatched_task("sess-3");
+        tasks[0].notice_delivered = true; // nothing pending before this call
+        finish_pending(&mut tasks, "sess-2", "abc123", "done", 0).unwrap();
+
+        assert_eq!(tasks[0].status, "in_review");
+        assert!(
+            !tasks[0].notice_delivered,
+            "the reviewer now owes a review request"
+        );
+    }
+
+    #[test]
+    fn finishing_unreviewed_work_leaves_notice_delivered_alone() {
+        let mut tasks = dispatched_task("");
+        finish_pending(&mut tasks, "sess-2", "abc123", "done", 0).unwrap();
+
+        assert_eq!(tasks[0].status, "done");
+        assert!(tasks[0].notice_delivered, "nobody is owed a notice");
+    }
+
+    #[test]
+    fn rejecting_a_review_marks_its_rework_notice_undelivered() {
+        let mut tasks = dispatched_task("sess-3");
+        finish_pending(&mut tasks, "sess-2", "abc123", "attempt", 0).unwrap();
+        tasks[0].notice_delivered = true; // the review request was delivered
+        review_pending(&mut tasks, "sess-3", "abc123", false, "missing a test", 0).unwrap();
+
+        assert_eq!(tasks[0].status, "rework");
+        assert!(
+            !tasks[0].notice_delivered,
+            "the target now owes a rework notice"
+        );
+    }
+
+    #[test]
+    fn approving_a_review_leaves_notice_delivered_alone() {
+        let mut tasks = dispatched_task("sess-3");
+        finish_pending(&mut tasks, "sess-2", "abc123", "attempt", 0).unwrap();
+        tasks[0].notice_delivered = true;
+        review_pending(&mut tasks, "sess-3", "abc123", true, "looks right", 0).unwrap();
+
+        assert_eq!(tasks[0].status, "done");
+        assert!(tasks[0].notice_delivered, "nobody is owed a notice");
+    }
+
+    // ---- notice_delivered persistence ----
+
+    #[test]
+    fn a_task_from_before_this_field_loads_as_notice_undelivered() {
+        // The useful reading of `serde(default)` here: an in_review or
+        // rework task written before Pantheon had any delivery mechanism at
+        // all gets retried once, rather than silently staying undelivered
+        // forever across the upgrade.
+        let stored = r#"{"id":"old1","from":"sess-1","target":"sess-2","task":"t","status":"in_review","result":"r","ts_ms":5,"reviewer":"sess-3"}"#;
+        let task: Task = serde_json::from_str(stored).expect("an older task must still load");
+
+        assert!(!task.notice_delivered);
+    }
+
+    #[test]
+    fn notice_delivered_round_trips_through_the_store() {
+        let (shared, dir) = shared_for_test();
+        let mut t = task_at("t1", "rework", 0);
+        t.notice_delivered = false;
+        shared.mutate_and_journal(|tasks| {
+            tasks.push(t.clone());
+            ((), vec![t])
+        });
+
+        let reloaded = load_brain(dir.path());
+        assert!(!reloaded.tasks[0].notice_delivered);
+    }
+
+    // ---- set_halted: queued tasks are cancelled and drained on resume ----
+
+    #[test]
+    fn set_halted_cancels_a_queued_task_the_same_as_a_pending_one() {
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        shared.set_halted(true);
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "cancelled");
+    }
+
+    // ---- drain_pane is called from every place that can free a pane ----
+    //
+    // `shared_for_test`'s engine reports nothing live, so `submit_to` always
+    // fails inside these tests (see the module-level `shared_for_test` doc
+    // comment). That is used here as the signal, not worked around: a
+    // queued task left touching this failure path is proof `drain_pane` ran
+    // and attempted delivery, where a queued task still sitting untouched
+    // would mean the trigger never fired at all. Confirming a *successful*
+    // delivery end-to-end needs a live pane, which this fixture cannot
+    // provide; `next_delivery_for`'s tests above cover the selection logic
+    // that a real delivery would act on.
+
+    #[test]
+    fn cancelling_a_task_drains_its_targets_queue() {
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        let mut occupying = task_at("t1", "pending", 0);
+        occupying.target = "sess-2".into();
+        let mut queued = task_at("t2", STATUS_QUEUED, 1);
+        queued.target = "sess-2".into();
+        shared.tasks.lock().unwrap().push(occupying);
+        shared.tasks.lock().unwrap().push(queued);
+
+        shared.cancel_tasks(&["t1".to_string()], "no longer needed");
+
+        let after = shared.tasks_snapshot();
+        let t2 = after.iter().find(|t| t.id == "t2").unwrap();
+        assert_eq!(
+            t2.status, "error",
+            "drain_pane must have attempted delivery and failed in this fixture"
+        );
+    }
+
+    #[test]
+    fn finishing_reviewed_work_gives_the_review_request_priority_over_the_reviewers_own_queue() {
+        // finish_task hands sess-3 a fresh, undelivered review request for
+        // t1, which is exactly the case next_delivery_for's own priority
+        // test covers: a notice goes out before anything already queued
+        // behind it. t2 must stay put rather than jump the notice.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
+        let mut work = task_at("t1", "pending", 0);
+        work.target = "sess-2".into();
+        work.reviewer = "sess-3".into();
+        let mut queued_for_reviewer = task_at("t2", STATUS_QUEUED, 1);
+        queued_for_reviewer.target = "sess-3".into();
+        shared.tasks.lock().unwrap().push(work);
+        shared.tasks.lock().unwrap().push(queued_for_reviewer);
+
+        shared.finish_task("sess-2", "t1", "done").unwrap();
+
+        let after = shared.tasks_snapshot();
+        assert_eq!(
+            after.iter().find(|t| t.id == "t1").unwrap().status,
+            "in_review",
+            "the review request is what drain_pane attempted"
+        );
+        assert_eq!(
+            after.iter().find(|t| t.id == "t2").unwrap().status,
+            STATUS_QUEUED,
+            "the queued task must not have been delivered ahead of the notice"
+        );
+    }
+
+    #[test]
+    fn approving_a_review_drains_the_reviewers_own_queue() {
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
+        let mut in_review = task_at("t1", "in_review", 0);
+        in_review.reviewer = "sess-3".into();
+        let mut queued_for_reviewer = task_at("t2", STATUS_QUEUED, 1);
+        queued_for_reviewer.target = "sess-3".into();
+        shared.tasks.lock().unwrap().push(in_review);
+        shared.tasks.lock().unwrap().push(queued_for_reviewer);
+
+        shared
+            .review_task("sess-3", "t1", true, "looks right")
+            .unwrap();
+
+        let after = shared.tasks_snapshot();
+        let t2 = after.iter().find(|t| t.id == "t2").unwrap();
+        assert_eq!(
+            t2.status, "error",
+            "the reviewer's own queue must have been drained"
+        );
+    }
+
+    #[test]
+    fn rejecting_a_review_drains_the_reviewers_queue_while_the_targets_notice_takes_priority() {
+        // review_task(reject) touches two panes: the reviewer's, which is
+        // now free and has nothing of its own pending, so its queue (t3)
+        // drains; and the target's, which review_task just handed a fresh
+        // undelivered rework notice, so its queue (t2) must wait behind it,
+        // the same priority next_delivery_for enforces on its own.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
+        let mut in_review = task_at("t1", "in_review", 0);
+        in_review.target = "sess-2".into();
+        in_review.reviewer = "sess-3".into();
+        let mut queued_for_target = task_at("t2", STATUS_QUEUED, 1);
+        queued_for_target.target = "sess-2".into();
+        let mut queued_for_reviewer = task_at("t3", STATUS_QUEUED, 1);
+        queued_for_reviewer.target = "sess-3".into();
+        shared.tasks.lock().unwrap().push(in_review);
+        shared.tasks.lock().unwrap().push(queued_for_target);
+        shared.tasks.lock().unwrap().push(queued_for_reviewer);
+
+        shared
+            .review_task("sess-3", "t1", false, "missing a test")
+            .unwrap();
+
+        let after = shared.tasks_snapshot();
+        assert_eq!(
+            after.iter().find(|t| t.id == "t1").unwrap().status,
+            "rework",
+            "the rework notice is what drain_pane attempted on the target's pane"
+        );
+        assert_eq!(
+            after.iter().find(|t| t.id == "t2").unwrap().status,
+            STATUS_QUEUED,
+            "the target's queue must not have been delivered ahead of its own rework notice"
+        );
+        assert_eq!(
+            after.iter().find(|t| t.id == "t3").unwrap().status,
+            "error",
+            "the reviewer's own queue, with no notice of its own, must have been drained"
+        );
+    }
+
+    #[test]
+    fn drain_pane_types_nothing_while_halted() {
+        // Set halted straight on the flag rather than through set_halted,
+        // which would cancel this very queued task before drain_pane ever
+        // saw it (see set_halted_cancels_a_queued_task_the_same_as_a_pending_one).
+        // What this test isolates is drain_pane's own halted check.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        *shared.halted.lock().unwrap() = true;
+
+        shared.drain_pane("sess-2");
+
+        assert_eq!(
+            shared.tasks_snapshot()[0].status,
+            STATUS_QUEUED,
+            "nothing is delivered while halted"
+        );
+    }
+
+    #[test]
+    fn drain_pane_resumes_delivery_once_unhalted() {
+        // `set_halted`'s resume sweep is keyed off `live_ids()`, which
+        // `shared_for_test`'s engine always reports empty, so the sweep
+        // itself has nothing to iterate in this fixture and cannot be
+        // exercised end to end here. What is exercisable, and is the actual
+        // guard drain_pane relies on, is that halted alone is what blocks
+        // it: once cleared, the same call that was a no-op above attempts
+        // delivery again.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        *shared.halted.lock().unwrap() = true;
+
+        shared.drain_pane("sess-2");
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
+
+        *shared.halted.lock().unwrap() = false;
+        shared.drain_pane("sess-2");
+        assert_eq!(
+            shared.tasks_snapshot()[0].status,
+            "error",
+            "delivery is attempted once unhalted, even though this fixture's engine cannot succeed at it"
+        );
+    }
+
+    // ---- sixth round: `delivery` excludes Stop and cancel, not delivery paths from each other ----
+    //
+    // Three findings from the same review. `drain_pane` (and `dispatch_task`
+    // and `reassign_task`'s own delivery) only ever took `delivery.read()`,
+    // and any number of readers can hold a `RwLock` at once by design, so
+    // that gate never stopped two of those from running concurrently on the
+    // same pane: two drains could both select the same candidate before
+    // either promoted it, and a dispatch could see a pane as free in the
+    // instant a drain had picked its queue head but not yet delivered it.
+    // Fixed with `pane_delivery`, a mutex per pane held across the whole
+    // "decide what this pane gets next, then send it" section by every
+    // delivery path. `reassign_task`'s occupied branch separately dropped
+    // `delivery_gate` before its own second mutation (pending to queued),
+    // reopening the exact window the fourth round closed for its first one;
+    // fixed by holding the gate through both, and by `requeue_if_still_pending`
+    // refusing to flip a task that is no longer exactly what it was left as.
+    // And the queue cap was read in one `tasks` lock acquisition, well before
+    // the task's creation in another; fixed by `enqueue_within_cap`, folding
+    // the check into the same lock hold as the push.
+    //
+    // ---- seventh round: the three tests above didn't force the race either ----
+    //
+    // A second review of the sixth round's own tests: a `Barrier` at
+    // `drain_pane`'s or `enqueue_within_cap`'s *entrance* only guarantees
+    // both threads start together, not that they reach the contested
+    // internal boundary together, so the scheduler could still run one
+    // thread all the way to completion before the other is even scheduled
+    // -- the fixture's `submit_to` fails instantly, so that window is tiny
+    // but real. And the lock-blocking test assumed a thread had reached a
+    // lock after a 50ms sleep, which a merely descheduled thread would also
+    // pass without ever attempting the lock at all. All three would pass on
+    // the unfixed code often enough to look green.
+    //
+    // Fixed with `test_seam` (see its doc comment on `Shared`): production
+    // code calls a test-installed hook at the exact internal boundary a
+    // real race would need to land on, and the hook blocks the calling
+    // thread on a channel receive instead of returning immediately. That
+    // gives each test explicit control over when a thread is allowed past
+    // the boundary, so the interleaving the finding describes is forced
+    // every run, not hoped for. A hook that pauses one thread (test 1) or
+    // simply signals it was reached (test 2), plus a bounded
+    // `recv_timeout` for a *second* signal that must never arrive while
+    // the first thread is still paused there, is what proves exclusion:
+    // under the fix, a second arrival is architecturally impossible until
+    // the first is released, so a timeout finding nothing is a guarantee,
+    // not a guess; under the bug, the second thread has nothing to block
+    // it and reaches the hook almost immediately, comfortably inside the
+    // bound. All three tests below were run against the sixth round's own
+    // fix with the relevant lock or fold-into-one-hold removed (by hand,
+    // then reverted) to confirm they fail without it; see each test's own
+    // comment for exactly what was reverted and how it failed.
+
+    #[test]
+    fn two_concurrent_drains_on_one_pane_deliver_the_queued_task_exactly_once() {
+        // Confirmed this fails without the fix: with `pane_gate` removed
+        // from `drain_pane`, `mine` reaches the seam (and sends `arrived`)
+        // within microseconds of being spawned, since nothing blocks it --
+        // the `recv_timeout` assertion below gets that second signal
+        // instead of timing out, and fails immediately. With `pane_gate`
+        // restored, `mine` blocks acquiring the pane lock `other` holds
+        // and cannot reach the seam until `other` is released and has
+        // fully returned, so the timeout always elapses.
+        let (shared, dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        // The hook reports reaching the seam, then pauses there (still
+        // holding `pane_gate`, past selection, before the post-submit
+        // journal) until this test explicitly releases it.
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let proceed_rx = Mutex::new(proceed_rx);
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+            let _ = proceed_rx.lock().unwrap().recv();
+        });
+
+        let other = thread::spawn({
+            let shared = shared.clone();
+            move || shared.drain_pane("sess-2")
+        });
+        arrived_rx
+            .recv()
+            .expect("other must reach the seam to select the only queued task");
+
+        // `other` is now proven paused at the seam, holding `pane_gate`
+        // under the fix. Spawn the second drain now, while it is still
+        // paused -- this is the exact window the finding describes.
+        let mine = thread::spawn({
+            let shared = shared.clone();
+            move || shared.drain_pane("sess-2")
+        });
+
+        // Sound, not a timing guess: while `other` still holds `pane_gate`,
+        // `mine` cannot possibly reach the seam, so a second `arrived`
+        // never arriving within any bound is a guarantee under the fix,
+        // not luck. A bug that let both proceed would deliver it well
+        // inside this bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second drain reached the seam while the first still held the pane lock; \
+             both would have selected the same queued task"
+        );
+
+        // Release both: `other` (proven waiting) and `mine` (only if it
+        // also reached the seam, which the assertion above says it should
+        // not have under the fix; sent regardless so neither thread can
+        // hang waiting on a message this test never sends).
+        let _ = proceed_tx.send(());
+        let _ = proceed_tx.send(());
+        other.join().unwrap();
+        mine.join().unwrap();
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+        let journal = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
+        assert_eq!(
+            journal.lines().count(),
+            1,
+            "only one of the two drains should have found anything to deliver; \
+             a second journal line means both attempted the same candidate"
+        );
+    }
+
+    #[test]
+    fn drain_pane_queues_behind_another_delivery_path_already_holding_the_panes_lock() {
+        // `dispatch_task` cannot be driven far enough in this fixture to
+        // reach `pane_delivery_lock` at all: `dispatch_precheck` refuses
+        // for want of a live target before either gate is ever taken (see
+        // `a_refused_dispatch_charges_nothing_and_records_nothing`), and
+        // `reassign_task`'s retarget path is refused the same way (see
+        // `reassign_pending_refuses_a_target_that_is_not_live`). So this
+        // holds the same lock those two would hold across their own
+        // decide-then-send section, directly, standing in for "a dispatch
+        // arrives while a drain holds a candidate": drain_pane must queue
+        // behind whichever delivery path already has the pane reserved,
+        // exactly as it would behind another drain.
+        //
+        // Confirmed this fails without the fix: with `pane_gate` removed
+        // from `drain_pane`, the seam call is reached (and `arrived_tx`
+        // sent) immediately, regardless of this test's own `holding` lock,
+        // since drain_pane never asks for it; the first `recv_timeout`
+        // assertion below fails immediately instead of timing out. With
+        // `pane_gate` restored, `draining`'s thread blocks on the same
+        // `pane_lock` this test holds and cannot reach the seam at all
+        // until `holding` is dropped, so the timeout always elapses.
+        let (shared, dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+        });
+
+        let pane_lock = shared.pane_delivery_lock("sess-2");
+        let holding = pane_lock.lock().unwrap();
+
+        let draining = thread::spawn({
+            let shared = shared.clone();
+            move || shared.drain_pane("sess-2")
+        });
+
+        // Not a sleep-then-peek: `drain_pane`'s seam call is placed after
+        // it acquires `pane_gate`, so while this test holds the same lock
+        // via `holding`, that call is architecturally unreachable -- any
+        // wait here finding nothing is a guarantee, not a guess about how
+        // long "long enough" is. A bug that skipped the lock entirely
+        // would reach the seam within microseconds, well inside this
+        // bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "drain_pane reached the seam while this test still held its pane lock"
+        );
+        assert_eq!(
+            shared.tasks_snapshot()[0].status,
+            STATUS_QUEUED,
+            "drain_pane must not act on this pane while another delivery path holds its lock"
+        );
+
+        drop(holding);
+        // Now unblocked, drain_pane proceeds to (and past) the seam; this
+        // blocks until it does, no timeout needed since it is now expected.
+        arrived_rx
+            .recv()
+            .expect("drain_pane must reach the seam once the lock is free");
+        draining.join().unwrap();
+
+        assert_eq!(
+            shared.tasks_snapshot()[0].status,
+            "error",
+            "released once the lock is free, same as any other drain"
+        );
+        let journal = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn requeue_if_still_pending_flips_a_matching_pending_task_to_queued() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        let flipped = requeue_if_still_pending(&mut tasks, "t1", "sess-2");
+
+        assert_eq!(flipped.unwrap().status, STATUS_QUEUED);
+        assert_eq!(tasks[0].status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn requeue_if_still_pending_leaves_a_task_alone_once_something_else_already_decided_its_fate() {
+        // The bug this guards against: reassign_task's occupied branch used
+        // to flip a task to queued unconditionally, so a cancel or a Stop
+        // that got there first, while the old code had briefly dropped its
+        // gate, was silently overwritten, resurrecting cancelled work.
+        let mut tasks = vec![task_at("t1", "cancelled", 0)];
+
+        let flipped = requeue_if_still_pending(&mut tasks, "t1", "sess-2");
+
+        assert!(flipped.is_none());
+        assert_eq!(tasks[0].status, "cancelled");
+    }
+
+    #[test]
+    fn requeue_if_still_pending_leaves_a_task_alone_when_the_target_no_longer_matches() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+        tasks[0].target = "sess-9".to_string();
+
+        let flipped = requeue_if_still_pending(&mut tasks, "t1", "sess-2");
+
+        assert!(flipped.is_none());
+        assert_eq!(tasks[0].status, "pending");
+    }
+
+    #[test]
+    fn requeue_if_still_pending_reports_nothing_for_an_unknown_id() {
+        let mut tasks = vec![task_at("t1", "pending", 0)];
+
+        assert!(requeue_if_still_pending(&mut tasks, "missing", "sess-2").is_none());
+    }
+
+    #[test]
+    fn enqueue_within_cap_lets_two_concurrent_callers_race_the_last_free_slot_without_overflowing()
+    {
+        // Confirmed this fails without the fix: with the cap check split
+        // from the push into two separate `self.tasks` lock acquisitions
+        // (this function's previous shape), `mine` reaches the seam within
+        // microseconds of being spawned, since `other`'s check has already
+        // released the lock by the time it pauses -- the `recv_timeout`
+        // assertion below gets a second `arrived` instead of timing out,
+        // and fails immediately. With the check and the push folded into
+        // one `mutate_and_journal` hold, `mine` blocks acquiring
+        // `self.tasks` until `other`'s entire closure, seam included, has
+        // returned, so the timeout always elapses.
+        let (shared, _dir) = shared_for_test();
+        {
+            // An occupying task, so `is_occupied` is true and each racer's
+            // new task lands as `queued` (counted by `queued_ids_for`)
+            // rather than `pending` (which would not be): the cap only
+            // bites a target that is already busy, exactly like a real
+            // dispatch queue.
+            let mut tasks = shared.tasks.lock().unwrap();
+            let mut occupying = task_at("occupant", "pending", 0);
+            occupying.target = "sess-2".to_string();
+            tasks.push(occupying);
+            for i in 0..QUEUE_CAP - 1 {
+                let mut t = task_at(&format!("q{i}"), STATUS_QUEUED, (i + 1) as u64);
+                t.target = "sess-2".to_string();
+                tasks.push(t);
+            }
+        }
+
+        // The hook reports reaching the seam, then pauses there -- still
+        // inside `enqueue_within_cap`'s `mutate_and_journal` closure, so
+        // still holding `self.tasks` -- until this test releases it.
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let proceed_rx = Mutex::new(proceed_rx);
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+            let _ = proceed_rx.lock().unwrap().recv();
+        });
+
+        let other = thread::spawn({
+            let shared = shared.clone();
+            move || {
+                shared.enqueue_within_cap("sess-2", |occupied| {
+                    let mut t = task_at(
+                        "racer-b",
+                        if occupied { STATUS_QUEUED } else { "pending" },
+                        100,
+                    );
+                    t.target = "sess-2".to_string();
+                    t
+                })
+            }
+        });
+        arrived_rx
+            .recv()
+            .expect("other must reach the seam past its own cap check");
+
+        // `other` is now proven paused at the seam, holding `self.tasks`
+        // under the fix. Spawn the second racer now, while it is still
+        // paused -- this is the exact window the finding describes.
+        let mine = thread::spawn({
+            let shared = shared.clone();
+            move || {
+                shared.enqueue_within_cap("sess-2", |occupied| {
+                    let mut t = task_at(
+                        "racer-a",
+                        if occupied { STATUS_QUEUED } else { "pending" },
+                        101,
+                    );
+                    t.target = "sess-2".to_string();
+                    t
+                })
+            }
+        });
+
+        // Sound, not a timing guess: while `other` still holds
+        // `self.tasks`, `mine` cannot possibly reach the seam (it cannot
+        // even start its own closure), so a second `arrived` never
+        // arriving within any bound is a guarantee under the fix. A split
+        // check-then-push would deliver it well inside this bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second caller reached the seam while the first still held the tasks lock \
+             mid check-then-push; the cap and the push are no longer atomic"
+        );
+
+        // Release both: `other` (proven waiting) and `mine` (only if it
+        // also reached the seam, which the assertion above says it should
+        // not have under the fix).
+        let _ = proceed_tx.send(());
+        let _ = proceed_tx.send(());
+        let theirs = other.join().unwrap();
+        let mine = mine.join().unwrap();
+
+        let outcomes = [mine, theirs];
+        let refused = outcomes.iter().filter(|r| r.is_err()).count();
+        let created = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(refused, 1, "exactly one of the two must lose to the cap");
+        assert_eq!(created, 1, "exactly one of the two must be created");
+
+        let final_queued = queued_ids_for(&shared.tasks_snapshot(), "sess-2").len();
+        assert_eq!(
+            final_queued, QUEUE_CAP,
+            "the cap must hold even when two callers raced its last free slot"
+        );
+    }
+
+    #[test]
+    fn enqueue_within_cap_refuses_and_creates_nothing_once_the_target_is_already_at_cap() {
+        let (shared, dir) = shared_for_test();
+        {
+            let mut tasks = shared.tasks.lock().unwrap();
+            for i in 0..QUEUE_CAP {
+                let mut t = task_at(&format!("q{i}"), STATUS_QUEUED, i as u64);
+                t.target = "sess-2".to_string();
+                tasks.push(t);
+            }
+        }
+
+        let refusal = shared
+            .enqueue_within_cap("sess-2", |occupied| {
+                let mut t = task_at("over", if occupied { STATUS_QUEUED } else { "pending" }, 99);
+                t.target = "sess-2".to_string();
+                t
+            })
+            .expect_err("the target is already at QUEUE_CAP");
+
+        assert!(refusal.contains("queue is full"), "{refusal}");
+        assert_eq!(
+            shared.tasks_snapshot().len(),
+            QUEUE_CAP,
+            "nothing was created"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("brain.jsonl")).is_err(),
+            "nothing was journaled either: refusal wrote no file at all"
         );
     }
 }
