@@ -6,7 +6,7 @@
 // the background. In later milestones this grows a TOML registry + git-worktree
 // isolation; here it's the flat, working core.
 
-mod headless;
+pub mod headless;
 mod mcp;
 mod worktree;
 
@@ -47,6 +47,11 @@ struct SessionHandle {
     /// and the session fell back to the shared one. Aborted on teardown; without
     /// this, one listener leaks per session for the life of the app.
     server: Option<mcp::SessionServer>,
+}
+
+struct ActiveHeadless {
+    pane_id: String,
+    tree: Arc<dyn headless::ProcessTree>,
 }
 
 /// Process-monotonic millisecond clock, used to time the gap between a prompt
@@ -253,6 +258,7 @@ fn ready_to_submit(
 #[derive(Default)]
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    headless: Mutex<HashMap<String, ActiveHeadless>>,
     /// Serialize ConPTY openpty+spawn: concurrent spawns can stall a PTY pipe on
     /// Windows, so only one session is created at a time.
     spawn_lock: Mutex<()>,
@@ -338,7 +344,9 @@ impl Drop for SpawnRollback {
 
 impl SessionManager {
     fn kill(&self, id: &str) {
-        if let Some(mut h) = self.sessions.lock().unwrap().remove(id) {
+        let handle = self.sessions.lock().unwrap().remove(id);
+        self.kill_headless_for_pane(id);
+        if let Some(mut h) = handle {
             let _ = h.child.kill();
             release_session(id, h);
         }
@@ -477,17 +485,92 @@ impl SessionManager {
             .map(|handle| handle.launch.clone())
     }
 
+    /// Run one Claude print-mode child with the live pane's cwd, model, MCP
+    /// endpoint, and identity. Dispatch lifecycle and quiet-gate policy remain
+    /// with the caller.
+    pub fn run_headless(
+        &self,
+        id: &str,
+        brief: &str,
+        budget_usd: f64,
+        timeout: Duration,
+    ) -> Result<headless::HeadlessOutcome, headless::HeadlessError> {
+        let (child, cli_session) = {
+            // Hold the session map through registration so pane close cannot
+            // remove the worktree between lookup and child tracking.
+            let sessions = self.sessions.lock().unwrap();
+            let launch = sessions
+                .get(id)
+                .map(|handle| handle.launch.clone())
+                .ok_or_else(|| headless::HeadlessError::SessionNotFound(id.to_string()))?;
+            let child = headless::HeadlessChild::spawn(id, &launch, brief, budget_usd)?;
+            let cli_session = child.cli_session().to_string();
+            self.headless.lock().unwrap().insert(
+                cli_session.clone(),
+                ActiveHeadless {
+                    pane_id: id.to_string(),
+                    tree: child.process_tree(),
+                },
+            );
+            (child, cli_session)
+        };
+        let result = child.wait(timeout);
+        self.headless.lock().unwrap().remove(&cli_session);
+        result
+    }
+
+    fn kill_headless_for_pane(&self, pane_id: &str) {
+        let trees = {
+            let mut active = self.headless.lock().unwrap();
+            let ids = active
+                .iter()
+                .filter(|(_, child)| child.pane_id == pane_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id).map(|child| child.tree))
+                .collect::<Vec<_>>()
+        };
+        terminate_headless_trees(trees);
+    }
+
     /// Kill every session — used on window close so no agent process is orphaned
     /// and no worktree is left behind.
     fn kill_all(&self) {
-        let mut map = self.sessions.lock().unwrap();
-        for (id, mut h) in map.drain() {
+        let handles = self
+            .sessions
+            .lock()
+            .unwrap()
+            .drain()
+            .collect::<Vec<_>>();
+        let trees = self
+            .headless
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, child)| child.tree)
+            .collect();
+        terminate_headless_trees(trees);
+        for (id, mut h) in handles {
             let _ = h.child.kill();
             if let Some(wt) = &h.worktree {
                 report_worktree_cleanup(wt);
             }
             let _ = std::fs::remove_dir_all(session_config_dir(&id));
         }
+    }
+}
+
+fn terminate_headless_trees(trees: Vec<Arc<dyn headless::ProcessTree>>) {
+    if trees.is_empty() {
+        return;
+    }
+    for tree in &trees {
+        let _ = tree.terminate();
+    }
+    thread::sleep(headless::HEADLESS_TERMINATION_GRACE);
+    for tree in &trees {
+        let _ = tree.kill();
     }
 }
 
@@ -1246,6 +1329,7 @@ async fn spawn_session(
     // stranding a directory, a branch, and a port for every session that wasn't
     // closed by hand.
     let handle = state.sessions.lock().unwrap().remove(&session_id);
+    state.kill_headless_for_pane(&session_id);
     if let Some(h) = handle {
         release_session(&session_id, h);
     } else {
@@ -1449,7 +1533,7 @@ fn human_dispatch(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1498,8 +1582,13 @@ pub fn run() {
                 window.state::<Arc<SessionManager>>().kill_all();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            app.state::<Arc<SessionManager>>().kill_all();
+        }
+    });
 }
 
 #[cfg(test)]

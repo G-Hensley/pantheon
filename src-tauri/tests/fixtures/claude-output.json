@@ -1,0 +1,17 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 1842,
+  "duration_api_ms": 1301,
+  "num_turns": 3,
+  "result": "Implemented and verified the change.",
+  "session_id": "4f1ea546-80af-4fad-a3c9-9fc94892561e",
+  "total_cost_usd": 0.037,
+  "usage": {
+    "input_tokens": 412,
+    "cache_creation_input_tokens": 203,
+    "cache_read_input_tokens": 1100,
+    "output_tokens": 287
+  }
+}
