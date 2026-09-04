@@ -1,0 +1,80 @@
+name: Skill efficacy finding
+description: Evidence that a skill or subagent should change, drawn from how humans responded to its output.
+title: "<skill or subagent>: <what it got wrong>"
+labels: ["skill-efficacy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        File this when a pattern has appeared across several pull requests, not
+        after a single one. A finding filed per pull request trains the reader to
+        rubber-stamp it, and the review gate stops meaning anything.
+
+  - type: input
+    id: subject
+    attributes:
+      label: Skill or subagent
+      description: The exact catalog name, as it appears in the provenance block.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: >-
+        A closed set, deliberately. A category that accepts anything cannot be
+        scored against an evaluation set (SPEC section 12.1 constraint 1).
+        Propose an addition in a separate issue rather than stretching one of
+        these.
+      options:
+        - over-triggering
+        - under-triggering
+        - missing-guidance
+        - stale-guidance
+        - unenforceable-boundary
+        - wrong-routing
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >-
+        The pull requests where this was observed, with head SHAs. Two is thin,
+        three or more is a pattern.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_vs_accepted
+    attributes:
+      label: What the tooling proposed, and what the human did instead
+      description: >-
+        The comparison is the finding. State what the skill produced, what was
+        actually merged, and the reason given for the difference. A reason is
+        what makes this actionable: "wrong" is not usable, "our convention for
+        this kind of global is different, and here it is" is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_edit
+    attributes:
+      label: Proposed edit
+      description: >-
+        One small, focused change to the skill. If it cannot be stated as a small
+        edit, the finding is not yet understood well enough to file.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This is a defect in the tooling, not in the code the tooling reviewed.
+          required: true
+        - label: The provenance block confirms this skill or subagent actually ran.
+          required: true

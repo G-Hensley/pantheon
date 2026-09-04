@@ -108,8 +108,8 @@ WebKitGTK development packages on Linux. See
    to put them in the same brain.
 4. **⌁ on a pane** promotes it to conductor. Dispatched tasks are typed into
    the target's visible terminal, so you see every instruction. **Stop** halts
-   all dispatch immediately. **Tasks** (or **Ctrl+Shift+T**) opens every task —
-   pending, overdue, in review, rework, or blocked on your answer — without
+   all dispatch immediately. **Tasks** (or **Ctrl+Shift+T**) opens every task
+   (pending, overdue, in review, rework, or blocked on your answer) without
    truncating any of them, plus a bounded recent-history tail; picking one
    focuses its pane.
 5. **Layout: scroll** keeps every terminal at a comfortable minimum height and

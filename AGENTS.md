@@ -30,7 +30,8 @@ broken, so fix the symlink rather than copying the rules back in.
   measured, which hypotheses were refuted, and what was tried and did not work.
   That is the part worth keeping, and it is why it stays prose.
 
-Build with `pnpm`. `dev.cmd` and `build.cmd` wrap the usual commands.
+Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
+`build.sh` on Linux, wrap the usual commands.
 
 ## Tasks
 

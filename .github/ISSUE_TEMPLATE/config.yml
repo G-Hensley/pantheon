@@ -1,0 +1,15 @@
+# Blank issues stay enabled on purpose. A form that cannot express the thing in
+# front of you should not be a reason to file nothing, and a blank issue is a
+# signal that a form is missing or too narrow.
+blank_issues_enabled: true
+
+# Vulnerabilities do not go in the issue tracker. On a public repository an issue
+# is a disclosure, and on a private one it still produces no advisory record and
+# leaks if the repository is ever made public.
+#
+# Substitute G-Hensley/pantheon when distributing this file. It is the one file here that
+# cannot be repository-agnostic.
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/G-Hensley/pantheon/security/advisories/new
+    about: Vulnerabilities go to a security advisory, never to a public issue.
