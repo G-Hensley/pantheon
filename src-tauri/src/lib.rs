@@ -16,7 +16,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -259,6 +259,10 @@ fn ready_to_submit(
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     headless: Mutex<HashMap<String, ActiveHeadless>>,
+    /// Only the first window-close request starts graceful cleanup. Later close
+    /// events wait for that cleanup's exit callback instead of starting an empty
+    /// second pass that could exit the app before the first pass kills its trees.
+    shutting_down: AtomicBool,
     /// Serialize ConPTY openpty+spawn: concurrent spawns can stall a PTY pipe on
     /// Windows, so only one session is created at a time.
     spawn_lock: Mutex<()>,
@@ -531,12 +535,48 @@ impl SessionManager {
                 .filter_map(|id| active.remove(&id).map(|child| child.tree))
                 .collect::<Vec<_>>()
         };
-        terminate_headless_trees(trees);
+        terminate_headless_trees(trees, headless::HEADLESS_TERMINATION_GRACE);
     }
 
-    /// Kill every session — used on window close so no agent process is orphaned
-    /// and no worktree is left behind.
-    fn kill_all(&self) {
+    /// Start graceful cleanup away from the event-loop thread. Returns the one
+    /// cleanup thread to the caller so it can exit the app only after the final
+    /// kill pass finishes. A repeated close request returns `None`; the first
+    /// request's thread and exit callback remain authoritative.
+    fn kill_all(&self) -> Option<thread::JoinHandle<()>> {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let mut handles = self.sessions.lock().unwrap().drain().collect::<Vec<_>>();
+        let trees = self
+            .headless
+            .lock()
+            .unwrap()
+            .values()
+            .map(|child| child.tree.clone())
+            .collect::<Vec<_>>();
+        // These calls are non-blocking syscalls. Send both kinds of child their
+        // first shutdown signal before returning, so even an unusually prompt OS
+        // exit does not depend on the cleanup thread having been scheduled yet.
+        for tree in &trees {
+            let _ = tree.terminate();
+        }
+        for (_, handle) in &mut handles {
+            let _ = handle.child.kill();
+        }
+        Some(thread::spawn(move || {
+            thread::sleep(headless::HEADLESS_CLOSE_GRACE);
+            for tree in trees {
+                let _ = tree.kill();
+            }
+            kill_session_handles(handles);
+        }))
+    }
+
+    /// App exit cannot wait for a grace period: kill every retained process tree
+    /// immediately. The Windows Job Object's kill-on-close setting remains the
+    /// final backstop if the process exits before this callback completes.
+    fn kill_all_immediate(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         let handles = self.sessions.lock().unwrap().drain().collect::<Vec<_>>();
         let trees = self
             .headless
@@ -544,26 +584,29 @@ impl SessionManager {
             .unwrap()
             .drain()
             .map(|(_, child)| child.tree)
-            .collect();
-        terminate_headless_trees(trees);
-        for (id, mut h) in handles {
-            let _ = h.child.kill();
-            if let Some(wt) = &h.worktree {
-                report_worktree_cleanup(wt);
-            }
-            let _ = std::fs::remove_dir_all(session_config_dir(&id));
+            .collect::<Vec<_>>();
+        for tree in trees {
+            let _ = tree.kill();
         }
+        kill_session_handles(handles);
     }
 }
 
-fn terminate_headless_trees(trees: Vec<Arc<dyn headless::ProcessTree>>) {
+fn kill_session_handles(handles: Vec<(String, SessionHandle)>) {
+    for (id, mut handle) in handles {
+        let _ = handle.child.kill();
+        release_session(&id, handle);
+    }
+}
+
+fn terminate_headless_trees(trees: Vec<Arc<dyn headless::ProcessTree>>, grace: Duration) {
     if trees.is_empty() {
         return;
     }
     for tree in &trees {
         let _ = tree.terminate();
     }
-    thread::sleep(headless::HEADLESS_TERMINATION_GRACE);
+    thread::sleep(grace);
     for tree in &trees {
         let _ = tree.kill();
     }
@@ -769,6 +812,9 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// observer the token exists to stop.
 const CODEX_TOKEN_ENV: &str = "PANTHEON_MCP_TOKEN";
 
+/// Write a token-bearing session config. Unix permissions are forced to 0600.
+/// Windows still uses the containing directory's default ACL; explicit ACL
+/// hardening is pending operator policy and is not implemented here.
 fn write_private_file(path: &Path, body: &str) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -1567,15 +1613,23 @@ pub fn run() {
             human_dispatch
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                window.state::<Arc<SessionManager>>().kill_all();
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let manager = window.state::<Arc<SessionManager>>().inner().clone();
+                if let Some(cleanup) = manager.kill_all() {
+                    let app = window.app_handle().clone();
+                    thread::spawn(move || {
+                        let _ = cleanup.join();
+                        app.exit(0);
+                    });
+                }
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            app.state::<Arc<SessionManager>>().kill_all();
+            app.state::<Arc<SessionManager>>().kill_all_immediate();
         }
     });
 }
@@ -1586,11 +1640,52 @@ mod tests {
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_paid_openrouter_model,
         migrate_legacy_dir, ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
-        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
-        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
-        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        validate_human_dispatch, worktree, ActiveHeadless, IsolationReason, SessionManager,
+        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
+        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_all_returns_quickly_then_kills_an_active_headless_tree() {
+        let manager = SessionManager::default();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 60 & sleep 60"]);
+        let mut process = crate::headless::spawn_process_tree(&mut command).unwrap();
+        let process_group = process.child.id() as libc::pid_t;
+        manager.headless.lock().unwrap().insert(
+            "shutdown-test".to_string(),
+            ActiveHeadless {
+                pane_id: "sess-test".to_string(),
+                tree: process.tree.clone(),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let cleanup = manager.kill_all().expect("first close starts cleanup");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "kill_all blocked the caller for {:?}",
+            started.elapsed()
+        );
+        cleanup.join().unwrap();
+        process.child.wait().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process group {process_group} survived app cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn legacy_data_directory_moves_to_the_pantheon_identity() {

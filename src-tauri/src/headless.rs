@@ -14,6 +14,9 @@ use uuid::Uuid;
 /// headless child in the same checkout.
 pub const HEADLESS_QUIET_MS: u64 = 30_000;
 pub const HEADLESS_TERMINATION_GRACE: Duration = Duration::from_secs(10);
+/// Interactive close remains responsive and completes cleanup promptly. Normal
+/// task timeouts retain the longer grace above, where no UI callback is waiting.
+pub(crate) const HEADLESS_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const STDERR_RING_BYTES: usize = 2 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
