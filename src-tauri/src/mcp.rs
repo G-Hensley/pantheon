@@ -526,12 +526,32 @@ impl Shared {
     }
 
     /// Re-point storage (the user picked a different project) and rehydrate it.
+    ///
+    /// A live pane's identity must survive the switch. `set_project` restores
+    /// panes and records their real kind (`note_session`) before the frontend
+    /// calls this, so the sessions held in memory at this instant are correct
+    /// for whichever panes are actually running; the new dir's own journal may
+    /// still say whatever it last recorded for those names. `merge_live_identity`
+    /// keeps this call's in-memory truth for every name that is live and lets
+    /// the journal stand for everything else, so a pane spawned into the old
+    /// dir does not read back the previous project's CLI once the new one
+    /// loads. See `merge_live_identity` for the rule itself and why it is a
+    /// pure helper rather than inline here.
     pub fn set_dir(&self, dir: PathBuf) {
         let brain = load_brain(&dir);
-        *self.dir.lock().unwrap() = dir;
+        let live = self.live_ids();
+        let (sessions, changed) =
+            merge_live_identity(&self.sessions_snapshot(), &brain.sessions, &live);
+        *self.dir.lock().unwrap() = dir.clone();
         *self.entries.lock().unwrap() = brain.entries;
-        *self.sessions.lock().unwrap() = brain.sessions;
+        *self.sessions.lock().unwrap() = sessions;
         *self.tasks.lock().unwrap() = brain.tasks;
+        // Same semantics as `note_session`: append one record per session that
+        // actually changed, to the dir just loaded, so the correction is not
+        // lost the next time this project's journal is read.
+        for session in &changed {
+            let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
+        }
         self.app.emit("context-changed");
         self.app.emit("conductor-changed");
     }
@@ -1268,6 +1288,56 @@ impl Shared {
         };
         Ok((result, delivered))
     }
+}
+
+/// Carry a live pane's kind/model forward across a `set_dir` switch, letting
+/// only a genuinely dead name fall back to whatever the new journal says.
+///
+/// `old` is the sessions held in memory right before the switch; `new` is
+/// what `load_brain` just read from the dir being switched to. For every
+/// name in `live`, `old` wins: it reflects `note_session` or
+/// `set_session_identity` calls the app already made for the pane that is
+/// actually running, while `new` may be stale (a different project's
+/// journal, or this project's own journal from before the pane's current
+/// CLI connected). A name not in `live` is left entirely to `new`, since
+/// nothing contradicts the journal for a pane that is not there to be wrong
+/// about.
+///
+/// Returns the merged roster plus exactly the entries that differ from
+/// `new`, so the caller can persist only those, the same "refresh when
+/// different" rule `note_session` already applies. Pure (no lock, no I/O),
+/// so the merge itself is testable without a live `Shared` or a running
+/// pane, which the test fixture's engine cannot provide (it reports nothing
+/// live).
+fn merge_live_identity(
+    old: &[AgentSession],
+    new: &[AgentSession],
+    live: &[String],
+) -> (Vec<AgentSession>, Vec<AgentSession>) {
+    let mut merged = new.to_vec();
+    let mut changed = Vec::new();
+    for prior in old {
+        if !live.iter().any(|id| id == &prior.name) {
+            continue;
+        }
+        match merged.iter_mut().find(|s| s.name == prior.name) {
+            Some(existing) => {
+                if existing.kind != prior.kind || existing.model != prior.model {
+                    existing.kind = prior.kind.clone();
+                    existing.model = prior.model.clone();
+                    changed.push(existing.clone());
+                }
+            }
+            // Live per the engine, but the new journal has never heard of it
+            // (a brand-new project). Carry the in-memory record forward
+            // rather than dropping a pane the roster already knows.
+            None => {
+                merged.push(prior.clone());
+                changed.push(prior.clone());
+            }
+        }
+    }
+    (merged, changed)
 }
 
 /// Age a single task in place: still-pending past the threshold becomes
@@ -3274,13 +3344,14 @@ mod tests {
         bearer_matches, blocked_wait_should_release, busy_label, cancel_pending, choose_reviewer,
         conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending, human_ms,
         injection_overage, is_open, is_terminal, load_brain, mark_pending_error,
-        mint_session_token, open_question, open_task_for_target, oversize_refusal, parse_task_ids,
-        reassign_pending, render_open_task_summaries, render_task, render_task_summary,
-        review_pending, reviewing_label, select_tasks, status_tag, still_open, task_for_dispatcher,
-        validate_path_component, wait_timeout, AgentSession, AskError, CancelOutcome, Entry,
-        Exchange, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
-        MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED, STATUS_BLOCKED,
-        TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
+        merge_live_identity, mint_session_token, open_question, open_task_for_target,
+        oversize_refusal, parse_task_ids, reassign_pending, render_open_task_summaries,
+        render_task, render_task_summary, review_pending, reviewing_label, select_tasks,
+        status_tag, still_open, task_for_dispatcher, validate_path_component, wait_timeout,
+        AgentSession, AskError, CancelOutcome, Entry, Exchange, Notifier, ReassignError, Shared,
+        StoreRecord, Task, TaskAccessError, MAX_QUESTIONS_PER_TASK, RECENT_FINISHED, REVIEW_WAIVED,
+        STATUS_ABANDONED, STATUS_BLOCKED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS,
+        WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5972,6 +6043,88 @@ mod tests {
         // grown is the cheapest way to see a silent extra write.
         let contents = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
         assert_eq!(contents.lines().count(), 1);
+    }
+
+    // ---- merge_live_identity: a pane's identity survives a set_dir switch ----
+    //
+    // Measured 2026-09-03 on the Phase 1 build: `set_dir` replaced `sessions`
+    // wholesale with the new journal's list, so a pane spawned before the
+    // switch (correct kind, in memory) went back to reading whatever the new
+    // journal last said about that name. Two panes spawned after the switch
+    // were fine, which is what pointed at `set_dir` rather than spawn itself.
+
+    fn agent(name: &str, kind: &str) -> AgentSession {
+        AgentSession {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            model: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_live_panes_identity_wins_over_the_new_journal() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "codex")];
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(
+            merged[0].kind, "claude",
+            "the live pane's real kind was dropped"
+        );
+        assert_eq!(
+            changed.len(),
+            1,
+            "the correction must be recorded to the new dir"
+        );
+        assert_eq!(changed[0].kind, "claude");
+    }
+
+    #[test]
+    fn a_dead_panes_identity_follows_the_journal() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "codex")];
+        let live: Vec<String> = Vec::new();
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(
+            merged[0].kind, "codex",
+            "a pane that is not live has nothing in memory to trust over the journal"
+        );
+        assert!(
+            changed.is_empty(),
+            "nothing changed, so nothing should be recorded"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_identity_records_nothing() {
+        let old = vec![agent("sess-1", "claude")];
+        let new = vec![agent("sess-1", "claude")];
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(merged[0].kind, "claude");
+        assert!(
+            changed.is_empty(),
+            "old and new already agree; appending a record would be a no-op write"
+        );
+    }
+
+    #[test]
+    fn a_live_pane_missing_from_a_brand_new_journal_is_carried_forward() {
+        let old = vec![agent("sess-1", "claude")];
+        let new: Vec<AgentSession> = Vec::new();
+        let live = vec!["sess-1".to_string()];
+
+        let (merged, changed) = merge_live_identity(&old, &new, &live);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].kind, "claude");
+        assert_eq!(changed.len(), 1);
     }
 
     // ---- Shared::cancel_tasks / Shared::reassign_task ----
