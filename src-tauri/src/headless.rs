@@ -822,10 +822,17 @@ mod tests {
             token: "secret".to_string(),
         });
         let command = build_claude_command(&spec, "cli-session", 1.25);
-        let args = command
+        let mut args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        // On Windows the program runs through `cmd.exe /c <program>`, so the
+        // headless arguments begin after those two.
+        #[cfg(windows)]
+        {
+            let wrapper = args.drain(..2).collect::<Vec<_>>();
+            assert_eq!(wrapper, ["/c", "claude"]);
+        }
 
         assert_eq!(
             args,
