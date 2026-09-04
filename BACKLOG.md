@@ -387,8 +387,9 @@ Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
 tool list under "How agents connect" in `README.md`. One caveat, measured
 2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
 transport with "The operation timed out" while 45 s returns, so the 600 s
-default is not usable from that host; tracked in the repair plan at
-`~/Projects/docs/plans/2026-09-03-pantheon-repair.md`.
+default is not usable from that host; tracked in the repair plan,
+`docs/plans/2026-09-03-pantheon-repair.md` in the private `G-Hensley/projects`
+repository (the parent tree this project is developed in).
 
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
