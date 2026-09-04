@@ -4,7 +4,7 @@
 // tool handlers touch app state directly (same process), and each write emits a
 // `context-changed` event so the sidebar updates live.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -605,6 +605,16 @@ pub struct Shared {
     engine: Arc<crate::SessionManager>,
     /// Which agent (if any) is the conductor. Set by the app, never self-claimed.
     conductor: Mutex<Option<String>>,
+    /// Panes whose MCP endpoint has actually received a request since their
+    /// most recent spawn: the CLI is up, reading its terminal, and this is
+    /// not merely a live PTY that could still be mid-boot. `note_session`
+    /// runs before the PTY and its engine handle even exist, and a live
+    /// process still starting up cannot receive typed input either, so
+    /// neither is proof a pane can be delivered to; a connection is.
+    /// `drain_pane` refuses to attempt anything against a pane not in this
+    /// set. Cleared on respawn (`note_session`) so a stale connection from a
+    /// prior incarnation of the same pane id cannot mark the new one ready.
+    connected: Mutex<HashSet<String>>,
     /// Global kill-switch for all dispatch.
     halted: Mutex<bool>,
     tasks: Mutex<Vec<Task>>,
@@ -657,12 +667,15 @@ impl Shared {
         self.app.emit("context-changed");
         self.app.emit("conductor-changed");
         // The tasks just loaded may hold a queued brief on a pane that is
-        // live right now, or an undelivered review request or rework notice
-        // for one, left over from before the app restarted. Nothing else
-        // sweeps for that, so this is the moment to: every task list this
-        // project could have had before is gone, replaced by `brain.tasks`
-        // above, and `live` already reflects who is actually here.
-        for id in &live {
+        // already connected, or an undelivered review request or rework
+        // notice for one, left over from before the project switched.
+        // Nothing else sweeps for that, so this is the moment to. Swept by
+        // `connected`, not `live`: a live pane can still be mid-boot with no
+        // engine handle yet, which `drain_pane` would refuse anyway (see
+        // `is_connected`), so sweeping `live` here would mostly cost a
+        // lock-and-no-op per pane for no benefit.
+        let connected: Vec<String> = self.connected.lock().unwrap().iter().cloned().collect();
+        for id in &connected {
             self.drain_pane(id);
         }
     }
@@ -732,6 +745,13 @@ impl Shared {
     /// model can change on a relaunch with a different flag; a roster line
     /// that still named the old CLI or model was actively misleading a
     /// conductor about what it was dispatching to.
+    ///
+    /// Called at MCP-wiring time in `spawn_session`, before the PTY and its
+    /// engine handle exist. An earlier version drained the pane from here;
+    /// that meant every restart errored each restored pane's queue at spawn
+    /// time, against a handle the engine did not have yet. This clears
+    /// `connected` instead: whatever readiness the last incarnation of this
+    /// pane earned is stale the moment a fresh one is about to start.
     pub fn note_session(&self, name: &str, kind: &str, model: &str) {
         let to_persist = {
             let mut s = self.sessions.lock().unwrap();
@@ -764,12 +784,13 @@ impl Shared {
             let _ = append_record(&dir, &StoreRecord::Session(session));
             self.app.emit("context-changed");
         }
-        // This is the moment the pane is known to be there and reading its
-        // terminal, identity changed or not: a restart or reconnect is
-        // exactly when a queued brief or an undelivered notice from before
-        // the pane went away needs to reach it, and nothing else runs on a
-        // timer to pick that up later.
-        self.drain_pane(name);
+        // This runs before the PTY and its engine handle exist (see
+        // spawn_session), so it is not proof the pane can be delivered to:
+        // it is the opposite, a fresh incarnation about to start that must
+        // not inherit whatever connected status the last one earned.
+        // `mark_connected` is what actually notices the pane is back and
+        // drains it, once its MCP endpoint hears from it again.
+        self.connected.lock().unwrap().remove(name);
     }
 
     // ---- conductor ----
@@ -1557,6 +1578,16 @@ impl Shared {
         if self.is_halted() {
             return;
         }
+        // A pane that has not connected since its most recent spawn has no
+        // engine handle yet, or has one but the CLI has not finished
+        // booting and would lose the bytes either way. Neither is a failed
+        // delivery: there was no delivery to fail, so nothing here may
+        // become `error` or count a notice as attempted. Leave it queued
+        // (or undelivered) for the next trigger, which fires once the pane
+        // actually connects; see `mark_connected`.
+        if !self.is_connected(pane) {
+            return;
+        }
         let candidate = {
             let tasks = self.tasks.lock().unwrap();
             next_delivery_for(&tasks, pane).cloned()
@@ -1597,6 +1628,25 @@ impl Shared {
         });
         drop(delivery_gate);
         self.app.emit("conductor-changed");
+    }
+
+    /// Whether `pane` has connected to its MCP endpoint since its most
+    /// recent spawn. See the `connected` field doc for why this, and not
+    /// liveness or a recorded identity, is what gates `drain_pane`.
+    fn is_connected(&self, pane: &str) -> bool {
+        self.connected.lock().unwrap().contains(pane)
+    }
+
+    /// Record that a pane's MCP endpoint just received a request from it,
+    /// and drain whatever was waiting on that. Call this from the actual
+    /// connection points: the dedicated endpoint's per-session handler
+    /// factory (one call per new session on that port) and
+    /// `set_session_identity` on the shared endpoint. Not from
+    /// `note_session`, which runs at spawn time before the PTY or its
+    /// engine handle exist and is not evidence of anything reachable.
+    pub fn mark_connected(&self, pane: &str) {
+        self.connected.lock().unwrap().insert(pane.to_string());
+        self.drain_pane(pane);
     }
 }
 
@@ -2967,12 +3017,12 @@ impl BrainHandler {
             }
         }
         self.shared.app.emit("context-changed");
-        // The shared-endpoint counterpart to note_session's drain on the
-        // dedicated-endpoint path: this call is how a session on the shared
-        // MCP endpoint tells Pantheon it is here and reading its terminal,
-        // which is exactly when a queued brief or an undelivered notice from
-        // before a restart or reconnect needs to reach it.
-        self.shared.drain_pane(&p.name);
+        // The shared-endpoint counterpart to the dedicated endpoint's
+        // per-session handler factory: this call is itself the connection,
+        // proof the session is here and reading its terminal, which is
+        // exactly when a queued brief or an undelivered notice from before
+        // a restart or reconnect needs to reach it. See `mark_connected`.
+        self.shared.mark_connected(&p.name);
         format!(
             "Identity set to '{}' in brain '{}'",
             p.name,
@@ -3743,7 +3793,13 @@ pub fn start_session_server(
             Err(_) => return,
         };
         let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
+            move || {
+                // This factory runs once per new MCP session on this port,
+                // which for a dedicated endpoint is the actual proof the CLI
+                // is up and reading its terminal; see `mark_connected`.
+                shared.mark_connected(&session_id);
+                Ok(BrainHandler::bound_to(shared.clone(), session_id.clone()))
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
@@ -3789,6 +3845,7 @@ pub fn start(
         name_to_room: Mutex::new(HashMap::new()),
         engine,
         conductor: Mutex::new(None),
+        connected: Mutex::new(HashSet::new()),
         halted: Mutex::new(false),
         tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
@@ -3837,7 +3894,7 @@ mod tests {
         STATUS_ABANDONED, STATUS_BLOCKED, STATUS_QUEUED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
         WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
@@ -4146,6 +4203,7 @@ mod tests {
             name_to_room: Mutex::new(HashMap::new()),
             engine: Arc::new(crate::SessionManager::default()),
             conductor: Mutex::new(Some("sess-1".to_string())),
+            connected: Mutex::new(HashSet::new()),
             halted: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             dispatches: Mutex::new(0),
@@ -6632,13 +6690,13 @@ mod tests {
     }
 
     #[test]
-    fn note_session_drains_the_pane_it_just_recorded() {
-        // A restart or reconnect is exactly when a queued brief left over
-        // from before the pane went away needs to reach it, and nothing else
-        // runs on a timer to pick that up. shared_for_test's engine still
-        // reports nothing live, so the observable proof is the same one the
-        // other drain_pane trigger tests use: a queued task on this pane
-        // flips to error on the attempted, failed delivery.
+    fn note_session_does_not_drain_a_pane_that_has_not_connected_yet() {
+        // note_session runs at MCP-wiring time in spawn_session, before the
+        // PTY or its engine handle exist. An earlier version drained from
+        // here, which meant a restart errored every restored pane's queue
+        // at spawn time, against a handle the engine did not have yet: a
+        // failed attempt that was never actually attempted. A queued task
+        // must survive this call untouched.
         let (shared, _dir) = shared_for_test();
         shared
             .tasks
@@ -6648,24 +6706,68 @@ mod tests {
 
         shared.note_session("sess-2", "claude", "sonnet");
 
-        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
     }
 
     #[test]
-    fn note_session_drains_even_when_the_identity_itself_is_unchanged() {
-        // The bug this guards against: an early return on the no-change path
-        // would skip the drain on every reconnect after the first, since a
-        // pane's identity is usually the same CLI and model it was before.
+    fn note_session_clears_connected_so_a_respawned_pane_must_reconnect() {
+        // The readiness flag resets on respawn: a pane already marked
+        // connected must go back to not-connected the moment note_session
+        // says a fresh incarnation is starting, so a stale connection from
+        // the last one cannot make the new one look ready before it is.
         let (shared, _dir) = shared_for_test();
+        shared.mark_connected("sess-2");
+        assert!(shared.is_connected("sess-2"), "sanity: it was connected");
+
         shared.note_session("sess-2", "claude", "sonnet");
+
+        assert!(!shared.is_connected("sess-2"));
+    }
+
+    #[test]
+    fn drain_pane_refuses_to_attempt_against_a_pane_that_has_never_connected() {
+        // Isolates the gate itself, independent of any trigger: even a
+        // direct drain_pane call must not touch a queued task ahead of a
+        // connection, which is the property the two note_session tests
+        // above and mark_connected's own test below all rest on.
+        let (shared, _dir) = shared_for_test();
         shared
             .tasks
             .lock()
             .unwrap()
             .push(task_at("t1", STATUS_QUEUED, 0));
 
-        shared.note_session("sess-2", "claude", "sonnet");
+        shared.drain_pane("sess-2");
 
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
+    }
+
+    #[test]
+    fn mark_connected_is_what_actually_drains_a_pane() {
+        // The other half of the note_session fix: delivery is not gone,
+        // just moved to the moment a pane's MCP endpoint actually hears
+        // from it. shared_for_test's engine still reports nothing live, so
+        // the observable proof is the one the other drain-trigger tests
+        // use: a queued task flips to error on the attempted, failed
+        // delivery.
+        //
+        // What this does not, and cannot, show: the real wiring in
+        // start_session_server (the per-session handler factory) and the
+        // shared endpoint's set_session_identity are what actually call
+        // mark_connected in the running app; neither runs a live HTTP
+        // client against this fixture, so only mark_connected itself is
+        // exercised here, directly, standing in for both.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        assert!(!shared.is_connected("sess-2"), "sanity: not connected yet");
+
+        shared.mark_connected("sess-2");
+
+        assert!(shared.is_connected("sess-2"));
         assert_eq!(shared.tasks_snapshot()[0].status, "error");
     }
 
@@ -6688,11 +6790,35 @@ mod tests {
         assert_eq!(shared.tasks_snapshot()[0].status, "error");
     }
 
-    // set_dir's live-pane drain sweep has no equivalent test: it iterates
-    // live_ids(), which shared_for_test's engine always reports empty, so
-    // the sweep has nothing to drive in this fixture. Its per-pane behavior
-    // is drain_pane, already covered above and by the trigger tests
-    // elsewhere in this module; only the sweep's own iteration is untested.
+    #[test]
+    fn set_dir_sweeps_every_connected_pane_not_bare_liveness() {
+        // Switched from live_ids() to `connected` specifically so this
+        // would stop being untestable: shared_for_test's engine always
+        // reports nothing live, but `connected` is ordinary state this
+        // fixture can drive directly, so the sweep itself is now exercised
+        // here rather than only trusted by inspection. The queued task has
+        // to live in the *new* dir's journal, because set_dir replaces
+        // `tasks` wholesale with whatever that journal holds; it is
+        // `connected` (in-memory, carried across the switch) that this
+        // test is proving actually gets swept.
+        let (shared, _old_dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+
+        let new_dir = tempfile::tempdir().expect("tempdir");
+        append_record(
+            new_dir.path(),
+            &StoreRecord::Task(task_at("t1", STATUS_QUEUED, 0)),
+        )
+        .unwrap();
+
+        shared.set_dir(new_dir.path().to_path_buf());
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
 
     // ---- merge_live_identity: a pane's identity survives a set_dir switch ----
     //
@@ -7278,6 +7404,11 @@ mod tests {
     #[test]
     fn cancelling_a_task_drains_its_targets_queue() {
         let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
         let mut occupying = task_at("t1", "pending", 0);
         occupying.target = "sess-2".into();
         let mut queued = task_at("t2", STATUS_QUEUED, 1);
@@ -7302,6 +7433,11 @@ mod tests {
         // test covers: a notice goes out before anything already queued
         // behind it. t2 must stay put rather than jump the notice.
         let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
         let mut work = task_at("t1", "pending", 0);
         work.target = "sess-2".into();
         work.reviewer = "sess-3".into();
@@ -7328,6 +7464,11 @@ mod tests {
     #[test]
     fn approving_a_review_drains_the_reviewers_own_queue() {
         let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
         let mut in_review = task_at("t1", "in_review", 0);
         in_review.reviewer = "sess-3".into();
         let mut queued_for_reviewer = task_at("t2", STATUS_QUEUED, 1);
@@ -7355,6 +7496,16 @@ mod tests {
         // undelivered rework notice, so its queue (t2) must wait behind it,
         // the same priority next_delivery_for enforces on its own.
         let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-3".to_string());
         let mut in_review = task_at("t1", "in_review", 0);
         in_review.target = "sess-2".into();
         in_review.reviewer = "sess-3".into();
@@ -7396,6 +7547,11 @@ mod tests {
         // What this test isolates is drain_pane's own halted check.
         let (shared, _dir) = shared_for_test();
         shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+        shared
             .tasks
             .lock()
             .unwrap()
@@ -7421,6 +7577,11 @@ mod tests {
         // it: once cleared, the same call that was a no-op above attempts
         // delivery again.
         let (shared, _dir) = shared_for_test();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
         shared
             .tasks
             .lock()
