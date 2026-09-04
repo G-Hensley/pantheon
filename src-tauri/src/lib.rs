@@ -170,6 +170,15 @@ fn is_codex(program: &str) -> bool {
     p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
 }
 
+/// Whether `program` is the opencode CLI, normalised the same way as
+/// `is_codex`: case-folded and stripped of a Windows `.exe` or `.cmd` suffix.
+/// The free-model guard keys on this, so a differently spelled program name
+/// must not slip past it.
+fn is_opencode(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    p.trim_end_matches(".exe").trim_end_matches(".cmd") == "opencode"
+}
+
 /// Whether a model id is a paid OpenRouter model that must be refused for opencode.
 ///
 /// OpenRouter free-tier models have ids ending in `:free`, or exactly
@@ -1045,7 +1054,7 @@ async fn spawn_session(
     // Free-model guard for opencode: an explicit model is required, and only
     // free-tier openrouter/* ids or local providers (ollama, lmstudio, etc.)
     // pass. See `opencode_model_guard` for why a missing model is refused.
-    if program == "opencode" {
+    if is_opencode(&program) {
         if let Err(reason) = opencode_model_guard(model.as_deref()) {
             return Err(SpawnError::failed(reason));
         }
@@ -1491,7 +1500,7 @@ pub fn run() {
 mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
-        delivery_allowance_ms, is_agent_cli, is_codex, is_paid_openrouter_model,
+        delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
         migrate_legacy_dir, opencode_model_guard, ready_to_submit, resolve_isolation,
         submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, IsolationReason,
         SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
@@ -2105,6 +2114,19 @@ mod tests {
         assert!(!is_codex("claude"));
         assert!(!is_codex("opencode"));
         assert!(!is_codex("powershell.exe"));
+    }
+
+    #[test]
+    fn is_opencode_normalizes_case_and_windows_suffixes() {
+        // The free-model guard keys on this, so every spelling a PATH lookup or
+        // a custom command could produce has to be recognised.
+        assert!(is_opencode("opencode"));
+        assert!(is_opencode("OpenCode"));
+        assert!(is_opencode("opencode.cmd"));
+        assert!(is_opencode("OPENCODE.EXE"));
+        assert!(!is_opencode("opencode-cli"));
+        assert!(!is_opencode("codex"));
+        assert!(!is_opencode("claude"));
     }
 
     #[test]
