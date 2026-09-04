@@ -640,7 +640,10 @@ impl Shared {
                     .find(|a| &a.name == id)
                     .map(|a| a.model.as_str())
                     .unwrap_or("model unknown");
-                format!("- {id} ({kind}, {model_display}) brain={room}{role}{}", busy_label(busy))
+                format!(
+                    "- {id} ({kind}, {model_display}) brain={room}{role}{}",
+                    busy_label(busy)
+                )
             })
             .collect()
     }
