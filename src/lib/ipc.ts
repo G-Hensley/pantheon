@@ -19,6 +19,10 @@ export type SessionType = {
   args: string[];
   color: string;
   modelFlag?: string;
+  // The launcher refuses to start this CLI without a model. Set where the CLI
+  // would otherwise fall back to a model the backend's free-model guard cannot
+  // see (opencode: its config, then its last-used model).
+  modelRequired?: boolean;
 };
 
 // Which plain shell the Shell pane launches. The webview user agent is the only
@@ -38,7 +42,7 @@ export const SESSION_TYPES: SessionType[] = [
     : { id: "shell", label: "Shell", program: "bash", args: [], color: "#7dcfff" },
   { id: "claude", label: "Claude Code", program: "claude", args: [], color: "#e0af68", modelFlag: "--model" },
   { id: "codex", label: "Codex", program: "codex", args: [], color: "#bb9af7", modelFlag: "-m" },
-  { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a", modelFlag: "-m" },
+  { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a", modelFlag: "-m", modelRequired: true },
 ];
 
 // The git worktree an isolated session runs in. Reported by the backend once the

@@ -380,15 +380,15 @@ routing, and it is what `#24` should replace.
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
 **Shipped, task dq3s0j.** `wait_for_tasks` blocks until the named ids reach a
-terminal status or the timeout fires (600 s default, 1800 s ceiling), returns
+terminal status or the timeout fires (45 s default, 55 s ceiling), returns
 the same rendering `get_task_result` would, words a timeout distinctly from
 completion, cancels nothing, and returns early when a task becomes `blocked`.
 Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
 tool list under "How agents connect" in `README.md`. One caveat, measured
 2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
-transport with "The operation timed out" while 45 s returns, so the 600 s
-default is not usable from that host; tracked in the repair plan at
-`~/Projects/docs/plans/2026-09-03-pantheon-repair.md`.
+transport with "The operation timed out" while 45 s returns, so the shipped
+default of 45 s and cap of 55 s are deliberate (`WAIT_DEFAULT_SECS` and
+`WAIT_MAX_SECS` in mcp.rs), not the 600 s default discussed below.
 
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
@@ -698,6 +698,17 @@ Care is needed with the sibling routers. `openrouter/free` prices prompt and
 completion at 0, but `openrouter/auto`, `openrouter/fusion`, and
 `openrouter/pareto-code` all report `-1`, meaning variable and billable. Pinning
 the wrong router looks equally tidy and spends money.
+
+**Launch-time enforcement, 2026-09-04.** Pantheon now refuses to start an
+opencode pane without an explicit model, and refuses any `openrouter/*` id that
+is not `openrouter/free`, `openrouter/openrouter/free`, or a `:free` id, compared
+case-insensitively (`opencode_model_guard` in `src-tauri/src/lib.rs`, with the
+launcher marking the field required). The missing-model refusal is the point:
+without `-m`, opencode falls back to its config's `model` and then to whatever
+model it used last, and Pantheon can see neither. The 2026-08-11 config pin is
+no longer in force on the development machine (the global config carries no
+top-level `model` as of this date), which is exactly the case the launch guard
+covers.
 
 Still outstanding, and still the only real guarantee: the account-side state
 (zero balance, auto top-up off, payment method removed, no BYOK keys). Config
