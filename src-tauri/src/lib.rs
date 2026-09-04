@@ -1665,8 +1665,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let cleanup = manager.kill_all().expect("first close starts cleanup");
+        // This is well below HEADLESS_CLOSE_GRACE (500 ms), so moving that
+        // sleep back onto the caller thread makes this assertion fail.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_millis(100),
             "kill_all blocked the caller for {:?}",
             started.elapsed()
         );
