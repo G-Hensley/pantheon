@@ -643,6 +643,22 @@ pub struct Shared {
     /// removed: a project has few, long-lived pane names, so the map does
     /// not grow without bound.
     pane_delivery: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// A test-only pause point, absent from every non-test build (the field
+    /// does not exist at all outside `#[cfg(test)]`, so this costs nothing
+    /// in production). `hit_test_seam` calls the hook, if one is set, at a
+    /// handful of internal boundaries a real race would need to land on:
+    /// after `drain_pane` selects a candidate, after `enqueue_within_cap`'s
+    /// cap check passes, and after `drain_pane` acquires its pane lock. A
+    /// test sets a hook with `set_test_seam` that blocks the calling thread
+    /// (a channel receive, not a sleep), giving the test explicit control
+    /// over when each thread is allowed past that boundary instead of
+    /// hoping the scheduler happens to interleave two threads there. See
+    /// the sixth-round tests below for why: a barrier at a function's
+    /// entrance, or a sleep assumed long enough for another thread to reach
+    /// a lock, both let the unfixed code pass by accident when the OS
+    /// schedules the two threads sequentially instead of concurrently.
+    #[cfg(test)]
+    test_seam: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl Shared {
@@ -1003,6 +1019,33 @@ impl Shared {
             .clone()
     }
 
+    /// Install a test-only pause hook; see `test_seam`. `hook` runs on
+    /// whichever thread reaches the boundary, synchronously, so a hook that
+    /// blocks (a channel receive) pauses that thread there until the test
+    /// releases it.
+    #[cfg(test)]
+    fn set_test_seam(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.test_seam.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Call the test hook, if one is set, with `label` naming which
+    /// boundary this is. A no-op with nothing installed, which is every
+    /// call outside a test that opts in with `set_test_seam`.
+    #[cfg(test)]
+    fn hit_test_seam(&self, label: &str) {
+        let hook = self.test_seam.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(label);
+        }
+    }
+
+    /// The production twin of the `#[cfg(test)]` version above: the field
+    /// it would read does not exist in this build, so this inlines to
+    /// nothing.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn hit_test_seam(&self, _label: &str) {}
+
     /// Check `target`'s queued depth against `QUEUE_CAP`, charge the
     /// dispatch budget, and push the new task, all in the same `tasks`-lock
     /// hold: a separate check-then-act let two concurrent dispatches each
@@ -1032,6 +1075,10 @@ impl Shared {
             if let Some(refusal) = queue_cap_refusal(&queued_ids) {
                 return (Err(refusal), Vec::new());
             }
+            // Test-only pause point, between the cap check just passed and
+            // the push below, both still under this same `tasks` lock hold;
+            // see `test_seam`.
+            self.hit_test_seam("enqueue_within_cap");
             if !self.take_dispatch_budget() {
                 return (
                     Err("dispatch budget exhausted for this run.".to_string()),
@@ -1717,6 +1764,10 @@ impl Shared {
         let Some(task) = candidate else {
             return;
         };
+        // Test-only pause point: past selection, still holding `pane_gate`,
+        // before submit_to or the post-submit journal below; see
+        // `test_seam`.
+        self.hit_test_seam("drain_pane");
 
         let is_dispatch = task.status == STATUS_QUEUED;
         let text = if is_dispatch {
@@ -4000,6 +4051,8 @@ pub fn start(
         dispatches: Mutex::new(0),
         delivery: RwLock::new(()),
         pane_delivery: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        test_seam: Mutex::new(None),
     });
 
     // Bind synchronously so we can hand the port back before the server task runs.
@@ -4046,7 +4099,8 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, RwLock};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::Duration;
 
@@ -4359,6 +4413,7 @@ mod tests {
             dispatches: Mutex::new(0),
             delivery: RwLock::new(()),
             pane_delivery: Mutex::new(HashMap::new()),
+            test_seam: Mutex::new(None),
         });
         // `app` owns the runtime the handle points at, so it has to outlive the
         // handle. Leaking it is cheaper than threading it through every caller
@@ -7771,19 +7826,49 @@ mod tests {
     // And the queue cap was read in one `tasks` lock acquisition, well before
     // the task's creation in another; fixed by `enqueue_within_cap`, folding
     // the check into the same lock hold as the push.
+    //
+    // ---- seventh round: the three tests above didn't force the race either ----
+    //
+    // A second review of the sixth round's own tests: a `Barrier` at
+    // `drain_pane`'s or `enqueue_within_cap`'s *entrance* only guarantees
+    // both threads start together, not that they reach the contested
+    // internal boundary together, so the scheduler could still run one
+    // thread all the way to completion before the other is even scheduled
+    // -- the fixture's `submit_to` fails instantly, so that window is tiny
+    // but real. And the lock-blocking test assumed a thread had reached a
+    // lock after a 50ms sleep, which a merely descheduled thread would also
+    // pass without ever attempting the lock at all. All three would pass on
+    // the unfixed code often enough to look green.
+    //
+    // Fixed with `test_seam` (see its doc comment on `Shared`): production
+    // code calls a test-installed hook at the exact internal boundary a
+    // real race would need to land on, and the hook blocks the calling
+    // thread on a channel receive instead of returning immediately. That
+    // gives each test explicit control over when a thread is allowed past
+    // the boundary, so the interleaving the finding describes is forced
+    // every run, not hoped for. A hook that pauses one thread (test 1) or
+    // simply signals it was reached (test 2), plus a bounded
+    // `recv_timeout` for a *second* signal that must never arrive while
+    // the first thread is still paused there, is what proves exclusion:
+    // under the fix, a second arrival is architecturally impossible until
+    // the first is released, so a timeout finding nothing is a guarantee,
+    // not a guess; under the bug, the second thread has nothing to block
+    // it and reaches the hook almost immediately, comfortably inside the
+    // bound. All three tests below were run against the sixth round's own
+    // fix with the relevant lock or fold-into-one-hold removed (by hand,
+    // then reverted) to confirm they fail without it; see each test's own
+    // comment for exactly what was reverted and how it failed.
 
     #[test]
     fn two_concurrent_drains_on_one_pane_deliver_the_queued_task_exactly_once() {
-        // Real threads, started together by a barrier, not two sequential
-        // calls: before `pane_delivery` existed, both could select the same
-        // queued task before either promoted it, and both would
-        // independently journal its outcome. The barrier makes the start
-        // simultaneous; the lock, not scheduling luck, is what keeps the
-        // result from depending on which one the OS actually ran first.
-        // shared_for_test's engine always fails submit_to, so both threads
-        // race for the *attempt*, not a successful delivery: the number of
-        // journal lines for t1 is what shows whether one attempted or two
-        // did, since a serialized second call finds nothing left to do.
+        // Confirmed this fails without the fix: with `pane_gate` removed
+        // from `drain_pane`, `mine` reaches the seam (and sends `arrived`)
+        // within microseconds of being spawned, since nothing blocks it --
+        // the `recv_timeout` assertion below gets that second signal
+        // instead of timing out, and fails immediately. With `pane_gate`
+        // restored, `mine` blocks acquiring the pane lock `other` holds
+        // and cannot reach the seam until `other` is released and has
+        // fully returned, so the timeout always elapses.
         let (shared, dir) = shared_for_test();
         shared
             .connected
@@ -7796,18 +7881,52 @@ mod tests {
             .unwrap()
             .push(task_at("t1", STATUS_QUEUED, 0));
 
-        let barrier = Arc::new(Barrier::new(2));
+        // The hook reports reaching the seam, then pauses there (still
+        // holding `pane_gate`, past selection, before the post-submit
+        // journal) until this test explicitly releases it.
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let proceed_rx = Mutex::new(proceed_rx);
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+            let _ = proceed_rx.lock().unwrap().recv();
+        });
+
         let other = thread::spawn({
             let shared = shared.clone();
-            let barrier = barrier.clone();
-            move || {
-                barrier.wait();
-                shared.drain_pane("sess-2");
-            }
+            move || shared.drain_pane("sess-2")
         });
-        barrier.wait();
-        shared.drain_pane("sess-2");
+        arrived_rx
+            .recv()
+            .expect("other must reach the seam to select the only queued task");
+
+        // `other` is now proven paused at the seam, holding `pane_gate`
+        // under the fix. Spawn the second drain now, while it is still
+        // paused -- this is the exact window the finding describes.
+        let mine = thread::spawn({
+            let shared = shared.clone();
+            move || shared.drain_pane("sess-2")
+        });
+
+        // Sound, not a timing guess: while `other` still holds `pane_gate`,
+        // `mine` cannot possibly reach the seam, so a second `arrived`
+        // never arriving within any bound is a guarantee under the fix,
+        // not luck. A bug that let both proceed would deliver it well
+        // inside this bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second drain reached the seam while the first still held the pane lock; \
+             both would have selected the same queued task"
+        );
+
+        // Release both: `other` (proven waiting) and `mine` (only if it
+        // also reached the seam, which the assertion above says it should
+        // not have under the fix; sent regardless so neither thread can
+        // hang waiting on a message this test never sends).
+        let _ = proceed_tx.send(());
+        let _ = proceed_tx.send(());
         other.join().unwrap();
+        mine.join().unwrap();
 
         assert_eq!(shared.tasks_snapshot()[0].status, "error");
         let journal = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
@@ -7832,6 +7951,15 @@ mod tests {
         // arrives while a drain holds a candidate": drain_pane must queue
         // behind whichever delivery path already has the pane reserved,
         // exactly as it would behind another drain.
+        //
+        // Confirmed this fails without the fix: with `pane_gate` removed
+        // from `drain_pane`, the seam call is reached (and `arrived_tx`
+        // sent) immediately, regardless of this test's own `holding` lock,
+        // since drain_pane never asks for it; the first `recv_timeout`
+        // assertion below fails immediately instead of timing out. With
+        // `pane_gate` restored, `draining`'s thread blocks on the same
+        // `pane_lock` this test holds and cannot reach the seam at all
+        // until `holding` is dropped, so the timeout always elapses.
         let (shared, dir) = shared_for_test();
         shared
             .connected
@@ -7844,23 +7972,30 @@ mod tests {
             .unwrap()
             .push(task_at("t1", STATUS_QUEUED, 0));
 
-        let started = Arc::new(AtomicBool::new(false));
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+        });
+
         let pane_lock = shared.pane_delivery_lock("sess-2");
         let holding = pane_lock.lock().unwrap();
 
         let draining = thread::spawn({
             let shared = shared.clone();
-            let started = started.clone();
-            move || {
-                started.store(true, Ordering::SeqCst);
-                shared.drain_pane("sess-2");
-            }
+            move || shared.drain_pane("sess-2")
         });
 
-        while !started.load(Ordering::SeqCst) {
-            thread::yield_now();
-        }
-        thread::sleep(Duration::from_millis(50));
+        // Not a sleep-then-peek: `drain_pane`'s seam call is placed after
+        // it acquires `pane_gate`, so while this test holds the same lock
+        // via `holding`, that call is architecturally unreachable -- any
+        // wait here finding nothing is a guarantee, not a guess about how
+        // long "long enough" is. A bug that skipped the lock entirely
+        // would reach the seam within microseconds, well inside this
+        // bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "drain_pane reached the seam while this test still held its pane lock"
+        );
         assert_eq!(
             shared.tasks_snapshot()[0].status,
             STATUS_QUEUED,
@@ -7868,6 +8003,11 @@ mod tests {
         );
 
         drop(holding);
+        // Now unblocked, drain_pane proceeds to (and past) the seam; this
+        // blocks until it does, no timeout needed since it is now expected.
+        arrived_rx
+            .recv()
+            .expect("drain_pane must reach the seam once the lock is free");
         draining.join().unwrap();
 
         assert_eq!(
@@ -7924,12 +8064,16 @@ mod tests {
     #[test]
     fn enqueue_within_cap_lets_two_concurrent_callers_race_the_last_free_slot_without_overflowing()
     {
-        // Deterministic despite real threads: a separate check-then-act let
-        // two concurrent dispatches each observe depth QUEUE_CAP - 1, each
-        // pass, and together land at QUEUE_CAP + 1. With the check and the
-        // push in one lock hold, exactly one of two racing callers can ever
-        // see room, no matter which the OS runs first; the other always
-        // sees the depth the first one just left behind and is refused.
+        // Confirmed this fails without the fix: with the cap check split
+        // from the push into two separate `self.tasks` lock acquisitions
+        // (this function's previous shape), `mine` reaches the seam within
+        // microseconds of being spawned, since `other`'s check has already
+        // released the lock by the time it pauses -- the `recv_timeout`
+        // assertion below gets a second `arrived` instead of timing out,
+        // and fails immediately. With the check and the push folded into
+        // one `mutate_and_journal` hold, `mine` blocks acquiring
+        // `self.tasks` until `other`'s entire closure, seam included, has
+        // returned, so the timeout always elapses.
         let (shared, _dir) = shared_for_test();
         {
             // An occupying task, so `is_occupied` is true and each racer's
@@ -7948,12 +8092,20 @@ mod tests {
             }
         }
 
-        let barrier = Arc::new(Barrier::new(2));
+        // The hook reports reaching the seam, then pauses there -- still
+        // inside `enqueue_within_cap`'s `mutate_and_journal` closure, so
+        // still holding `self.tasks` -- until this test releases it.
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let proceed_rx = Mutex::new(proceed_rx);
+        shared.set_test_seam(move |_label| {
+            let _ = arrived_tx.send(());
+            let _ = proceed_rx.lock().unwrap().recv();
+        });
+
         let other = thread::spawn({
             let shared = shared.clone();
-            let barrier = barrier.clone();
             move || {
-                barrier.wait();
                 shared.enqueue_within_cap("sess-2", |occupied| {
                     let mut t = task_at(
                         "racer-b",
@@ -7965,17 +8117,46 @@ mod tests {
                 })
             }
         });
-        barrier.wait();
-        let mine = shared.enqueue_within_cap("sess-2", |occupied| {
-            let mut t = task_at(
-                "racer-a",
-                if occupied { STATUS_QUEUED } else { "pending" },
-                101,
-            );
-            t.target = "sess-2".to_string();
-            t
+        arrived_rx
+            .recv()
+            .expect("other must reach the seam past its own cap check");
+
+        // `other` is now proven paused at the seam, holding `self.tasks`
+        // under the fix. Spawn the second racer now, while it is still
+        // paused -- this is the exact window the finding describes.
+        let mine = thread::spawn({
+            let shared = shared.clone();
+            move || {
+                shared.enqueue_within_cap("sess-2", |occupied| {
+                    let mut t = task_at(
+                        "racer-a",
+                        if occupied { STATUS_QUEUED } else { "pending" },
+                        101,
+                    );
+                    t.target = "sess-2".to_string();
+                    t
+                })
+            }
         });
+
+        // Sound, not a timing guess: while `other` still holds
+        // `self.tasks`, `mine` cannot possibly reach the seam (it cannot
+        // even start its own closure), so a second `arrived` never
+        // arriving within any bound is a guarantee under the fix. A split
+        // check-then-push would deliver it well inside this bound.
+        assert!(
+            arrived_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second caller reached the seam while the first still held the tasks lock \
+             mid check-then-push; the cap and the push are no longer atomic"
+        );
+
+        // Release both: `other` (proven waiting) and `mine` (only if it
+        // also reached the seam, which the assertion above says it should
+        // not have under the fix).
+        let _ = proceed_tx.send(());
+        let _ = proceed_tx.send(());
         let theirs = other.join().unwrap();
+        let mine = mine.join().unwrap();
 
         let outcomes = [mine, theirs];
         let refused = outcomes.iter().filter(|r| r.is_err()).count();
