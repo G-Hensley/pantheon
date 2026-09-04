@@ -380,16 +380,15 @@ routing, and it is what `#24` should replace.
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
 **Shipped, task dq3s0j.** `wait_for_tasks` blocks until the named ids reach a
-terminal status or the timeout fires (600 s default, 1800 s ceiling), returns
+terminal status or the timeout fires (45 s default, 55 s ceiling), returns
 the same rendering `get_task_result` would, words a timeout distinctly from
 completion, cancels nothing, and returns early when a task becomes `blocked`.
 Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
 tool list under "How agents connect" in `README.md`. One caveat, measured
 2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
-transport with "The operation timed out" while 45 s returns, so the 600 s
-default is not usable from that host; tracked in the repair plan,
-`docs/plans/2026-09-03-pantheon-repair.md` in the private `G-Hensley/projects`
-repository (the parent tree this project is developed in).
+transport with "The operation timed out" while 45 s returns, so the shipped
+default of 45 s and cap of 55 s are deliberate (`WAIT_DEFAULT_SECS` and
+`WAIT_MAX_SECS` in mcp.rs), not the 600 s default discussed below.
 
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
