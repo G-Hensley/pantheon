@@ -107,11 +107,12 @@ WebKitGTK development packages on Linux. See
 3. **Drag a pane header** onto another pane, or onto a brain in the sidebar,
    to put them in the same brain.
 4. **⌁ on a pane** promotes it to conductor. Dispatched tasks are typed into
-   the target's visible terminal, so you see every instruction. **Stop** halts
-   all dispatch immediately. **Tasks** (or **Ctrl+Shift+T**) opens every task
-   (pending, overdue, in review, rework, or blocked on your answer) without
-   truncating any of them, plus a bounded recent-history tail; picking one
-   focuses its pane.
+   the target's visible terminal, so you see every instruction, once the
+   target is free to receive it: a busy pane gets the brief queued instead
+   (see Guardrails). **Stop** halts all dispatch immediately. **Tasks** (or
+   **Ctrl+Shift+T**) opens every task (queued, pending, overdue, in review,
+   rework, or blocked on your answer) without truncating any of them, plus a
+   bounded recent-history tail; picking one focuses its pane.
 5. **Layout: scroll** keeps every terminal at a comfortable minimum height and
    scrolls the cockpit. Open **Layout** to choose automatic or fixed 1 to 6
    column arrangements and a minimum pane height, or switch to **Fit window**
@@ -147,15 +148,19 @@ only), `cancel_task` (conductor only), `reassign_task` (conductor only),
 `complete_task`, `review_task`, `get_task_result`, `wait_for_tasks`,
 `ask_conductor`, `answer_question` (conductor only), `set_session_identity`.
 `cancel_task` closes any open task with a reason, several at once if you name
-them together. `reassign_task` moves a pending, overdue, or already-abandoned
-task to a new live target (redelivering the brief), or hands an in_review or
-rework task to a new live reviewer, so a session that is stuck, gone, or
-already given up on does not have to leave the work stranded. `review_task`
-only changes the task's record: approving or rejecting reaches nobody's
-terminal, and the agent that did the work cannot even read the record itself
-with `get_task_result`, which only the dispatcher may call. Delivering a
-review result to the target is Phase 2 work; until then the conductor has to
-tell the target by hand what the review found.
+them together, queued tasks included: nothing is journaled for a queued task
+that never got dispatched, the same as any other refusal. `reassign_task`
+moves a pending, overdue, queued, or already-abandoned task to a new live
+target (redelivering the brief, or re-queuing it if that target is itself
+busy), or hands an in_review or rework task to a new live reviewer, so a
+session that is stuck, gone, or already given up on does not have to leave
+the work stranded. `review_task` changes the task's record and delivers the
+result: approving frees the reviewer's own pane for its queue, and rejecting
+types a rework notice straight into the target's terminal, so the conductor
+does not have to relay what the review found by hand. `get_task_result` is no
+longer dispatcher-only: the task's target and reviewer may also read it by
+full id, since both are told to call it by the notice they receive; a
+no-id listing of every dispatched task still returns only to the dispatcher.
 
 ## How agents are briefed
 
@@ -237,6 +242,21 @@ exchange is kept on the task, so an answer given once is not asked again.
   candidate exists. That is `CONTRIBUTING.md`'s cross-model review rule
   applied automatically rather than left to the conductor to remember; naming
   a reviewer explicitly is unaffected by it.
+- A pane is occupied while it holds an open task as target (pending, overdue,
+  rework, or blocked) or as reviewer (in_review). Dispatching to an occupied
+  pane queues the brief instead of typing over whatever the pane is already
+  doing; the response says which task it is queued behind and at what
+  position. Each pane holds at most 3 queued briefs; a fourth is refused,
+  naming the ones already queued, and nothing is journaled for a refusal.
+  `list_sessions` shows the depth on a busy pane, for example
+  `[busy 4m, 2 queued]`.
+- Whenever a pane stops being occupied, whatever is next for it (an
+  undelivered review request or rework notice first, then the oldest queued
+  brief) is typed in automatically: no broadcast, no second dispatch, and
+  nothing is typed while the pane is still occupied. Nothing is delivered
+  while halted; unhalting resumes it. An oversized brief or review finding is
+  shortened to fit rather than refused, since a system-generated notice has
+  no caller to refuse to; the full text stays reachable by task id.
 - A worktree branch is deleted only when it has no commits of its own, so
   committed agent work is never silently discarded. Cleanup also refuses to
   remove a dirty worktree, preserving uncommitted changes on disk.
@@ -256,9 +276,6 @@ exchange is kept on the task, so an answer given once is not asked again.
 - **Isolated work has no merge path.** A session's branch (`pantheon/<id>-<uid>`)
   survives when it has commits, but the UI never shows the branch name or a
   diff.
-- **Dispatch assumes an idle target.** Instructions are typed into the
-  target's terminal; if that agent is mid-task the input is swallowed and the
-  task sits pending indefinitely. Nothing times it out.
 - **A finished agent can leave its task open.** Completion is an explicit
   `complete_task` call, so a session that does the work and never makes that
   call is indistinguishable, to the conductor, from one still thinking. A pane
