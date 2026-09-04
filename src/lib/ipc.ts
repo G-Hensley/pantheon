@@ -18,6 +18,11 @@ export type SessionType = {
   program: string;
   args: string[];
   color: string;
+  modelFlag?: string;
+  // The launcher refuses to start this CLI without a model. Set where the CLI
+  // would otherwise fall back to a model the backend's free-model guard cannot
+  // see (opencode: its config, then its last-used model).
+  modelRequired?: boolean;
 };
 
 // Which plain shell the Shell pane launches. The webview user agent is the only
@@ -35,9 +40,9 @@ export const SESSION_TYPES: SessionType[] = [
   IS_WINDOWS
     ? { id: "shell", label: "Shell", program: "powershell.exe", args: ["-NoLogo"], color: "#7dcfff" }
     : { id: "shell", label: "Shell", program: "bash", args: [], color: "#7dcfff" },
-  { id: "claude", label: "Claude Code", program: "claude", args: [], color: "#e0af68" },
-  { id: "codex", label: "Codex", program: "codex", args: [], color: "#bb9af7" },
-  { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a" },
+  { id: "claude", label: "Claude Code", program: "claude", args: [], color: "#e0af68", modelFlag: "--model" },
+  { id: "codex", label: "Codex", program: "codex", args: [], color: "#bb9af7", modelFlag: "-m" },
+  { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a", modelFlag: "-m", modelRequired: true },
 ];
 
 // The git worktree an isolated session runs in. Reported by the backend once the
@@ -60,7 +65,7 @@ export function spawnSession(
   args: string[],
   rows: number,
   cols: number,
-  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree },
+  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree; model?: string; modelFlag?: string },
 ): Promise<void> {
   return invoke("spawn_session", {
     sessionId,
@@ -72,6 +77,8 @@ export function spawnSession(
     cwd: opts?.cwd,
     isolate: opts?.isolate,
     reuseWorktree: opts?.reuseWorktree,
+    model: opts?.model,
+    modelFlag: opts?.modelFlag,
   });
 }
 

@@ -25,6 +25,7 @@ export type StoredPane = {
   typeId: string;
   brain: string;
   isolate: boolean;
+  model?: string;
   worktree?: SavedWorktree;
 };
 
@@ -97,6 +98,7 @@ export function parseRoster(raw: string | null): Roster {
       type,
       brain: typeof entry.brain === "string" && entry.brain ? entry.brain : "main",
       isolate: entry.isolate === true,
+      model: typeof entry.model === "string" ? entry.model : undefined,
       worktree: parseWorktree(entry.worktree),
     });
   }
