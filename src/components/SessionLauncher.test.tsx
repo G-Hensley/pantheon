@@ -96,6 +96,41 @@ describe("<SessionLauncher>", () => {
     expect(codexItem.querySelector("input")).toBeNull();
   });
 
+  it("clicking or editing the model controls does not launch the row", () => {
+    // The row's label area is a <button onClick={pick}>, so a click that
+    // opens the select, or lands on the custom input, must not bubble up
+    // and launch the session before the operator has finished choosing.
+    const onPick = vi.fn();
+    render(
+      <SessionLauncher onPick={onPick} onClose={() => {}} project={null} />,
+    );
+    const codexItem = screen.getByText("Codex").closest(".launcher-item")!;
+    const select = codexItem.querySelector("select") as HTMLSelectElement;
+
+    fireEvent.click(select);
+    expect(onPick).not.toHaveBeenCalled();
+
+    const customValue = Array.from(select.options).find(
+      (o) => o.textContent === "Custom…",
+    )!.value;
+    fireEvent.change(select, { target: { value: customValue } });
+    expect(onPick).not.toHaveBeenCalled();
+
+    const input = codexItem.querySelector("input") as HTMLInputElement;
+    fireEvent.click(input);
+    fireEvent.change(input, { target: { value: "gpt-4o-custom" } });
+    expect(onPick).not.toHaveBeenCalled();
+
+    // An explicit click on the rest of the row still launches, with the
+    // value picked while none of the above fired it.
+    fireEvent.click(screen.getByText("Codex"));
+    expect(onPick).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "codex" }),
+      expect.anything(),
+      "gpt-4o-custom",
+    );
+  });
+
   it("choosing Custom reveals the text input", () => {
     render(
       <SessionLauncher onPick={vi.fn()} onClose={() => {}} project={null} />,

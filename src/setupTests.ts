@@ -7,4 +7,8 @@ import { cleanup } from "@testing-library/react";
 // auto-cleanup (which only registers when `afterEach` is already global).
 afterEach(() => {
   cleanup();
+  // jsdom's localStorage otherwise persists across tests in the same file,
+  // so a value one test writes (session launcher model choices, "isolate")
+  // leaks into the next test's initial render.
+  localStorage.clear();
 });

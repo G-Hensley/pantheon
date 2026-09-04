@@ -266,6 +266,67 @@ fn parse_and_filter_models(raw: &str) -> Vec<String> {
     models
 }
 
+/// How often `run_with_timeout` polls for the child having exited.
+const RUN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Run `cmd` to completion, killing it if it has not exited within `timeout`.
+/// Returns its exit status and captured stdout/stderr.
+///
+/// Reads stdout and stderr on their own threads rather than one after the
+/// other: a child that fills one pipe while it is still blocked writing to
+/// the other would otherwise deadlock the sequential read waiting on the
+/// pipe that is not being drained.
+///
+/// The deadline is enforced by polling `try_wait` rather than by racing the
+/// output reads, so it bounds the child's whole run, not just how long its
+/// output takes to arrive. A child that closes both pipes early but keeps
+/// running is exactly the case a read-only race would miss: the reads would
+/// finish immediately, and a follow-up blocking `wait()` would then have no
+/// deadline of its own and could hang forever.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(RUN_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Err(e) => return Err(format!("failed to wait on child: {e}")),
+        }
+    };
+
+    // The child has exited, so both pipes are closed (or closing) and these
+    // reads cannot block for long.
+    let out = stdout_reader.join().unwrap_or_default();
+    let err = stderr_reader.join().unwrap_or_default();
+    Ok((status, out, err))
+}
+
 /// List the models a CLI offers, for the launcher's model picker.
 ///
 /// Only opencode has a list command; every other program returns an empty
@@ -278,45 +339,14 @@ fn list_models(program: String) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let mut child = Command::new(&program)
-        .arg("models")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to run '{program} models': {e}"))?;
-
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut out = String::new();
-        let mut err = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        let _ = stderr.read_to_string(&mut err);
-        // The receiver may already be gone if we timed out; nothing to do
-        // about that here, the caller has already returned an error.
-        let _ = tx.send((out, err));
-    });
-
-    match rx.recv_timeout(LIST_MODELS_TIMEOUT) {
-        Ok((out, err)) => {
-            let status = child
-                .wait()
-                .map_err(|e| format!("failed to wait on '{program} models': {e}"))?;
-            if !status.success() {
-                return Err(format!("'{program} models' failed: {}", err.trim()));
-            }
-            Ok(parse_and_filter_models(&out))
-        }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(format!(
-                "'{program} models' timed out after {}s",
-                LIST_MODELS_TIMEOUT.as_secs()
-            ))
-        }
+    let mut cmd = Command::new(&program);
+    cmd.arg("models");
+    let (status, out, err) = run_with_timeout(cmd, LIST_MODELS_TIMEOUT)
+        .map_err(|e| format!("'{program} models' {e}"))?;
+    if !status.success() {
+        return Err(format!("'{program} models' failed: {}", err.trim()));
     }
+    Ok(parse_and_filter_models(&out))
 }
 
 /// Whether the Enter that submits a prompt can be sent yet.
@@ -1579,12 +1609,14 @@ mod tests {
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
         list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_models,
-        ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
+        ready_to_submit, resolve_isolation, run_with_timeout, submit_ceiling_ms, submit_floor_ms,
         validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
         CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
         SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn legacy_data_directory_moves_to_the_pantheon_identity() {
@@ -2460,6 +2492,62 @@ mod tests {
         assert_eq!(
             list_models("bash".to_string()).unwrap(),
             Vec::<String>::new()
+        );
+    }
+
+    // `run_with_timeout` is exercised directly with real child processes
+    // (rather than only through `list_models`, which is pinned to the
+    // literal program name "opencode") so the timeout and concurrent-read
+    // behaviour is covered without needing an `opencode` binary on PATH.
+    // `sh` makes these Unix-only.
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_kills_a_child_that_closes_its_pipes_but_keeps_running() {
+        // Closes stdout and stderr immediately, then sleeps far longer than
+        // the timeout below. A timeout that only bounded reading the (now
+        // closed, immediately-EOF) pipes would let this sleep run to
+        // completion instead of killing it.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec >/dev/null 2>&1; sleep 5"]);
+        let started = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        // Killed at the deadline, not left to run out its 5s sleep.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}, should have been killed well before the child's sleep finished",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_drains_a_full_stderr_without_stalling_stdout() {
+        // Writes 200000 bytes to stderr (comfortably past a pipe's default
+        // buffer size) before writing to stdout and exiting. Reading stdout
+        // to EOF first (the sequential-read bug this replaces) would block
+        // forever here: the child cannot finish (and so cannot close stdout)
+        // until its stderr write is drained, which a sequential reader never
+        // gets to until stdout already closed.
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' 'e' 1>&2; printf out",
+        ]);
+        let started = Instant::now();
+        let (status, out, err) = run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(status.success());
+        assert_eq!(out, "out");
+        assert_eq!(err.len(), 200_000);
+        assert!(err.chars().all(|c| c == 'e'));
+        // Finished on its own long before the generous timeout above; this
+        // guards against a regression back to a stall that only the timeout
+        // would eventually break.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}, should have completed almost immediately",
+            started.elapsed()
         );
     }
 }

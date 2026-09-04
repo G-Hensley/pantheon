@@ -118,7 +118,11 @@ function ModelPicker({
   const selectableOptions = isDynamic ? dynamicOptions : staticOptions;
 
   return (
-    <span className="ll-model-field">
+    // The row's whole label area is a <button onClick={pick}>, so without
+    // this a click that opens the select, chooses an option, or focuses the
+    // custom input would bubble up and launch the session before the
+    // operator finished choosing a model.
+    <span className="ll-model-field" onClick={(e) => e.stopPropagation()}>
       {selectableOptions && (
         <select
           className="ll-model-select"
