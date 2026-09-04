@@ -114,7 +114,7 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 /// dispatch has a caller to hand a refusal back to, but a review request or
 /// rework notice is typed in on its own, by `drain_pane`, with nobody on
 /// the line to refuse to. Truncating instead is safe here specifically
-/// because the full text stays reachable by id through `get_task_result` â€”
+/// because the full text stays reachable by id through `get_task_result`:
 /// nothing is actually lost, only what reaches the terminal is shortened.
 fn fit_injection(build: impl Fn(&str) -> String, variable: &str) -> String {
     let full = build(variable);
@@ -297,15 +297,15 @@ pub struct Task {
     /// Whether the message this task owes its own pane has reached it: the
     /// review request for an `in_review` task (to `reviewer`), or the rework
     /// notice for a `rework` task (to `target`). Meaningless, and left
-    /// `true`, for every other status â€” there is nothing to notify about.
+    /// `true`, for every other status: there is nothing to notify about.
     ///
     /// `serde(default)` loads every task written before this field as
     /// `false`: "not yet delivered". That is the honest answer for an
     /// `in_review` or `rework` task from before Pantheon had any delivery
-    /// mechanism at all, and it is also the useful one â€” see BACKLOG.md's
-    /// "review request was never delivered" entry, which this field exists
-    /// to close: a workspace upgrading mid-run retries exactly the
-    /// notifications that never had anywhere to go.
+    /// mechanism at all, and it is also the useful one, closing what
+    /// BACKLOG.md's "review request was never delivered" entry named: a
+    /// workspace upgrading mid-run retries exactly the notifications that
+    /// never had anywhere to go.
     #[serde(default)]
     pub notice_delivered: bool,
 }
@@ -345,7 +345,7 @@ pub const STATUS_BLOCKED: &str = "blocked";
 /// The status a freshly dispatched (or redirected) task holds while its
 /// target pane is occupied: recorded, but not yet typed into any terminal.
 /// Open, not terminal, and deliberately not counted as "busy" the way
-/// `pending` is â€” see `attribute_open_tasks` â€” because nothing is running
+/// `pending` is (see `attribute_open_tasks`), because nothing is running
 /// yet for it to be slow at. `drain_pane` is what moves a task off this
 /// status once its pane is free.
 pub const STATUS_QUEUED: &str = "queued";
@@ -656,6 +656,15 @@ impl Shared {
         }
         self.app.emit("context-changed");
         self.app.emit("conductor-changed");
+        // The tasks just loaded may hold a queued brief on a pane that is
+        // live right now, or an undelivered review request or rework notice
+        // for one, left over from before the app restarted. Nothing else
+        // sweeps for that, so this is the moment to: every task list this
+        // project could have had before is gone, replaced by `brain.tasks`
+        // above, and `live` already reflects who is actually here.
+        for id in &live {
+            self.drain_pane(id);
+        }
     }
 
     /// The brain a given agent name is currently in. Defaults to "main".
@@ -750,10 +759,17 @@ impl Shared {
                 }
             }
         };
-        let Some(session) = to_persist else { return };
-        let dir = self.dir.lock().unwrap().clone();
-        let _ = append_record(&dir, &StoreRecord::Session(session));
-        self.app.emit("context-changed");
+        if let Some(session) = to_persist {
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Session(session));
+            self.app.emit("context-changed");
+        }
+        // This is the moment the pane is known to be there and reading its
+        // terminal, identity changed or not: a restart or reconnect is
+        // exactly when a queued brief or an undelivered notice from before
+        // the pane went away needs to reach it, and nothing else runs on a
+        // timer to pick that up later.
+        self.drain_pane(name);
     }
 
     // ---- conductor ----
@@ -1663,8 +1679,8 @@ fn queued_ids_for(tasks: &[Task], pane: &str) -> Vec<String> {
 /// (`pending`, `overdue`, `rework`, or `blocked`), or the `in_review` task it
 /// is reviewing. `excluding` skips one id, so a task cannot be judged
 /// occupied by itself the moment its own status is what would occupy the
-/// pane â€” see `drain_pane` and `Shared::reassign_task`, which both check
-/// occupancy of a pane a task is *about* to notify or move to.
+/// pane (see `drain_pane` and `Shared::reassign_task`, which both check
+/// occupancy of a pane a task is *about* to notify or move to).
 fn occupying_task<'a>(tasks: &'a [Task], pane: &str, excluding: &str) -> Option<&'a Task> {
     tasks.iter().find(|t| {
         t.id != excluding
@@ -2951,6 +2967,12 @@ impl BrainHandler {
             }
         }
         self.shared.app.emit("context-changed");
+        // The shared-endpoint counterpart to note_session's drain on the
+        // dedicated-endpoint path: this call is how a session on the shared
+        // MCP endpoint tells Pantheon it is here and reading its terminal,
+        // which is exactly when a queued brief or an undelivered notice from
+        // before a restart or reconnect needs to reach it.
+        self.shared.drain_pane(&p.name);
         format!(
             "Identity set to '{}' in brain '{}'",
             p.name,
@@ -3061,7 +3083,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -3105,8 +3127,8 @@ impl BrainHandler {
                 p.target, o.task_id
             ),
             Ok(o) => format!(
-                "Task {} recorded for {} but delivery failed (could not write to that session) \
-                 â€” status is 'error'.",
+                "Task {} recorded for {} but delivery failed (could not write to that session), \
+                 so status is 'error'.",
                 o.task_id, p.target
             ),
         }
@@ -3242,7 +3264,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work. With a task_id, the dispatcher, the target, and the named reviewer may all read that one task in full â€” a review request or rework notice you receive points you back here. With no task_id, this returns every task YOU dispatched (open ones plus the most recently finished) in one call â€” do that instead of polling ids one by one; that listing stays dispatcher-only. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. queued means it is recorded but has not been typed into its target's terminal yet, because that pane was occupied when it was dispatched; it will be delivered automatically. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work. With a task_id, the dispatcher, the target, and the named reviewer may all read that one task in full: a review request or rework notice you receive points you back here. With no task_id, this returns every task YOU dispatched (open ones plus the most recently finished) in one call, so do that instead of polling ids one by one; that listing stays dispatcher-only. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. queued means it is recorded but has not been typed into its target's terminal yet, because that pane was occupied when it was dispatched; it will be delivered automatically. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -3809,11 +3831,11 @@ mod tests {
         render_open_task_summaries, render_task, render_task_summary, review_pending,
         review_request_notice, reviewing_label, rework_notice, select_tasks, single_line,
         status_tag, still_open, task_for_reader, truncate_bytes, truncate_chars,
-        validate_path_component, wait_timeout, AgentSession, AskError, CancelOutcome, Entry,
-        Exchange, Notifier, ReassignError, Shared, StoreRecord, Task, TaskAccessError,
-        MAX_QUESTIONS_PER_TASK, QUEUE_CAP, RECENT_FINISHED, REVIEW_WAIVED, STATUS_ABANDONED,
-        STATUS_BLOCKED, STATUS_QUEUED, TASK_ECHO_CHARS, TASK_OVERDUE_MS, WAIT_DEFAULT_SECS,
-        WAIT_MAX_SECS,
+        validate_path_component, wait_timeout, AgentSession, AskError, BrainHandler, CancelOutcome,
+        Entry, Exchange, Identify, Notifier, Parameters, ReassignError, Shared, StoreRecord, Task,
+        TaskAccessError, MAX_QUESTIONS_PER_TASK, QUEUE_CAP, RECENT_FINISHED, REVIEW_WAIVED,
+        STATUS_ABANDONED, STATUS_BLOCKED, STATUS_QUEUED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -6608,6 +6630,69 @@ mod tests {
         let contents = std::fs::read_to_string(dir.path().join("brain.jsonl")).unwrap();
         assert_eq!(contents.lines().count(), 1);
     }
+
+    #[test]
+    fn note_session_drains_the_pane_it_just_recorded() {
+        // A restart or reconnect is exactly when a queued brief left over
+        // from before the pane went away needs to reach it, and nothing else
+        // runs on a timer to pick that up. shared_for_test's engine still
+        // reports nothing live, so the observable proof is the same one the
+        // other drain_pane trigger tests use: a queued task on this pane
+        // flips to error on the attempted, failed delivery.
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        shared.note_session("sess-2", "claude", "sonnet");
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    #[test]
+    fn note_session_drains_even_when_the_identity_itself_is_unchanged() {
+        // The bug this guards against: an early return on the no-change path
+        // would skip the drain on every reconnect after the first, since a
+        // pane's identity is usually the same CLI and model it was before.
+        let (shared, _dir) = shared_for_test();
+        shared.note_session("sess-2", "claude", "sonnet");
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+
+        shared.note_session("sess-2", "claude", "sonnet");
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    #[test]
+    fn set_session_identity_on_the_shared_endpoint_drains_the_pane() {
+        let (shared, _dir) = shared_for_test();
+        shared
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task_at("t1", STATUS_QUEUED, 0));
+        let handler = BrainHandler::new(shared.clone());
+
+        handler.set_session_identity(Parameters(Identify {
+            name: "sess-2".to_string(),
+            kind: "claude".to_string(),
+            room: String::new(),
+        }));
+
+        assert_eq!(shared.tasks_snapshot()[0].status, "error");
+    }
+
+    // set_dir's live-pane drain sweep has no equivalent test: it iterates
+    // live_ids(), which shared_for_test's engine always reports empty, so
+    // the sweep has nothing to drive in this fixture. Its per-pane behavior
+    // is drain_pane, already covered above and by the trigger tests
+    // elsewhere in this module; only the sweep's own iteration is untested.
 
     // ---- merge_live_identity: a pane's identity survives a set_dir switch ----
     //
