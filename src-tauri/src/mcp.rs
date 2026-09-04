@@ -2096,8 +2096,8 @@ fn age(t: &mut Task, now: u64) {
 ///
 /// `in_review` is a second fix for a related bug: this used to check the
 /// *target*'s liveness for every open status, including `in_review`, even
-    /// though the target has already submitted and is no longer the actor: the
-    /// reviewer is. That meant a target closing its pane after a clean submission
+/// though the target has already submitted and is no longer the actor: the
+/// reviewer is. That meant a target closing its pane after a clean submission
 /// could erase a result the reviewer had not even looked at yet, while a task
 /// stuck on a reviewer that no longer existed (the actual failure, see
 /// BACKLOG.md) went completely undetected: the target was still live, so
