@@ -2507,6 +2507,7 @@ name = "pantheon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "portable-pty",
  "rmcp",
  "schemars 1.2.2",
@@ -2519,6 +2520,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
