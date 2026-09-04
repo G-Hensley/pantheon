@@ -120,6 +120,12 @@ export const projectIsRepo = (dir: string): Promise<boolean> =>
 export const initProjectRepo = (dir: string): Promise<void> =>
   invoke("init_project_repo", { dir });
 
+// The models a CLI's list command offers, already filtered to ones the
+// free-model guard will accept. Only opencode has one; every other program
+// resolves to an empty list, so the launcher falls back to Custom for those.
+export const listModels = (program: string): Promise<string[]> =>
+  invoke("list_models", { program });
+
 // ---- Conductor ----
 // One question a working agent put to the conductor, and the answer (empty
 // while still open). Mirrors `Exchange` in src-tauri/src/mcp.rs.

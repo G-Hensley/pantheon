@@ -1,11 +1,184 @@
 import { useEffect, useState } from "react";
 import {
   initProjectRepo,
+  listModels,
   projectIsRepo,
   SESSION_TYPES,
   type SessionType,
 } from "../lib/ipc";
 import { readStored, writeStored } from "../lib/storage";
+
+type ModelChoice = { value: string; label: string };
+
+// Sentinel <option> value for "type your own id"; distinct from any real
+// model id so a select's value can tell the two apart.
+const CUSTOM_MODEL = "__custom__";
+
+// Small, fixed option sets for the CLIs that don't have a list command.
+// claude's are the aliases `claude --help` documents for --model; codex's
+// "Config default" (empty value, no -m flag) reproduces what an empty model
+// already meant before this picker existed: Codex falls back to its own
+// ~/.codex/config.toml. opencode has no entry here: its options come from
+// `list_models` instead.
+const STATIC_MODEL_OPTIONS: Record<string, ModelChoice[]> = {
+  claude: [
+    { value: "fable", label: "Fable 5.1" },
+    { value: "opus", label: "Opus 5" },
+    { value: "sonnet", label: "Sonnet 5" },
+  ],
+  codex: [{ value: "", label: "Config default" }],
+};
+
+// Group opencode's model ids by provider prefix ("openrouter/gpt-4o" ->
+// "openrouter") for the select's <optgroup>s. An id with no "/" groups under
+// "other" rather than being dropped.
+function groupByProvider(ids: string[]): Array<[string, string[]]> {
+  const groups = new Map<string, string[]>();
+  for (const id of ids) {
+    const slash = id.indexOf("/");
+    const provider = slash === -1 ? "other" : id.slice(0, slash);
+    const group = groups.get(provider);
+    if (group) {
+      group.push(id);
+    } else {
+      groups.set(provider, [id]);
+    }
+  }
+  return [...groups.entries()];
+}
+
+// The model row for one CLI: a styled select over its known options, plus a
+// "Custom..." choice that reveals a styled text input for an id not in the
+// list. opencode's options are fetched once per launcher open; claude's and
+// codex's are static and available immediately.
+function ModelPicker({
+  type,
+  value,
+  onChange,
+  missing,
+}: {
+  type: SessionType;
+  value: string;
+  onChange: (v: string) => void;
+  missing: boolean;
+}) {
+  const staticOptions = STATIC_MODEL_OPTIONS[type.id];
+  const isDynamic = staticOptions === undefined;
+
+  const [dynamicOptions, setDynamicOptions] = useState<string[] | null>(null);
+  const [loading, setLoading] = useState(isDynamic);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Preselect the remembered value if it's one of the known options, else
+  // start in Custom mode with it filled in. For a dynamic CLI the options
+  // aren't known yet at mount, so this starts as Custom and the effect below
+  // corrects it once the list arrives.
+  const [customMode, setCustomMode] = useState<boolean>(() =>
+    staticOptions ? !staticOptions.some((o) => o.value === value) : true,
+  );
+
+  useEffect(() => {
+    if (!isDynamic) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    listModels(type.program)
+      .then((models) => {
+        if (cancelled) return;
+        setDynamicOptions(models);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setLoadError(
+          typeof e === "string"
+            ? e
+            : e instanceof Error
+              ? e.message
+              : "failed to list models",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Fetch once per launcher open (on mount), not on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [type.program]);
+
+  useEffect(() => {
+    if (dynamicOptions && value !== "" && dynamicOptions.includes(value)) {
+      setCustomMode(false);
+    }
+    // Only re-check once the list itself changes, not on every value edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dynamicOptions]);
+
+  const selectableOptions = isDynamic ? dynamicOptions : staticOptions;
+
+  return (
+    <span className="ll-model-field">
+      {selectableOptions && (
+        <select
+          className="ll-model-select"
+          value={customMode ? CUSTOM_MODEL : value}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === CUSTOM_MODEL) {
+              setCustomMode(true);
+            } else {
+              setCustomMode(false);
+              onChange(v);
+            }
+          }}
+        >
+          {isDynamic
+            ? groupByProvider(selectableOptions as string[]).map(
+                ([provider, ids]) => (
+                  <optgroup key={provider} label={provider}>
+                    {ids.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </optgroup>
+                ),
+              )
+            : (selectableOptions as ModelChoice[]).map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+          <option value={CUSTOM_MODEL}>Custom…</option>
+        </select>
+      )}
+      {isDynamic && loading && (
+        <span className="ll-model-loading">loading…</span>
+      )}
+      {isDynamic && loadError && (
+        <span className="launcher-repo-error" role="alert">
+          {loadError}
+        </span>
+      )}
+      {customMode && (
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="ll-model-input"
+          placeholder={type.modelRequired ? "model required" : undefined}
+        />
+      )}
+      {missing && (
+        <span className="launcher-repo-error" role="alert">
+          {type.label} needs a model: a free OpenRouter id such as
+          openrouter/free, or a local provider's model.
+        </span>
+      )}
+    </span>
+  );
+}
 
 // ⌘K-style launcher: pick which agent/CLI to open in a new pane. (Atelier's
 // command-palette feel; keyboard-first with Escape to dismiss.)
@@ -30,7 +203,7 @@ export function SessionLauncher({
   const [isRepo, setIsRepo] = useState<boolean | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(false);
-  
+
   // Initialize models state from localStorage once
   const [models, setModels] = useState<Map<string, string>>(() => {
     const initial = new Map<string, string>();
@@ -100,7 +273,9 @@ export function SessionLauncher({
     for (const [id, value] of models.entries()) {
       try {
         writeStored(`model:${id}`, value);
-      } catch {/* ignore */}
+      } catch {
+        /* ignore */
+      }
     }
   }, [models]);
 
@@ -120,26 +295,16 @@ export function SessionLauncher({
               <span className="ll-cmd">
                 {t.program} {t.args.join(" ")}
                 {t.modelFlag && (
-                  <span>
-                    <input
-                      type="text"
-                      value={models.get(t.id) || ""}
-                      onChange={(e) => {
-                        const newModels = new Map(models);
-                        newModels.set(t.id, e.target.value);
-                        setModels(newModels);
-                      }}
-                      className="ll-model-input"
-                      placeholder={t.modelRequired ? "model required" : undefined}
-                    />
-                    {models.get(t.id) || ""}
-                    {modelMissing === t.id && (
-                      <span className="launcher-repo-error" role="alert">
-                        {t.label} needs a model: a free OpenRouter id such as
-                        openrouter/free, or a local provider's model.
-                      </span>
-                    )}
-                  </span>
+                  <ModelPicker
+                    type={t}
+                    value={models.get(t.id) || ""}
+                    onChange={(v) => {
+                      const newModels = new Map(models);
+                      newModels.set(t.id, v);
+                      setModels(newModels);
+                    }}
+                    missing={modelMissing === t.id}
+                  />
                 )}
               </span>
               <kbd className="ll-key">{i + 1}</kbd>

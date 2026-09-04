@@ -243,6 +243,82 @@ fn opencode_model_guard(model: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// How long `list_models` waits for `opencode models` before giving up on it.
+/// Measured locally at ~2s for 379 ids, so 15s leaves ample room for a slower
+/// machine or a cold model cache without leaving the launcher hung indefinitely
+/// on a CLI that never returns.
+const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parse `opencode models` output (one id per line) and drop every id the
+/// free-model guard would refuse, so the launcher only ever offers models that
+/// can actually be picked. Pulled out of `list_models` so the parsing and
+/// filtering is testable without spawning a process.
+fn parse_and_filter_models(raw: &str) -> Vec<String> {
+    let mut models: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !is_paid_openrouter_model(line))
+        .map(str::to_string)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// List the models a CLI offers, for the launcher's model picker.
+///
+/// Only opencode has a list command; every other program returns an empty
+/// list so the frontend falls back to its static options plus Custom. The
+/// child is given `LIST_MODELS_TIMEOUT` to finish and is killed if it
+/// overruns, so a hung `opencode models` cannot hang the launcher with it.
+#[tauri::command]
+fn list_models(program: String) -> Result<Vec<String>, String> {
+    if !is_opencode(&program) {
+        return Ok(Vec::new());
+    }
+
+    let mut child = Command::new(&program)
+        .arg("models")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run '{program} models': {e}"))?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut out = String::new();
+        let mut err = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = stderr.read_to_string(&mut err);
+        // The receiver may already be gone if we timed out; nothing to do
+        // about that here, the caller has already returned an error.
+        let _ = tx.send((out, err));
+    });
+
+    match rx.recv_timeout(LIST_MODELS_TIMEOUT) {
+        Ok((out, err)) => {
+            let status = child
+                .wait()
+                .map_err(|e| format!("failed to wait on '{program} models': {e}"))?;
+            if !status.success() {
+                return Err(format!("'{program} models' failed: {}", err.trim()));
+            }
+            Ok(parse_and_filter_models(&out))
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!(
+                "'{program} models' timed out after {}s",
+                LIST_MODELS_TIMEOUT.as_secs()
+            ))
+        }
+    }
+}
+
 /// Whether the Enter that submits a prompt can be sent yet.
 ///
 /// Split out from the waiting loop so the policy is testable without a live PTY.
@@ -1485,6 +1561,7 @@ pub fn run() {
             set_project,
             project_is_repo,
             init_project_repo,
+            list_models,
             human_dispatch
         ])
         .on_window_event(|window, event| {
@@ -1501,10 +1578,11 @@ mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
-        migrate_legacy_dir, opencode_model_guard, ready_to_submit, resolve_isolation,
-        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, IsolationReason,
-        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
-        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_models,
+        ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
+        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
+        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
 
@@ -2331,5 +2409,57 @@ mod tests {
         assert!(is_paid_openrouter_model("\topenrouter/gpt-4o\n"));
         // Free-tier with whitespace is still free.
         assert!(!is_paid_openrouter_model(" openrouter/free "));
+    }
+
+    #[test]
+    fn parse_and_filter_models_drops_paid_openrouter_ids() {
+        let raw = "openrouter/free\n\
+                    openrouter/gpt-4o\n\
+                    openrouter/anthropic/claude-3-5-sonnet:free\n\
+                    ollama/llama3\n";
+        assert_eq!(
+            parse_and_filter_models(raw),
+            vec![
+                "ollama/llama3",
+                "openrouter/anthropic/claude-3-5-sonnet:free",
+                "openrouter/free"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_and_filter_models_trims_dedupes_and_sorts() {
+        // Blank lines, surrounding whitespace, a duplicate id, and out-of-order
+        // input are all things real CLI output can contain; none of them should
+        // survive into the launcher's list.
+        let raw = "\n  opencode/gpt-oss-120b-free  \nllama-3.1-8b\nllama-3.1-8b\n\topencode/gpt-oss-120b-free\t\n";
+        assert_eq!(
+            parse_and_filter_models(raw),
+            vec!["llama-3.1-8b", "opencode/gpt-oss-120b-free"]
+        );
+    }
+
+    #[test]
+    fn parse_and_filter_models_of_empty_input_is_empty() {
+        assert!(parse_and_filter_models("").is_empty());
+        assert!(parse_and_filter_models("\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn list_models_skips_programs_other_than_opencode() {
+        // These must not spawn anything: an empty Ok is returned immediately so
+        // the frontend falls back to Custom for CLIs with no list command.
+        assert_eq!(
+            list_models("claude".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            list_models("codex".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            list_models("bash".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }
