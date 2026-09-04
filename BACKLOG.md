@@ -290,8 +290,9 @@ reproduction spawns the real agent CLIs with deterministic startup and inspects
 the editor buffer before submission, comparing one write against paced chunks.
 
 **Fixed by bounding the payload, 2026-08-12.** `dispatch` now refuses any
-injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src/mcp.rs`) instead
-of sending it and hoping. The mechanism drops *complete* leading chunks only, so
+injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src-tauri/src/mcp.rs`)
+instead of sending it and hoping. The mechanism drops *complete* leading chunks
+only, so
 an injection under one chunk has no complete leading chunk and cannot lose a
 byte. That is a guarantee rather than a mitigation, and it does not depend on
 ever finding the cause.
@@ -380,15 +381,15 @@ routing, and it is what `#24` should replace.
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
 **Shipped, task dq3s0j.** `wait_for_tasks` blocks until the named ids reach a
-terminal status or the timeout fires (600 s default, 1800 s ceiling), returns
+terminal status or the timeout fires (45 s default, 55 s ceiling), returns
 the same rendering `get_task_result` would, words a timeout distinctly from
 completion, cancels nothing, and returns early when a task becomes `blocked`.
 Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
 tool list under "How agents connect" in `README.md`. One caveat, measured
 2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
-transport with "The operation timed out" while 45 s returns, so the 600 s
-default is not usable from that host; tracked in the repair plan at
-`~/Projects/docs/plans/2026-09-03-pantheon-repair.md`.
+transport with "The operation timed out" while 45 s returns, so the shipped
+default of 45 s and cap of 55 s are deliberate (`WAIT_DEFAULT_SECS` and
+`WAIT_MAX_SECS` in mcp.rs), not the 600 s default discussed below.
 
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
@@ -579,12 +580,12 @@ guesses have been wrong in practice: broad web research kept going to OpenCode
 sessions on a free-tier model, which is close to the worst available match for
 it.
 
-**Pantheon does not merely omit the model, it never learns it.** `SESSION_TYPES`
-in `src/lib/ipc.ts` launches each agent CLI bare: `{ id: "opencode", program:
-"opencode", args: [] }`, and the same for `claude` and `codex`. No model flag is
-passed, so the model is whatever that CLI's own config selects, and Pantheon has
-no channel to find out. Any fix here starts by *acquiring* the fact, not by
-plumbing one Pantheon already holds.
+**The model is now acquired, but not routed on.** `SESSION_TYPES` in
+`src/lib/ipc.ts:35-41` gives each CLI a `modelFlag` (`--model` for claude, `-m`
+for codex and opencode), `src-tauri/src/lib.rs:995-998` accepts an optional
+`model` override and prepends the flag, and `note_session` stores it so
+`roster_lines` prints it as `- {id} ({kind}, {model})` (mcp.rs:604, 704-711).
+What is still open is the capability profile and the routing decision.
 
 Two places currently overstate what is known, which is worth correcting whether
 or not the larger item is built. The `list_sessions` tool description advertises
@@ -648,8 +649,10 @@ This is a privilege escalation and needs treating as such:
 ## Guardrail: OpenCode sessions must stay on free OpenRouter models
 
 OpenRouter is configured with a real account, so an OpenCode pane can select a
-paid model and silently spend money. Nothing in Pantheon currently constrains
-this, and the conductor cannot see what a pane costs.
+paid model and silently spend money. Pantheon now refuses a paid opencode model
+at launch (`is_paid_openrouter_model`, `src-tauri/src/lib.rs:173-184`, enforced
+at 1014-1024), but it still cannot see what a pane costs and the account-side
+budget remains unenforced.
 
 The naive implementation is wrong in a specific way worth writing down:
 
