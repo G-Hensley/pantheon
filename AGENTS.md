@@ -5,12 +5,16 @@ rather than siloed. Each agent gets a live terminal pane; panes can share a
 context store, and one can be promoted to conductor to fan work out and collect
 results.
 
-Runs on Windows and Linux: the terminal layer is `portable-pty`, which is ConPTY
-on Windows and a Unix PTY elsewhere. Status is working prototype, so read the
-Known gaps section of `README.md` before relying on any part of it.
+Runs on Windows and Linux: the terminal layer is `portable-pty`, which is ConPTY on
+Windows and a Unix PTY elsewhere. macOS is unexercised rather than ruled out.
+Status is working prototype, so read the Known gaps section of `README.md`
+before relying on any part of it.
 
-This file is orientation. It does not restate the global working-style rules or
-the delivery policy, both of which are already loaded from the parent tree.
+This file is orientation for this project only. The shared working-style rules, the
+guarded-change policy, and the greenfield stack defaults live in
+`~/Projects/global-llm-configs/AGENTS.md`, which every agent host loads. They are not
+restated here on purpose; if they seem to be missing, the host's symlink to that file is
+broken, so fix the symlink rather than copying the rules back in.
 
 ## Where things are
 
@@ -36,20 +40,14 @@ alongside the code. Read it when you pick work up and update it when you put it
 down. A status that no longer matches reality is worse than no status, because
 it is the one people trust.
 
-    agent-toolkit task list                    # what is open here
-    agent-toolkit task show <id>               # one task, including done_when
-    agent-toolkit task set <id> status=doing   # claim it
-    agent-toolkit task set <id> status=todo done_when="..."   # several at once
-    agent-toolkit task add "Title" --status backlog
+    lexicon task list                    # what is open here
+    lexicon task show <id>               # one task, including done_when
+    lexicon task set <id> status=doing   # claim it
+    lexicon task set <id> status=todo done_when="..."   # several at once
+    lexicon task add "Title" --status backlog
 
 Always go through the command rather than editing the JSON. The command holds
 the compare-and-swap that stops one agent's write reverting another's, and argv
 cannot be malformed the way a hand-written JSON document can.
 
 Reasoning stays in `BACKLOG.md`. A task links to it; it does not swallow it.
-
-## Writing style
-
-No em dashes in authored prose, documentation, or user-facing text. Use a colon,
-semicolon, comma, or parentheses. This applies to natural language, not to
-hyphens required by code, commands, flags, paths, or identifiers.
