@@ -295,15 +295,17 @@ fn run_with_timeout(
 
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let mut stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_reader = thread::spawn(move || {
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
-    let stderr_reader = thread::spawn(move || {
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut buf = String::new();
         let _ = stderr.read_to_string(&mut buf);
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let deadline = Instant::now() + timeout;
@@ -320,10 +322,22 @@ fn run_with_timeout(
         }
     };
 
-    // The child has exited, so both pipes are closed (or closing) and these
-    // reads cannot block for long.
-    let out = stdout_reader.join().unwrap_or_default();
-    let err = stderr_reader.join().unwrap_or_default();
+    // The child itself has exited, but a descendant it spawned (a
+    // backgrounded shell job, for example) can inherit the pipe and keep its
+    // write end open long after nothing more will ever arrive on it:
+    // `read_to_string` then blocks for that descendant's remaining lifetime,
+    // not the exited child's. Collecting through a channel with the *same*
+    // deadline the exit wait above used, rather than an unbounded thread
+    // join, is what keeps this call bounded by `timeout` no matter which
+    // process is still holding a pipe open.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let out = out_rx
+        .recv_timeout(remaining)
+        .map_err(|_| format!("timed out after {}s waiting for output", timeout.as_secs()))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let err = err_rx
+        .recv_timeout(remaining)
+        .map_err(|_| format!("timed out after {}s waiting for output", timeout.as_secs()))?;
     Ok((status, out, err))
 }
 
@@ -2547,6 +2561,30 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "took {:?}, should have completed almost immediately",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_is_bounded_even_when_a_descendant_outlives_the_child() {
+        // The shell backgrounds `sleep 2` (which inherits the piped stdout
+        // and stderr) and then exits immediately itself. try_wait sees the
+        // shell exit almost instantly, well inside the timeout, but the
+        // sleep process is still holding the write end of both pipes open:
+        // a plain `read_to_string`/thread join would then block for the
+        // sleep's remaining 2s, not the shell's near-zero runtime. The
+        // deadline on collecting output is what has to catch this, since the
+        // process-exit deadline above already passed.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2 & exit 0"]);
+        let started = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}, should have returned around the 200ms deadline, \
+             not waited out the backgrounded sleep",
             started.elapsed()
         );
     }
