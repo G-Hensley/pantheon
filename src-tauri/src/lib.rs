@@ -6,11 +6,13 @@
 // the background. In later milestones this grows a TOML registry + git-worktree
 // isolation; here it's the flat, working core.
 
+mod headless;
 mod mcp;
 mod worktree;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,6 +40,9 @@ struct SessionHandle {
     /// The program this session launched, so `submit_to` can tell which CLI it is
     /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
     program: String,
+    /// The resolved launch inputs retained for headless work in this pane's
+    /// checkout and against this pane's MCP endpoint.
+    launch: headless::LaunchSpec,
     /// This session's dedicated MCP listener. Present unless the endpoint failed
     /// and the session fell back to the shared one. Aborted on teardown; without
     /// this, one listener leaks per session for the life of the app.
@@ -463,6 +468,15 @@ impl SessionManager {
             .map(|h| h.program.clone())
     }
 
+    /// The launch inputs for a live session, if it is still held.
+    pub fn launch_of(&self, id: &str) -> Option<headless::LaunchSpec> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|handle| handle.launch.clone())
+    }
+
     /// Kill every session — used on window close so no agent process is orphaned
     /// and no worktree is left behind.
     fn kill_all(&self) {
@@ -677,6 +691,23 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// observer the token exists to stop.
 const CODEX_TOKEN_ENV: &str = "PANTHEON_MCP_TOKEN";
 
+fn write_private_file(path: &Path, body: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(body.as_bytes())
+}
+
 fn agent_mcp_wiring(
     program: &str,
     session_id: &str,
@@ -705,7 +736,7 @@ fn agent_mcp_wiring(
             let body = format!(
                 r#"{{"mcpServers":{{"pantheon":{{"type":"http","url":"{url}"{headers}}}}}}}"#
             );
-            match std::fs::write(&path, body) {
+            match write_private_file(&path, &body) {
                 Ok(_) => (
                     vec![
                         "--mcp-config".to_string(),
@@ -743,7 +774,7 @@ fn agent_mcp_wiring(
             let body = format!(
                 r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"pantheon":{{"type":"remote","url":"{url}"{headers}}}}}}}"#
             );
-            match std::fs::write(&path, body) {
+            match write_private_file(&path, &body) {
                 Ok(_) => (
                     vec![],
                     vec![(
@@ -1056,7 +1087,7 @@ async fn spawn_session(
     // provably from it — so identity needs no handshake and can't be spoofed or
     // forgotten. Sessions sharing one endpoint would all authenticate as
     // "unknown", which silently breaks brain assignment and the conductor.
-    let (extra_args, extra_env) =
+    let (mcp_args, mcp_env, endpoint) =
         match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
             Ok(server) => {
                 let url = format!("http://127.0.0.1:{}/mcp", server.port);
@@ -1064,7 +1095,13 @@ async fn spawn_session(
                 rollback.server = Some(server);
                 let model_str = model.as_deref().unwrap_or("");
                 shared.note_session(&session_id, &program, model_str);
-                agent_mcp_wiring(&program, &session_id, &url, Some(&token))
+                let (args, env) =
+                    agent_mcp_wiring(&program, &session_id, &url, Some(&token));
+                (
+                    args,
+                    env,
+                    headless::LaunchEndpoint::Dedicated { url, token },
+                )
             }
             // Endpoint failed: fall back to the shared one. The agent can still reach
             // the brain, it just has to declare who it is.
@@ -1077,11 +1114,21 @@ async fn spawn_session(
                 eprintln!("[pantheon] session endpoint failed, using shared: {e}");
                 let model_str = model.as_deref().unwrap_or("");
                 shared.note_session(&session_id, &program, model_str);
-                agent_mcp_wiring(&program, &session_id, &mcp.url, None)
+                let (args, env) = agent_mcp_wiring(&program, &session_id, &mcp.url, None);
+                (args, env, headless::LaunchEndpoint::Shared)
             }
         };
-    let mut args = args;
-    args.extend(extra_args);
+    let launch = headless::LaunchSpec::for_session(
+        session_cwd.clone(),
+        program.clone(),
+        args,
+        model.as_deref(),
+        model_flag.as_deref(),
+        mcp_args,
+        mcp_env,
+        &session_id,
+        endpoint,
+    );
 
     // Starts "active now" so a session that never writes anything is governed by
     // SUBMIT_FLOOR_MS rather than looking quiet since the epoch.
@@ -1119,18 +1166,12 @@ async fn spawn_session(
             )));
         }
 
-        // Prepend the model flag and model to the command when both are provided.
-        // The model_flag comes from the frontend's SessionType definition, so
-        // there's a single source of truth for which CLI uses which flag.
-        if let (Some(ref m), Some(ref flag)) = (model, model_flag) {
-            args.insert(0, flag.clone());
-            args.insert(1, m.clone());
-        }
-
-        let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
-        // The agent's Pantheon name = its session id, so the collab skill can
-        // self-identify and the app can map it to a brain.
-        cmd.env("PANTHEON_SESSION", &session_id);
+        let cmd = build_command(
+            &launch.program,
+            &launch.args,
+            &launch.cwd,
+            &launch.env,
+        );
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave); // so the reader hits EOF when the child exits
 
@@ -1146,6 +1187,7 @@ async fn spawn_session(
                 worktree,
                 last_output: activity.clone(),
                 program: program.clone(),
+                launch,
                 server,
             },
         );
@@ -2119,11 +2161,21 @@ mod tests {
             .position(|a| a == "--mcp-config")
             .map(|i| args[i + 1].clone())
             .expect("claude gets a --mcp-config path");
-        let body = std::fs::read_to_string(path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
         assert!(
             body.contains(r#""Authorization":"Bearer secret123""#),
             "{body}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                file_mode & 0o777,
+                0o600,
+                "token file mode was {file_mode:o}"
+            );
+        }
         assert!(
             env.is_empty(),
             "claude reads the token from its config file"
