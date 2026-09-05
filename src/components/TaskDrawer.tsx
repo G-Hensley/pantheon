@@ -165,6 +165,8 @@ function TaskItem({
       <div className="taskitem-top">
         {pane && <span className="taskitem-agent">{pane.type.label}</span>}
         <span className="taskitem-target">{task.target}</span>
+        <span className="taskitem-mode">{task.mode ?? "pane"}</span>
+        {task.exit_code != null && <span className="taskitem-exit">exit {task.exit_code}</span>}
         {!pane && <span className="taskitem-pane-closed">pane closed</span>}
         <span className="taskitem-status" data-status={task.status}>
           {statusLabel(task.status)}

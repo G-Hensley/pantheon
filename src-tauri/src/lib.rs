@@ -49,9 +49,32 @@ struct SessionHandle {
     server: Option<mcp::SessionServer>,
 }
 
+#[derive(Clone)]
 struct ActiveHeadless {
     pane_id: String,
     tree: Arc<dyn headless::ProcessTree>,
+    cancellation: Arc<HeadlessCancellation>,
+}
+
+#[derive(Default)]
+struct HeadlessCancellation {
+    requested: AtomicBool,
+    finished: Mutex<bool>,
+    done: std::sync::Condvar,
+}
+
+impl HeadlessCancellation {
+    fn wait(&self) {
+        let mut finished = self.finished.lock().unwrap();
+        while !*finished {
+            finished = self.done.wait(finished).unwrap();
+        }
+    }
+
+    fn complete(&self) {
+        *self.finished.lock().unwrap() = true;
+        self.done.notify_all();
+    }
 }
 
 /// Process-monotonic millisecond clock, used to time the gap between a prompt
@@ -560,10 +583,10 @@ impl Drop for SpawnRollback {
 impl SessionManager {
     fn kill(&self, id: &str) {
         let handle = self.sessions.lock().unwrap().remove(id);
-        self.kill_headless_for_pane(id);
+        let cleanup = self.kill_headless_for_pane(id);
         if let Some(mut h) = handle {
             let _ = h.child.kill();
-            release_session(id, h);
+            release_after_headless(id.to_string(), h, cleanup);
         }
     }
 
@@ -710,7 +733,26 @@ impl SessionManager {
         budget_usd: f64,
         timeout: Duration,
     ) -> Result<headless::HeadlessOutcome, headless::HeadlessError> {
-        let (child, cli_session) = {
+        self.run_headless_registered(id, brief, budget_usd, timeout, |_| {})
+    }
+
+    pub(crate) fn headless_activity_age_ms(&self, id: &str) -> Option<u64> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|h| mono_ms().saturating_sub(h.last_output.load(Ordering::Acquire)))
+    }
+
+    pub(crate) fn run_headless_registered(
+        &self,
+        id: &str,
+        brief: &str,
+        budget_usd: f64,
+        timeout: Duration,
+        registered: impl FnOnce(&str),
+    ) -> Result<headless::HeadlessOutcome, headless::HeadlessError> {
+        let (child, cli_session, cancellation) = {
             // Hold the session map through registration so pane close cannot
             // remove the worktree between lookup and child tracking.
             let sessions = self.sessions.lock().unwrap();
@@ -720,33 +762,76 @@ impl SessionManager {
                 .ok_or_else(|| headless::HeadlessError::SessionNotFound(id.to_string()))?;
             let child = headless::HeadlessChild::spawn(id, &launch, brief, budget_usd)?;
             let cli_session = child.cli_session().to_string();
+            let cancellation = Arc::new(HeadlessCancellation::default());
             self.headless.lock().unwrap().insert(
                 cli_session.clone(),
                 ActiveHeadless {
                     pane_id: id.to_string(),
                     tree: child.process_tree(),
+                    cancellation: cancellation.clone(),
                 },
             );
-            (child, cli_session)
+            (child, cli_session, cancellation)
         };
+        registered(&cli_session);
         let result = child.wait(timeout);
-        self.headless.lock().unwrap().remove(&cli_session);
+        // Decide exit versus cancellation under the registry lock: cancellation
+        // marks its latch under the same lock. Retain cancelled entries until
+        // cleanup completes so a concurrent pane close also waits before
+        // removing its worktree and endpoint.
+        let cancelled = {
+            let mut active = self.headless.lock().unwrap();
+            let cancelled = cancellation.requested.load(Ordering::Acquire);
+            if !cancelled {
+                active.remove(&cli_session);
+            }
+            cancelled
+        };
+        if cancelled {
+            cancellation.wait();
+            self.headless.lock().unwrap().remove(&cli_session);
+        }
+        if cancelled || self.shutting_down.load(Ordering::Acquire) {
+            return cancelled_headless_result(result);
+        }
         result
     }
 
-    fn kill_headless_for_pane(&self, pane_id: &str) {
-        let trees = {
-            let mut active = self.headless.lock().unwrap();
-            let ids = active
-                .iter()
-                .filter(|(_, child)| child.pane_id == pane_id)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| active.remove(&id).map(|child| child.tree))
+    pub(crate) fn kill_headless_for_pane(&self, pane_id: &str) -> Option<thread::JoinHandle<()>> {
+        let children = {
+            let active = self.headless.lock().unwrap();
+            active
+                .values()
+                .filter(|child| child.pane_id == pane_id)
+                .map(|child| {
+                    let newly_cancelled =
+                        !child.cancellation.requested.swap(true, Ordering::AcqRel);
+                    (child.clone(), newly_cancelled)
+                })
                 .collect::<Vec<_>>()
         };
-        terminate_headless_trees(trees, headless::HEADLESS_TERMINATION_GRACE);
+        if children.is_empty() {
+            return None;
+        }
+        for (child, newly_cancelled) in &children {
+            if *newly_cancelled {
+                let _ = child.tree.terminate();
+            }
+        }
+        Some(thread::spawn(move || {
+            if children.iter().any(|(_, newly_cancelled)| *newly_cancelled) {
+                thread::sleep(headless::HEADLESS_TERMINATION_GRACE);
+                for (child, newly_cancelled) in &children {
+                    if *newly_cancelled {
+                        let _ = child.tree.kill();
+                        child.cancellation.complete();
+                    }
+                }
+            }
+            for (child, _) in children {
+                child.cancellation.wait();
+            }
+        }))
     }
 
     /// Start graceful cleanup away from the event-loop thread. Returns the one
@@ -810,16 +895,34 @@ fn kill_session_handles(handles: Vec<(String, SessionHandle)>) {
     }
 }
 
-fn terminate_headless_trees(trees: Vec<Arc<dyn headless::ProcessTree>>, grace: Duration) {
-    if trees.is_empty() {
-        return;
-    }
-    for tree in &trees {
-        let _ = tree.terminate();
-    }
-    thread::sleep(grace);
-    for tree in &trees {
-        let _ = tree.kill();
+fn cancelled_headless_result(
+    result: Result<headless::HeadlessOutcome, headless::HeadlessError>,
+) -> Result<headless::HeadlessOutcome, headless::HeadlessError> {
+    let (exit_code, usage) = match result {
+        Ok(o) => (o.exit_code, o.usage.map(Box::new)),
+        Err(headless::HeadlessError::Exited {
+            exit_code, usage, ..
+        }) => (exit_code, usage),
+        Err(headless::HeadlessError::InvalidJson { exit_code, .. }) => (exit_code, None),
+        _ => (None, None),
+    };
+    Err(headless::HeadlessError::Cancelled { exit_code, usage })
+}
+
+// A pane's worktree and endpoint outlive the child termination grace. Cleanup
+// is off the event-loop thread, but never races the child still using them.
+fn release_after_headless(
+    id: String,
+    handle: SessionHandle,
+    cleanup: Option<thread::JoinHandle<()>>,
+) {
+    if let Some(cleanup) = cleanup {
+        thread::spawn(move || {
+            let _ = cleanup.join();
+            release_session(&id, handle);
+        });
+    } else {
+        release_session(&id, handle);
     }
 }
 
@@ -1571,13 +1674,12 @@ async fn spawn_session(
     // stranding a directory, a branch, and a port for every session that wasn't
     // closed by hand.
     let handle = state.sessions.lock().unwrap().remove(&session_id);
-    state.kill_headless_for_pane(&session_id);
+    let cleanup = state.kill_headless_for_pane(&session_id);
     if let Some(h) = handle {
-        release_session(&session_id, h);
-    } else {
-        // Already removed by an explicit kill, which cleaned the rest.
-        let _ = std::fs::remove_dir_all(session_config_dir(&session_id));
+        release_after_headless(session_id.clone(), h, cleanup);
     }
+    // If an explicit kill removed the handle, it owns cleanup, possibly after
+    // a headless child's termination grace. Do not remove its config early.
     let _ = app.emit("session-exited", &session_id);
     Ok(())
 }
@@ -1860,6 +1962,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn externally_killed_headless_result_keeps_exit_and_usage() {
+        use crate::headless::{HeadlessError, HeadlessOutcome, HeadlessUsage};
+        let result = super::cancelled_headless_result(Ok(HeadlessOutcome {
+            result: "partial".into(),
+            cli_session: "uuid".into(),
+            stderr: String::new(),
+            exit_code: Some(143),
+            usage: Some(HeadlessUsage {
+                input_tokens: Some(9),
+                ..Default::default()
+            }),
+        }));
+        match result {
+            Err(HeadlessError::Cancelled { exit_code, usage }) => {
+                assert_eq!(exit_code, Some(143));
+                assert_eq!(usage.unwrap().input_tokens, Some(9));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        // The live SessionHandle/PTY registration path cannot be built by the
+        // shared-store fixture. This is the exact conversion used after its
+        // cancellation latch fires; process-tree termination is tested separately.
+    }
+
+    #[test]
+    fn run_headless_registered_drops_an_uninvoked_callbacks_captured_guard_on_session_not_found() {
+        use crate::headless::HeadlessError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::RwLock;
+
+        // mcp.rs's run_headless_task moves a store_gate/delivery/pane-lock
+        // guard into the `registered` callback and relies on that callback
+        // being the thing that drops it. A pre-review flagged the path where
+        // the callback never runs at all (the session is gone before
+        // `run_headless_registered` reaches its own lookup) as a possible
+        // guard leak into `headless_exited_at`, which re-acquires one of the
+        // same guards. This reproduces that shape directly: no live session
+        // exists here at all, so the callback below can never run, yet the
+        // guard it would have dropped must still be free the moment this
+        // call returns, because dropping an un-invoked `FnOnce` drops
+        // whatever it captured by move; there is no code path in
+        // `run_headless_registered` that holds `registered` open past its
+        // own early return. Nothing needed changing to make this pass; it
+        // pins the guarantee mcp.rs's comment at that call site now relies on.
+        let manager = SessionManager::default();
+        let held = std::sync::Arc::new(RwLock::new(()));
+        let guard = held.read().unwrap();
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let called_from_closure = called.clone();
+        let result = manager.run_headless_registered(
+            "no-such-session",
+            "brief",
+            5.0,
+            Duration::from_secs(1),
+            move |_session| {
+                called_from_closure.store(true, Ordering::SeqCst);
+                drop(guard);
+            },
+        );
+        assert!(
+            matches!(&result, Err(HeadlessError::SessionNotFound(id)) if id == "no-such-session"),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "the callback must not run when the session is gone"
+        );
+        assert!(
+            held.try_write().is_ok(),
+            "the callback's captured guard leaked past a call that never invoked it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn kill_all_returns_quickly_then_kills_an_active_headless_tree() {
         let manager = SessionManager::default();
         let mut command = std::process::Command::new("sh");
@@ -1871,6 +2048,7 @@ mod tests {
             ActiveHeadless {
                 pane_id: "sess-test".to_string(),
                 tree: process.tree.clone(),
+                cancellation: std::sync::Arc::new(super::HeadlessCancellation::default()),
             },
         );
 

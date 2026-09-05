@@ -137,7 +137,22 @@ export type Exchange = {
   asked_ms: number;
 };
 
+export type TaskUsage = {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_creation_input_tokens: number | null;
+  cache_read_input_tokens: number | null;
+  cost_usd: number | null;
+  turns: number | null;
+  duration_ms: number | null;
+  duration_api_ms: number | null;
+};
+
 export type ConductorTask = {
+  mode?: "pane" | "headless";
+  exit_code?: number | null;
+  cli_session?: string;
+  usage?: TaskUsage | null;
   id: string;
   from: string;
   target: string;

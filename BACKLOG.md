@@ -52,6 +52,24 @@ maintainer to reproduce.
 
 ## Dispatch headlessly (`opencode run`) instead of typing into the TUI
 
+**Shipped for Claude, task y4fz0h, in `feat/headless-dispatch-tool`.** MCP `dispatch(headless: true)` now calls
+the PR #40 process owner through the per-pane queue, waits for 30 seconds of
+quiet, and maps process exit into the result/review lifecycle without requiring
+`complete_task`. Multiline briefs bypass the pane byte limit. Mode, exit code,
+budget, CLI UUID, and usage (including any tool the child was refused) are
+persisted; cancellation reaches the process tree. The budget is
+conductor-settable per dispatch (`budget_usd`, $5.00 default, $25.00 ceiling,
+refused rather than clamped when out of range), after a rework brief found the
+first cut's fixed $1.00 failed any real task against the measurement below.
+Evidence: 335 Rust tests and 29 Vitest tests pass, including lifecycle, queue,
+parser, process-tree cancellation, and TaskDrawer cases; `pnpm build` passes,
+and Clippy reports only the existing `spawn_session` argument-count warning.
+Claude 2.1.261 measurement observed success exit 0 and budget
+failure exit 1 with `is_error`, `errors`, `subtype`, and `terminal_reason`.
+OpenCode support, live transcript streaming, and headless resume remain open;
+rework notices still go to the pane. The original OpenCode cold-start evidence
+below motivates that remaining host work.
+
 The 30 second ceiling on local-model requests is **not** an OpenCode-wide
 limit. It belongs to the interactive session path only.
 

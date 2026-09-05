@@ -35,6 +35,12 @@ function makePane(id: string) {
 }
 
 describe("<TaskDrawer>", () => {
+  it("shows headless mode and a zero exit code", () => {
+    const task = makeTask({ mode: "headless", status: "done", exit_code: 0 });
+    render(<TaskDrawer tasks={[task]} panes={[]} onClose={() => {}} onFocusPane={() => {}} />);
+    expect(screen.getByText("headless")).toBeInTheDocument();
+    expect(screen.getByText("exit 0")).toBeInTheDocument();
+  });
   it("renders all six concurrent open tasks — none dropped past the old five-item cap", () => {
     const tasks = Array.from({ length: 6 }, (_, i) =>
       makeTask({ target: `sess-${i}`, task: `distinct task brief number ${i}` }),
