@@ -1983,6 +1983,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn kill_all_returns_quickly_then_kills_an_active_headless_tree() {
         let manager = SessionManager::default();
