@@ -34,13 +34,20 @@ agent from the rest of the system. Concretely, today:
 - Git worktree isolation assumes the repository and its contents are already
   trusted. It exists to keep parallel agents from clobbering each other's
   edits, not to contain a hostile one.
+- Each session's MCP bearer token is written into that session's generated CLI
+  config file under the app data directory. On Unix the file is created with
+  mode 0600. On Windows it inherits the containing directory's ACL, which on a
+  default single-user profile is already private to that account; no explicit
+  DACL is applied. That is a decision, taken 2026-09-04, not an oversight: the
+  threat model above excludes shared machines, and the Linux machine this
+  project is developed on cannot exercise Windows ACL code.
 
 None of this is a secret; it is documented here so you can decide whether
 Pantheon fits your setup. Do not run Pantheon on a machine or account you share
 with untrusted users, and do not point it at a project or an agent you do not
-already trust. Hardening this further (per-session tokens, tighter IPC and
-environment scoping, path canonicalization) is tracked as future work, not
-promised behavior.
+already trust. Hardening this further (tighter IPC and environment scoping,
+path canonicalization, Windows ACLs on the token files) is tracked as future
+work, not promised behavior.
 
 ## Scope
 
