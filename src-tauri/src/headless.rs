@@ -265,7 +265,7 @@ pub(crate) fn terminate_process_tree(tree: &dyn ProcessTree, grace: Duration) ->
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -301,10 +301,15 @@ pub enum HeadlessError {
         exit_code: Option<i32>,
         stderr: String,
     },
+    Cancelled {
+        exit_code: Option<i32>,
+        usage: Option<Box<HeadlessUsage>>,
+    },
     Exited {
         exit_code: Option<i32>,
         message: String,
         stderr: String,
+        usage: Option<Box<HeadlessUsage>>,
     },
     InvalidJson {
         error: String,
@@ -317,6 +322,7 @@ pub enum HeadlessError {
 impl fmt::Display for HeadlessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled { .. } => formatter.write_str("headless child cancelled"),
             Self::SessionNotFound(id) => write!(formatter, "no live session '{id}'"),
             Self::Unsupported(program) => {
                 write!(
@@ -346,6 +352,7 @@ impl fmt::Display for HeadlessError {
                 exit_code,
                 message,
                 stderr,
+                ..
             } => write!(
                 formatter,
                 "headless child exited {}: {}{}",
@@ -385,7 +392,14 @@ fn display_stderr(stderr: &str) -> String {
 
 #[derive(Deserialize)]
 struct ClaudeJson {
-    result: String,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    errors: Vec<String>,
+    #[serde(default)]
+    subtype: String,
+    #[serde(default)]
+    terminal_reason: String,
     session_id: String,
     #[serde(default)]
     is_error: bool,
@@ -425,14 +439,6 @@ fn parse_claude_output(
             stdout: String::from_utf8_lossy(stdout).into_owned(),
             stderr: stderr.clone(),
         })?;
-    if parsed.is_error {
-        return Err(HeadlessError::Exited {
-            exit_code,
-            message: parsed.result,
-            stderr,
-        });
-    }
-
     let usage = if parsed.usage.is_some()
         || parsed.total_cost_usd.is_some()
         || parsed.num_turns.is_some()
@@ -459,8 +465,32 @@ fn parse_claude_output(
         None
     };
 
+    if parsed.is_error || exit_code != Some(0) {
+        let mut details = parsed.errors;
+        if let Some(result) = parsed.result.filter(|s| !s.is_empty()) {
+            details.push(result);
+        }
+        if !parsed.subtype.is_empty() {
+            details.push(parsed.subtype);
+        }
+        if !parsed.terminal_reason.is_empty() {
+            details.push(parsed.terminal_reason);
+        }
+        return Err(HeadlessError::Exited {
+            exit_code,
+            message: details.join(": "),
+            stderr,
+            usage: usage.map(Box::new),
+        });
+    }
+
     Ok(HeadlessOutcome {
-        result: parsed.result,
+        result: parsed.result.ok_or_else(|| HeadlessError::InvalidJson {
+            error: "successful JSON result is missing result text".into(),
+            exit_code,
+            stdout: String::from_utf8_lossy(stdout).into_owned(),
+            stderr: stderr.clone(),
+        })?,
         cli_session: parsed.session_id,
         usage,
         exit_code,
@@ -624,23 +654,6 @@ impl HeadlessChild {
         if let Some(error) = raw.input_error {
             return Err(HeadlessError::Input(error));
         }
-        if !raw.status.success() {
-            let message = serde_json::from_slice::<serde_json::Value>(&raw.stdout)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("result")
-                        .or_else(|| value.get("error"))
-                        .and_then(|message| message.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&raw.stdout).into_owned());
-            return Err(HeadlessError::Exited {
-                exit_code,
-                message,
-                stderr,
-            });
-        }
         parse_claude_output(&raw.stdout, stderr, exit_code)
     }
 
@@ -770,6 +783,49 @@ mod tests {
     }
 
     #[test]
+    fn success_requires_result_text() {
+        assert!(matches!(
+            parse_claude_output(
+                br#"{"session_id":"uuid","is_error":false}"#,
+                String::new(),
+                Some(0)
+            ),
+            Err(HeadlessError::InvalidJson { .. })
+        ));
+    }
+
+    #[test]
+    fn measured_budget_error_retains_error_array_and_usage_without_result() {
+        let error = parse_claude_output(br#"{"session_id":"uuid","is_error":true,"subtype":"error_max_budget_usd","terminal_reason":"budget_exhausted","errors":["Reached maximum budget ($0.05)"],"total_cost_usd":0.24,"usage":{"input_tokens":1,"cache_creation_input_tokens":2000}}"#, String::new(), Some(1)).unwrap_err();
+        match error {
+            HeadlessError::Exited {
+                exit_code,
+                message,
+                usage,
+                ..
+            } => {
+                assert_eq!(exit_code, Some(1));
+                assert!(message.contains("Reached maximum budget ($0.05)"));
+                assert!(message.contains("budget_exhausted"));
+                assert_eq!(usage.unwrap().cost_usd, Some(0.24));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn json_error_flag_at_exit_zero_is_still_an_error() {
+        assert!(matches!(
+            parse_claude_output(
+                br#"{"session_id":"uuid","is_error":true,"result":"failed"}"#,
+                String::new(),
+                Some(0)
+            ),
+            Err(HeadlessError::Exited { .. })
+        ));
+    }
+
+    #[test]
     fn launch_spec_retains_dedicated_endpoint_and_exact_pane_launch() {
         let endpoint = LaunchEndpoint::Dedicated {
             url: "http://127.0.0.1:43123/mcp".to_string(),
@@ -822,7 +878,7 @@ mod tests {
             token: "secret".to_string(),
         });
         let command = build_claude_command(&spec, "cli-session", 1.25);
-        let mut args = command
+        let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -830,9 +886,10 @@ mod tests {
         // headless arguments begin after those two.
         #[cfg(windows)]
         {
-            let wrapper = args.drain(..2).collect::<Vec<_>>();
-            assert_eq!(wrapper, ["/c", "claude"]);
+            assert_eq!(&args[..2], ["/c", "claude"]);
         }
+        #[cfg(windows)]
+        let args = args[2..].to_vec();
 
         assert_eq!(
             args,

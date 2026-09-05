@@ -64,7 +64,7 @@ fn oversize_refusal(injection: &str) -> Option<String> {
             "brief is {over} bytes too long to deliver intact ({} bytes; the most that \
              can be delivered is {}). Longer briefs reach the agent with the beginning \
              silently missing. Split this into smaller tasks, or shorten it and point \
-             the agent at a file for the detail.",
+             the agent at a file for the detail, or use headless: true for Claude.",
             injection.len(),
             MAX_INJECTION_BYTES - 1
         )
@@ -82,8 +82,10 @@ fn single_line(s: &str) -> String {
 }
 
 fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
-    let task = single_line(task);
+    dispatch_prompt_raw(conductor, task_id, &single_line(task))
+}
 
+fn dispatch_prompt_raw(conductor: &str, task_id: &str, task: &str) -> String {
     // Deliberately lean. Every byte spent here is a byte the brief cannot
     // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
     // agent can learn from an MCP tool call does not belong in the terminal.
@@ -224,6 +226,14 @@ pub struct AgentSession {
 /// One dispatched unit of work, from the conductor to another session.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Task {
+    #[serde(default = "pane_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub cli_session: String,
+    #[serde(default)]
+    pub usage: Option<Usage>,
     pub id: String,
     pub from: String,
     pub target: String,
@@ -310,6 +320,124 @@ pub struct Task {
     pub notice_delivered: bool,
 }
 
+fn headless_ready(activity_age_ms: Option<u64>, connected: bool) -> bool {
+    connected && activity_age_ms.is_some_and(|age| age >= crate::headless::HEADLESS_QUIET_MS)
+}
+
+fn abandon_headless_on_load(tasks: &mut [Task]) -> Vec<Task> {
+    let mut changed = Vec::new();
+    for t in tasks
+        .iter_mut()
+        .filter(|t| t.mode == "headless" && is_open(&t.status))
+    {
+        t.status = STATUS_ABANDONED.into();
+        t.done_ms = Some(Shared::now_ms());
+        if t.result.is_empty() {
+            t.result = "headless task abandoned after app restart".into();
+        }
+        changed.push(t.clone());
+    }
+    changed
+}
+
+fn apply_headless_exit(
+    t: &mut Task,
+    outcome: &Result<crate::headless::HeadlessOutcome, crate::headless::HeadlessError>,
+    now: u64,
+) {
+    use crate::headless::HeadlessError;
+    let (code, failure) = match outcome {
+        Ok(o) => {
+            t.usage = o.usage.clone();
+            // The registered UUID is authoritative; retain it on errors too.
+            if t.cli_session.is_empty() {
+                t.cli_session = o.cli_session.clone();
+            }
+            (
+                o.exit_code,
+                if o.exit_code == Some(0) {
+                    None
+                } else {
+                    Some(o.stderr.clone())
+                },
+            )
+        }
+        Err(HeadlessError::Exited {
+            exit_code,
+            message,
+            stderr,
+            usage,
+        }) => {
+            t.usage = usage.as_deref().cloned();
+            (
+                *exit_code,
+                Some(if message.is_empty() {
+                    stderr.clone()
+                } else {
+                    message.clone()
+                }),
+            )
+        }
+        Err(HeadlessError::Cancelled { exit_code, usage }) => {
+            t.usage = usage.as_deref().cloned();
+            (*exit_code, Some("headless child cancelled".into()))
+        }
+        Err(HeadlessError::InvalidJson {
+            exit_code,
+            stderr,
+            error,
+            ..
+        }) => (
+            *exit_code,
+            Some(if stderr.is_empty() {
+                format!("invalid JSON: {error}")
+            } else {
+                stderr.clone()
+            }),
+        ),
+        Err(HeadlessError::Timeout {
+            exit_code,
+            timeout,
+            stderr,
+        }) => (
+            *exit_code,
+            Some(format!(
+                "wall-clock cap exceeded ({} ms): {stderr}",
+                timeout.as_millis()
+            )),
+        ),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    t.exit_code = code;
+    if accepts_result(&t.status) {
+        if let Some(reason) = failure {
+            t.status = if matches!(
+                outcome,
+                Err(HeadlessError::SessionNotFound(_) | HeadlessError::Cancelled { .. })
+            ) {
+                "cancelled"
+            } else {
+                "error"
+            }
+            .into();
+            t.done_ms = Some(now);
+            t.result = format!(
+                "exited {}: {reason}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+        }
+    }
+}
+
+fn pane_mode() -> String {
+    "pane".to_string()
+}
+
+pub type Usage = crate::headless::HeadlessUsage;
+const HEADLESS_MAX_MS: u64 = 2 * TASK_OVERDUE_MS;
+const HEADLESS_BUDGET_USD: f64 = 1.0;
+
 /// One question from a working agent and the conductor's answer to it.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct Exchange {
@@ -383,7 +511,7 @@ const STORE_FILE: &str = "brain.jsonl";
 enum StoreRecord {
     Entry(Entry),
     Session(AgentSession),
-    Task(Task),
+    Task(Box<Task>),
 }
 
 #[derive(Default)]
@@ -412,6 +540,7 @@ fn load_brain(dir: &Path) -> StoredBrain {
                 }
             }
             StoreRecord::Task(task) => {
+                let task = *task;
                 if let Some(existing) = brain.tasks.iter_mut().find(|t| t.id == task.id) {
                     *existing = task;
                 } else {
@@ -508,6 +637,7 @@ pub struct DispatchOutcome {
     /// 1-based position in the target's queue, set exactly when `queued` is
     /// `true`.
     pub queue_position: Option<usize>,
+    pub quiet_age_secs: Option<u64>,
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
@@ -536,6 +666,32 @@ fn dispatch_precheck(
         return Err(format!(
             "no live session '{target}'. Call list_sessions for valid targets."
         ));
+    }
+    dispatch_mode_precheck(target, injection, None)
+}
+
+fn dispatch_mode_precheck(
+    target: &str,
+    injection: &str,
+    launch: Option<&crate::headless::LaunchSpec>,
+) -> Result<(), String> {
+    if let Some(launch) = launch {
+        if launch
+            .program
+            .to_ascii_lowercase()
+            .trim_end_matches(".exe")
+            .trim_end_matches(".cmd")
+            != "claude"
+        {
+            return Err(format!(
+                "headless dispatch does not support {} yet",
+                launch.program
+            ));
+        }
+        if matches!(launch.endpoint, crate::headless::LaunchEndpoint::Shared) {
+            return Err(format!("refused: {target} has no per-session endpoint; restart the pane or send a pane brief"));
+        }
+        return Ok(());
     }
     // Last, so a conductor that got the target wrong hears about the target.
     // Both errors are actionable, but only one of them is about the thing the
@@ -567,6 +723,9 @@ fn dispatch_precheck(
 /// out of `Shared` entirely.
 /// Named so the `Notifier` field stays readable; clippy flags the raw form as
 /// a very complex type.
+#[cfg(test)]
+type TestSeam = Arc<dyn Fn(&str) + Send + Sync>;
+
 type EmitFn = Box<dyn Fn(&str) + Send + Sync>;
 
 pub struct Notifier(Option<EmitFn>);
@@ -597,6 +756,10 @@ pub struct Shared {
     /// Where entries are mirrored as markdown. Follows the picked project, so it
     /// changes at runtime rather than being fixed at startup.
     dir: Mutex<PathBuf>,
+    /// Distinguish a brain first loaded after restart from an in-app round trip.
+    loaded_dirs: Mutex<HashSet<PathBuf>>,
+    /// A worker's registration and source journal must not move mid-write.
+    store_gate: RwLock<()>,
     entries: Mutex<Vec<Entry>>,
     sessions: Mutex<Vec<AgentSession>>,
     /// agent name -> brain (room). The app owns this; drag reassigns it live.
@@ -644,6 +807,8 @@ pub struct Shared {
     /// removed: a project has few, long-lived pane names, so the map does
     /// not grow without bound.
     pane_delivery: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    headless_running: Mutex<HashMap<String, String>>,
+    headless_reported: Mutex<HashSet<String>>,
     /// A test-only pause point, absent from every non-test build (the field
     /// does not exist at all outside `#[cfg(test)]`, so this costs nothing
     /// in production). `hit_test_seam` calls the hook, if one is set, at a
@@ -659,10 +824,214 @@ pub struct Shared {
     /// a lock, both let the unfixed code pass by accident when the OS
     /// schedules the two threads sequentially instead of concurrently.
     #[cfg(test)]
-    test_seam: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    test_seam: Mutex<Option<TestSeam>>,
 }
 
 impl Shared {
+    fn headless_busy(&self, pane: &str) -> bool {
+        self.headless_running
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p == pane)
+    }
+
+    fn start_headless_worker(shared: &Arc<Self>) {
+        let weak = Arc::downgrade(shared);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(shared) = weak.upgrade() else {
+                break;
+            };
+            if shared.is_halted() {
+                continue;
+            }
+            let _store = shared.store_gate.read().unwrap();
+            let origin = shared.dir.lock().unwrap().clone();
+            let tasks = shared.tasks_snapshot();
+            for task in tasks
+                .iter()
+                .filter(|t| t.mode == "headless" && is_open(&t.status))
+            {
+                shared.drain_pane(&task.target);
+                // One worker per task, including the interval before spawn and
+                // after complete_task but before wait has reaped the child.
+                if task.status != "pending" || !task.cli_session.is_empty() {
+                    continue;
+                }
+                let mut running = shared.headless_running.lock().unwrap();
+                if running.contains_key(&task.id) || running.values().any(|p| p == &task.target) {
+                    continue;
+                }
+                running.insert(task.id.clone(), task.target.clone());
+                drop(running);
+                let worker = shared.clone();
+                let task = task.clone();
+                let origin = origin.clone();
+                std::thread::spawn(move || {
+                    worker.run_headless_task(&task, &origin);
+                    worker.headless_running.lock().unwrap().remove(&task.id);
+                    worker.headless_reported.lock().unwrap().remove(&task.id);
+                    worker.drain_pane(&task.target);
+                });
+            }
+        });
+    }
+
+    fn run_headless_task(&self, task: &Task, origin: &Path) {
+        let store_gate = self.store_gate.read().unwrap();
+        if *self.dir.lock().unwrap() != origin {
+            return;
+        }
+        let gate = self.delivery.read().unwrap();
+        let pane_lock = self.pane_delivery_lock(&task.target);
+        let pane_gate = pane_lock.lock().unwrap();
+        if self.is_halted()
+            || !self.tasks.lock().unwrap().iter().any(|t| {
+                t.id == task.id
+                    && t.target == task.target
+                    && t.status == "pending"
+                    && t.cli_session.is_empty()
+            })
+        {
+            return;
+        }
+        let Some(age) = self.engine.headless_activity_age_ms(&task.target) else {
+            drop(pane_gate);
+            drop(gate);
+            drop(store_gate);
+            self.headless_exited_at(
+                origin,
+                task,
+                Err(crate::headless::HeadlessError::SessionNotFound(
+                    task.target.clone(),
+                )),
+            );
+            return;
+        };
+        if !headless_ready(Some(age), self.is_connected(&task.target)) {
+            return;
+        }
+        let prompt = dispatch_prompt_raw(&task.from, &task.id, &task.task);
+        // The callback runs synchronously after registration. Cancel/Stop cannot
+        // obtain delivery.write until the new process is visible to their kill.
+        let outcome = self.engine.run_headless_registered(
+            &task.target,
+            &prompt,
+            HEADLESS_BUDGET_USD,
+            Duration::from_millis(HEADLESS_MAX_MS),
+            |session| {
+                self.mutate_and_journal(|tasks| {
+                    let Some(t) = tasks.iter_mut().find(|t| t.id == task.id) else {
+                        return ((), vec![]);
+                    };
+                    t.cli_session = session.into();
+                    t.ts_ms = Self::now_ms();
+                    ((), vec![t.clone()])
+                });
+                drop(pane_gate);
+                drop(gate);
+                drop(store_gate);
+                self.app.emit("conductor-changed");
+            },
+        );
+        self.headless_exited_at(origin, task, outcome);
+    }
+
+    #[cfg(test)]
+    fn headless_exited(
+        &self,
+        original: &Task,
+        outcome: Result<crate::headless::HeadlessOutcome, crate::headless::HeadlessError>,
+    ) {
+        let origin = self.dir.lock().unwrap().clone();
+        self.headless_exited_at(&origin, original, outcome);
+    }
+
+    fn headless_exited_at(
+        &self,
+        origin: &Path,
+        original: &Task,
+        outcome: Result<crate::headless::HeadlessOutcome, crate::headless::HeadlessError>,
+    ) {
+        let _store = self.store_gate.read().unwrap();
+        if *self.dir.lock().unwrap() != origin {
+            // The process exit is a one-shot event. Persist it to the original
+            // brain even when another project is on screen. On return, set_dir
+            // loads the result and drains its normal review/rework notices.
+            let mut brain = load_brain(origin);
+            let reported = self
+                .headless_reported
+                .lock()
+                .unwrap()
+                .contains(&original.id);
+            let Some(t) = brain
+                .tasks
+                .iter_mut()
+                .find(|t| t.id == original.id && t.target == original.target)
+            else {
+                return;
+            };
+            let status = t.status.clone();
+            let result = t.result.clone();
+            let done_ms = t.done_ms;
+            apply_headless_exit(t, &outcome, Self::now_ms());
+            if reported {
+                t.status = status;
+                t.result = result;
+                t.done_ms = done_ms;
+            }
+            if !reported {
+                if let Ok(o) = &outcome {
+                    if o.exit_code == Some(0) {
+                        let _ = finish_pending(
+                            &mut brain.tasks,
+                            &original.target,
+                            &original.id,
+                            &o.result,
+                            Self::now_ms(),
+                        );
+                    }
+                }
+            }
+            if let Some(t) = brain.tasks.into_iter().find(|t| t.id == original.id) {
+                let _ = append_record(origin, &StoreRecord::Task(Box::new(t)));
+            }
+            return;
+        }
+        let success = match &outcome {
+            Ok(o) if o.exit_code == Some(0) => Some(o.result.clone()),
+            _ => None,
+        };
+        self.mutate_and_journal(|tasks| {
+            let Some(t) = tasks
+                .iter_mut()
+                .find(|t| t.id == original.id && t.target == original.target)
+            else {
+                return ((), vec![]);
+            };
+            let reported = self.headless_reported.lock().unwrap().contains(&t.id);
+            if reported {
+                let status = t.status.clone();
+                let result = t.result.clone();
+                let done_ms = t.done_ms;
+                apply_headless_exit(t, &outcome, Self::now_ms());
+                t.status = status;
+                t.result = result;
+                t.done_ms = done_ms;
+            } else {
+                apply_headless_exit(t, &outcome, Self::now_ms());
+            }
+            ((), vec![t.clone()])
+        });
+        if let Some(result) = success {
+            // finish_task owns the review contract and rejects an already
+            // completed or cancelled task. Never overwrite a child tool result.
+            let _ = self.finish_task_inner(&original.target, &original.id, &result, true);
+        }
+        self.app.emit("conductor-changed");
+    }
+
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -683,7 +1052,21 @@ impl Shared {
     /// loads. See `merge_live_identity` for the rule itself and why it is a
     /// pure helper rather than inline here.
     pub fn set_dir(&self, dir: PathBuf) {
-        let brain = load_brain(&dir);
+        let dir = fs::canonicalize(&dir).unwrap_or(dir);
+        let store_gate = self.store_gate.write().unwrap();
+        let mut brain = load_brain(&dir);
+        let first_load = self.loaded_dirs.lock().unwrap().insert(dir.clone());
+        let running = self.headless_running.lock().unwrap();
+        let mut abandoned = Vec::new();
+        for task in &mut brain.tasks {
+            if !running.contains_key(&task.id) && first_load {
+                abandoned.extend(abandon_headless_on_load(std::slice::from_mut(task)));
+            }
+        }
+        drop(running);
+        for task in abandoned {
+            let _ = append_record(&dir, &StoreRecord::Task(Box::new(task)));
+        }
         let live = self.live_ids();
         let (sessions, changed) =
             merge_live_identity(&self.sessions_snapshot(), &brain.sessions, &live);
@@ -697,6 +1080,7 @@ impl Shared {
         for session in &changed {
             let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
         }
+        drop(store_gate);
         self.app.emit("context-changed");
         self.app.emit("conductor-changed");
         // The tasks just loaded may hold a queued brief on a pane that is
@@ -912,8 +1296,9 @@ impl Shared {
                         append_queued(reviewing_label(reviewing), depth),
                     )
                 };
+                let headless = if tasks.iter().any(|t| t.target == *id && t.mode == "headless" && is_open(&t.status)) { " [headless]" } else { "" };
                 format!(
-                    "- {id} ({kind}, {model_display}) brain={room}{role}{busy_str}{reviewing_str}"
+                    "- {id} ({kind}, {model_display}) brain={room}{role}{busy_str}{reviewing_str}{headless}"
                 )
             })
             .collect()
@@ -981,7 +1366,7 @@ impl Shared {
         if !changed.is_empty() {
             let dir = self.dir.lock().unwrap().clone();
             for task in &changed {
-                let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+                let _ = append_record(&dir, &StoreRecord::Task(Box::new(task.clone())));
             }
         }
         result
@@ -1086,7 +1471,7 @@ impl Shared {
                     Vec::new(),
                 );
             }
-            let occupied = is_occupied(tasks, target);
+            let occupied = is_occupied(tasks, target) || self.headless_busy(target);
             let t = build(occupied);
             tasks.push(t.clone());
             let queue_len = queued_ids_for(tasks, target).len();
@@ -1115,7 +1500,11 @@ impl Shared {
                     for t in tasks.iter_mut() {
                         // A queued task is exactly as stopped by Stop as a
                         // pending one: neither has been typed anywhere yet.
-                        if t.status == "pending" || t.status == STATUS_QUEUED {
+                        if t.status == "pending"
+                            || t.status == STATUS_QUEUED
+                            || (t.mode == "headless"
+                                && matches!(t.status.as_str(), "overdue" | "blocked"))
+                        {
                             t.status = "cancelled".to_string();
                             t.done_ms = Some(now);
                             changed.push(t.clone());
@@ -1123,6 +1512,16 @@ impl Shared {
                     }
                     ((), changed)
                 });
+                let panes: HashSet<String> = self
+                    .headless_running
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect();
+                for pane in panes {
+                    let _ = self.engine.kill_headless_for_pane(&pane);
+                }
             } else {
                 *self.dispatches.lock().unwrap() = 0;
             }
@@ -1276,8 +1675,29 @@ impl Shared {
     /// reviewer's pane is drained too, to try delivering the review request
     /// immediately rather than leaving it for the next unrelated event.
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<Task, TaskAccessError> {
+        let _store = self.store_gate.read().unwrap();
+        self.finish_task_inner(caller, id, result, false)
+    }
+
+    fn finish_task_inner(
+        &self,
+        caller: &str,
+        id: &str,
+        result: &str,
+        from_exit: bool,
+    ) -> Result<Task, TaskAccessError> {
         let task = self.mutate_task_and_journal(id, |tasks| {
-            finish_pending(tasks, caller, id, result, Self::now_ms())
+            if from_exit && self.headless_reported.lock().unwrap().contains(id) {
+                return Err(TaskAccessError::NotPending);
+            }
+            let result = finish_pending(tasks, caller, id, result, Self::now_ms());
+            if result.is_ok()
+                && !from_exit
+                && self.headless_running.lock().unwrap().contains_key(id)
+            {
+                self.headless_reported.lock().unwrap().insert(id.into());
+            }
+            result
         })?;
         self.app.emit("conductor-changed");
         self.drain_pane(caller);
@@ -1380,6 +1800,17 @@ impl Shared {
         task: &str,
         reviewer: &str,
     ) -> Result<DispatchOutcome, String> {
+        self.dispatch_task_mode(from, target, task, reviewer, false)
+    }
+
+    fn dispatch_task_mode(
+        &self,
+        from: &str,
+        target: &str,
+        task: &str,
+        reviewer: &str,
+        headless: bool,
+    ) -> Result<DispatchOutcome, String> {
         // Liveness, not membership, and it settles dead panes' tasks on the way
         // past. Dispatching into a pane whose process has exited was the way
         // this failure compounded: the work was never done, the task never
@@ -1400,7 +1831,21 @@ impl Shared {
         // holds us to.
         let id = uuid::Uuid::new_v4().simple().to_string();
         let injection = dispatch_prompt(from, &id, task);
-        dispatch_precheck(self.is_halted(), from, target, target_is_live, &injection)?;
+        // Apply identity/liveness policy before the mode-specific size/host policy.
+        dispatch_precheck(
+            self.is_halted(),
+            from,
+            target,
+            target_is_live,
+            if headless { "" } else { &injection },
+        )?;
+        if headless {
+            let launch = self
+                .engine
+                .launch_of(target)
+                .ok_or_else(|| format!("no live session '{target}'"))?;
+            dispatch_mode_precheck(target, task, Some(&launch))?;
+        }
 
         // Held from here through the write (when there is one): `set_halted`
         // and `cancel_tasks` both take `delivery` exclusively before they
@@ -1437,6 +1882,14 @@ impl Shared {
             reviewer_gone: false,
             done_ms: None,
             notice_delivered: true,
+            mode: if headless {
+                "headless".into()
+            } else {
+                pane_mode()
+            },
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }) {
             Err(refusal) => {
                 drop(pane_gate);
@@ -1457,6 +1910,24 @@ impl Shared {
                 already_busy: queue_predecessor(&self.tasks.lock().unwrap(), target),
                 queued: true,
                 queue_position: Some(queue_len),
+                quiet_age_secs: None,
+            });
+        }
+
+        if headless {
+            let quiet_age_secs = self
+                .engine
+                .headless_activity_age_ms(target)
+                .filter(|age| *age < crate::headless::HEADLESS_QUIET_MS)
+                .map(|age| age / 1000);
+            return Ok(DispatchOutcome {
+                task_id: id,
+                delivered: false,
+                reviewer,
+                already_busy: None,
+                queued: true,
+                queue_position: None,
+                quiet_age_secs,
             });
         }
 
@@ -1483,6 +1954,7 @@ impl Shared {
             already_busy: None,
             queued: false,
             queue_position: None,
+            quiet_age_secs: None,
         })
     }
 
@@ -1522,6 +1994,11 @@ impl Shared {
         });
         if !changed.is_empty() {
             self.app.emit("conductor-changed");
+        }
+        for task in &changed {
+            if self.headless_running.lock().unwrap().contains_key(&task.id) {
+                let _ = self.engine.kill_headless_for_pane(&task.target);
+            }
         }
         drop(delivery_gate);
         let mut drained: Vec<&str> = Vec::new();
@@ -1606,6 +2083,16 @@ impl Shared {
         }
         let live = self.reconcile_abandoned();
         let retargeting = new_target.is_some();
+        if retargeting
+            && self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id && t.mode == "headless")
+        {
+            return Err(ReassignError::HeadlessRetarget);
+        }
         let now = Self::now_ms();
 
         // Captured before the mutation, so there is something to drain
@@ -1663,6 +2150,7 @@ impl Shared {
         let occupied = {
             let tasks = self.tasks.lock().unwrap();
             occupying_task(&tasks, &task.target, &task.id).is_some()
+                || self.headless_busy(&task.target)
         };
 
         let (result, delivered) = if occupied {
@@ -1753,7 +2241,7 @@ impl Shared {
         // become `error` or count a notice as attempted. Leave it queued
         // (or undelivered) for the next trigger, which fires once the pane
         // actually connects; see `mark_connected`.
-        if !self.is_connected(pane) {
+        if self.headless_busy(pane) || !self.is_connected(pane) {
             return;
         }
         let pane_lock = self.pane_delivery_lock(pane);
@@ -1771,6 +2259,25 @@ impl Shared {
         self.hit_test_seam("drain_pane");
 
         let is_dispatch = task.status == STATUS_QUEUED;
+        if is_dispatch && task.mode == "headless" {
+            // Promotion reserves the queue head as pending. The worker retries
+            // it until quiet; a later queued task cannot pass this reservation.
+            let promoted = self.mutate_and_journal(|tasks| {
+                let Some(t) = tasks
+                    .iter_mut()
+                    .find(|t| t.id == task.id && t.target == pane && t.status == STATUS_QUEUED)
+                else {
+                    return (false, Vec::new());
+                };
+                t.status = "pending".into();
+                (true, vec![t.clone()])
+            });
+            if !promoted {
+                return;
+            }
+            self.app.emit("conductor-changed");
+            return;
+        }
         let text = if is_dispatch {
             dispatch_prompt(&task.from, &task.id, &task.task)
         } else if task.status == "rework" {
@@ -2070,6 +2577,11 @@ fn human_ms(ms: u64) -> String {
 }
 
 fn age(t: &mut Task, now: u64) {
+    // A quiet-window reservation has not started running. Aging it to overdue
+    // would remove it from the worker's pending candidates and strand it.
+    if t.mode == "headless" && t.cli_session.is_empty() {
+        return;
+    }
     if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_OVERDUE_MS {
         t.status = "overdue".to_string();
     }
@@ -2149,7 +2661,12 @@ fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
             }
             continue;
         }
-        t.status = STATUS_ABANDONED.to_string();
+        t.status = if t.mode == "headless" {
+            "cancelled"
+        } else {
+            STATUS_ABANDONED
+        }
+        .to_string();
         // Terminal, so it takes a finish time like any other terminal state.
         // Without one the UI cannot tell an abandonment that just happened from
         // one already in the store at startup, and announces the whole history.
@@ -2162,9 +2679,14 @@ fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
         // leaving a blank that reads like a result of no content.
         if t.result.is_empty() {
             t.result = format!(
-                "Abandoned: session '{}' is no longer running, so this task can \
+                "{}: session '{}' is no longer running, so this task can \
                  never report a result. Re-dispatch it to a live pane if the work \
                  is still wanted.",
+                if t.mode == "headless" {
+                    "Cancelled"
+                } else {
+                    "Abandoned"
+                },
                 t.target
             );
         }
@@ -2560,6 +3082,7 @@ fn cancel_pending(tasks: &mut [Task], id: &str, reason: &str, now_ms: u64) -> Ca
 /// Why a reassignment was refused.
 #[derive(Debug, PartialEq)]
 enum ReassignError {
+    HeadlessRetarget,
     NotFound,
     /// `target` was given but the task is not pending or overdue, so there is
     /// nothing to redeliver.
@@ -2758,6 +3281,23 @@ fn status_tag(t: &Task) -> String {
 
 /// One task rendered for an agent. Kept in one place so a single-id lookup and
 /// the collect-everything listing never drift apart.
+fn render_execution(t: &Task) -> String {
+    let mut text = format!("mode: {}", t.mode);
+    if let Some(code) = t.exit_code {
+        text.push_str(&format!(", exit code: {code}"));
+    }
+    if !t.cli_session.is_empty() {
+        text.push_str(&format!(", cli_session: {}", t.cli_session));
+    }
+    if let Some(usage) = &t.usage {
+        text.push_str(&format!(
+            ", usage: {}",
+            serde_json::to_string(usage).unwrap()
+        ));
+    }
+    text
+}
+
 fn render_task(t: &Task) -> String {
     // Who signed off is part of the answer, not a footnote. A conductor
     // reading "done" needs to know whether that means reviewed or waived,
@@ -2805,14 +3345,15 @@ fn render_task(t: &Task) -> String {
     };
 
     let status = status_tag(t);
+    let execution = render_execution(t);
     if t.result.is_empty() {
         format!(
-            "[{status}]{sign_off} {} â†’ {}{asked}{reviewer_gone}",
+            "[{status}]{sign_off} ({execution}) {} â†’ {}{asked}{reviewer_gone}",
             t.target, t.task
         )
     } else {
         format!(
-            "[{status}]{sign_off} {} â†’ {}\n{}{findings}{asked}{reviewer_gone}",
+            "[{status}]{sign_off} ({execution}) {} â†’ {}\n{}{findings}{asked}{reviewer_gone}",
             t.target, t.task, t.result
         )
     }
@@ -2917,7 +3458,11 @@ fn render_open_task_summaries(mine: &[Task], open: &[String]) -> Vec<String> {
 }
 
 fn render_task_summary(t: &Task) -> String {
-    let brief = truncate_chars(&t.task, TASK_ECHO_CHARS);
+    let brief = format!(
+        "{} ({})",
+        truncate_chars(&t.task, TASK_ECHO_CHARS),
+        render_execution(t)
+    );
     if t.status == "done" {
         format!("[done] {} â†’ {}\n{}", t.target, brief, t.result)
     } else {
@@ -3066,6 +3611,9 @@ pub struct SearchArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DispatchArgs {
+    /// Run a separate Claude print-mode child after 30 seconds of pane quiet.
+    #[serde(default)]
+    pub headless: bool,
     /// The session to hand the task to: use an id from list_sessions.
     pub target: String,
     /// The task, written the way you'd say it to a teammate.
@@ -3334,7 +3882,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. Pass headless: true to run a Claude print-mode child with a $1 budget and 40 minute deadline after 30 seconds of pane quiet; this accepts multiline briefs without the pane byte limit. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -3350,9 +3898,37 @@ impl BrainHandler {
 
         match self
             .shared
-            .dispatch_task(&me, &p.target, &p.task, &p.reviewer)
+            .dispatch_task_mode(&me, &p.target, &p.task, &p.reviewer, p.headless)
         {
+            Err(e) if e.starts_with("refused:") => e,
             Err(e) => format!("Refused: {e}"),
+            Ok(o) if p.headless => {
+                let waiting = if let Some(age) = o.quiet_age_secs {
+                    format!(
+                        "queued: {} active {age}s ago, starts after 30 s quiet",
+                        p.target
+                    )
+                } else if let Some(position) = o.queue_position {
+                    format!("queued: {} occupied, position {}", p.target, position)
+                } else {
+                    "pane is quiet; queued for the next background start".into()
+                };
+                let behind = o
+                    .already_busy
+                    .as_deref()
+                    .map(|id| format!(" behind {id}"))
+                    .unwrap_or_default();
+                format!(
+                    "Task {} for {}, mode: headless; {waiting}{behind}. Reviewer: {}.",
+                    o.task_id,
+                    p.target,
+                    if o.reviewer.is_empty() {
+                        "none"
+                    } else {
+                        &o.reviewer
+                    }
+                )
+            }
             Ok(o) if o.queued => {
                 let position = o.queue_position.unwrap_or(0);
                 let behind = o
@@ -3433,6 +4009,7 @@ impl BrainHandler {
                 "Task '{}' reassigned to reviewer {}.",
                 task.id, task.reviewer
             ),
+            Err(ReassignError::HeadlessRetarget) => "Refused: cancel the headless task and dispatch a new one to retarget it.".to_string(),
             Err(ReassignError::NotFound) => format!("No task '{}'.", p.task_id),
             Err(ReassignError::NotOpenForRetarget) => "Refused: target only applies to a pending, overdue, abandoned, or queued task. Use reviewer for an in_review or rework task."
                 .to_string(),
@@ -4037,9 +4614,15 @@ pub fn start(
     dir: PathBuf,
     engine: Arc<crate::SessionManager>,
 ) -> std::io::Result<(u16, Arc<Shared>)> {
-    let brain = load_brain(&dir);
+    let dir = fs::canonicalize(&dir).unwrap_or(dir);
+    let mut brain = load_brain(&dir);
+    for task in abandon_headless_on_load(&mut brain.tasks) {
+        let _ = append_record(&dir, &StoreRecord::Task(Box::new(task)));
+    }
     let shared = Arc::new(Shared {
         app: Notifier::to_app(app),
+        loaded_dirs: Mutex::new(HashSet::from([dir.clone()])),
+        store_gate: RwLock::new(()),
         dir: Mutex::new(dir),
         entries: Mutex::new(brain.entries),
         sessions: Mutex::new(brain.sessions),
@@ -4052,9 +4635,13 @@ pub fn start(
         dispatches: Mutex::new(0),
         delivery: RwLock::new(()),
         pane_delivery: Mutex::new(HashMap::new()),
+        headless_running: Mutex::new(HashMap::new()),
+        headless_reported: Mutex::new(HashSet::new()),
         #[cfg(test)]
         test_seam: Mutex::new(None),
     });
+
+    Shared::start_headless_worker(&shared);
 
     // Bind synchronously so we can hand the port back before the server task runs.
     let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -4082,6 +4669,10 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::{
+        abandon_headless_on_load, apply_headless_exit, dispatch_mode_precheck, dispatch_prompt_raw,
+        pane_mode, HEADLESS_MAX_MS,
+    };
+    use super::{
         abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
         attribute_open_tasks, bearer_matches, blocked_wait_should_release, busy_label,
         cancel_pending, choose_reviewer, conductor_briefing, dispatch_precheck, dispatch_prompt,
@@ -4104,6 +4695,556 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::Duration;
+
+    fn headless_task() -> Task {
+        let mut t = task_at("headless-test", "pending", 1);
+        t.mode = "headless".into();
+        t
+    }
+
+    fn headless_outcome(
+        code: i32,
+    ) -> Result<crate::headless::HeadlessOutcome, crate::headless::HeadlessError> {
+        Ok(crate::headless::HeadlessOutcome {
+            result: "CLI result".into(),
+            cli_session: "uuid".into(),
+            exit_code: Some(code),
+            stderr: "stderr tail".into(),
+            usage: Some(crate::headless::HeadlessUsage {
+                input_tokens: Some(12),
+                cost_usd: Some(0.05),
+                ..Default::default()
+            }),
+        })
+    }
+
+    #[test]
+    fn restart_abandonment_preserves_a_submitted_result() {
+        for status in ["in_review", "rework"] {
+            let mut task = headless_task();
+            task.status = status.into();
+            task.result = "submitted findings".into();
+            abandon_headless_on_load(std::slice::from_mut(&mut task));
+            assert_eq!(task.status, "abandoned");
+            assert_eq!(task.result, "submitted findings");
+            assert!(task.done_ms.is_some());
+        }
+        // The brief explicitly requires all open headless states to become
+        // abandoned at restart. Preserve the work even though review is closed.
+    }
+
+    #[test]
+    fn headless_promotion_tolerates_a_task_removed_after_candidate_selection() {
+        let (mut shared, _dir) = shared_for_test();
+        let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = emitted.clone();
+        Arc::get_mut(&mut shared).unwrap().app = Notifier(Some(Box::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })));
+        let mut task = headless_task();
+        task.status = STATUS_QUEUED.into();
+        shared.tasks.lock().unwrap().push(task.clone());
+        shared.connected.lock().unwrap().insert(task.target.clone());
+        let weak = Arc::downgrade(&shared);
+        shared.set_test_seam(move |label| {
+            if label == "drain_pane" {
+                // Same replacement boundary as a concurrent set_dir, after
+                // selection but before queue promotion takes tasks again.
+                weak.upgrade().unwrap().tasks.lock().unwrap().clear();
+            }
+        });
+        shared.drain_pane(&task.target);
+        assert!(shared.tasks_snapshot().is_empty());
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            0,
+            "a missed promotion must not announce delivery"
+        );
+        assert!(shared.headless_running.lock().unwrap().is_empty());
+        assert!(shared.engine.headless.lock().unwrap().is_empty());
+        assert!(shared.delivery.write().is_ok());
+        assert!(shared.pane_delivery_lock(&task.target).lock().is_ok());
+    }
+
+    #[test]
+    fn a_project_switch_waits_for_child_registration_to_finish() {
+        let (shared, _dir) = shared_for_test();
+        let other = tempfile::tempdir().unwrap();
+        let registration = shared.store_gate.read().unwrap();
+        let worker = shared.clone();
+        let path = other.path().to_path_buf();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let switch = thread::spawn(move || {
+            arrived_tx.send(()).unwrap();
+            worker.set_dir(path);
+            done_tx.send(()).unwrap();
+        });
+        arrived_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(registration);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        switch.join().unwrap();
+        // The fixture has no live PTY. This is the exact gate held from the
+        // source-dir check through run_headless_registered's callback.
+    }
+
+    #[test]
+    fn headless_exit_is_persisted_to_its_original_brain_after_a_switch() {
+        for reviewer in ["", "sess-3"] {
+            let (shared, dir) = shared_for_test();
+            let other = tempfile::tempdir().unwrap();
+            let mut task = headless_task();
+            task.reviewer = reviewer.into();
+            task.cli_session = "uuid".into();
+            super::append_record(
+                dir.path(),
+                &super::StoreRecord::Task(Box::new(task.clone())),
+            )
+            .unwrap();
+            shared.tasks.lock().unwrap().push(task.clone());
+            shared
+                .headless_running
+                .lock()
+                .unwrap()
+                .insert(task.id.clone(), task.target.clone());
+            shared.set_dir(other.path().into());
+            shared.headless_exited_at(dir.path(), &task, headless_outcome(0));
+            assert!(shared.tasks_snapshot().is_empty());
+            shared.headless_running.lock().unwrap().clear();
+            shared.set_dir(dir.path().into());
+            let saved = shared.tasks_snapshot().remove(0);
+            assert_eq!(
+                saved.status,
+                if reviewer.is_empty() {
+                    "done"
+                } else {
+                    "in_review"
+                }
+            );
+            assert_eq!(saved.result, "CLI result");
+            assert_eq!(saved.exit_code, Some(0));
+            assert!(saved.usage.is_some());
+        }
+    }
+
+    #[test]
+    fn a_worker_selected_before_a_switch_cannot_spawn_in_the_new_brain() {
+        let (shared, dir) = shared_for_test();
+        let other = tempfile::tempdir().unwrap();
+        let task = headless_task();
+        super::append_record(
+            dir.path(),
+            &super::StoreRecord::Task(Box::new(task.clone())),
+        )
+        .unwrap();
+        shared.set_dir(other.path().into());
+        shared.run_headless_task(&task, dir.path());
+        shared.set_dir(dir.path().into());
+        let saved = shared.tasks_snapshot().remove(0);
+        assert_eq!(saved.status, "pending");
+        assert!(saved.cli_session.is_empty());
+    }
+
+    #[test]
+    fn first_loading_a_project_abandons_unstarted_headless_work_from_previous_app() {
+        let (shared, _dir) = shared_for_test();
+        let project = tempfile::tempdir().unwrap();
+        super::append_record(
+            project.path(),
+            &super::StoreRecord::Task(Box::new(headless_task())),
+        )
+        .unwrap();
+        shared.set_dir(project.path().into());
+        assert_eq!(shared.tasks_snapshot()[0].status, "abandoned");
+        let journal = std::fs::read_to_string(project.path().join(super::STORE_FILE)).unwrap();
+        shared.set_dir(project.path().into());
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(super::STORE_FILE)).unwrap(),
+            journal
+        );
+    }
+
+    #[test]
+    fn stop_preserves_headless_review_work_after_child_exit() {
+        for status in ["in_review", "rework"] {
+            let (shared, _dir) = shared_for_test();
+            let mut task = headless_task();
+            task.status = status.into();
+            task.cli_session = "exited-child".into();
+            task.result = "submitted work".into();
+            shared.tasks.lock().unwrap().push(task);
+            shared.set_halted(true);
+            let saved = shared.tasks_snapshot().remove(0);
+            assert_eq!(saved.status, status);
+            assert_eq!(saved.result, "submitted work");
+        }
+    }
+
+    #[test]
+    fn restart_abandonment_is_journaled_only_once() {
+        let mut tasks = vec![headless_task()];
+        assert_eq!(abandon_headless_on_load(&mut tasks).len(), 1);
+        assert!(abandon_headless_on_load(&mut tasks).is_empty());
+    }
+
+    #[test]
+    fn switching_brains_preserves_a_headless_quiet_reservation() {
+        let (shared, dir) = shared_for_test();
+        let task = headless_task();
+        super::append_record(dir.path(), &super::StoreRecord::Task(Box::new(task))).unwrap();
+        shared.set_dir(dir.path().into());
+        assert_eq!(shared.tasks_snapshot()[0].status, "pending");
+    }
+
+    #[test]
+    fn a_headless_quiet_wait_does_not_age_out_of_start_eligibility() {
+        let mut task = headless_task();
+        age(&mut task, TASK_OVERDUE_MS + 100);
+        assert_eq!(task.status, "pending");
+        task.cli_session = "started".into();
+        age(&mut task, TASK_OVERDUE_MS + 100);
+        assert_eq!(task.status, "overdue");
+    }
+
+    #[test]
+    fn dispatch_schema_defaults_to_pane_delivery() {
+        let args: super::DispatchArgs =
+            serde_json::from_str(r#"{"target":"sess-2","task":"brief"}"#).unwrap();
+        assert!(!args.headless);
+    }
+
+    #[test]
+    fn task_renderers_include_execution_metadata() {
+        let mut t = headless_task();
+        apply_headless_exit(&mut t, &headless_outcome(0), 42);
+        for text in [render_task(&t), render_task_summary(&t)] {
+            assert!(text.contains("mode: headless"));
+            assert!(text.contains("exit code: 0"));
+            assert!(text.contains("cli_session: uuid"));
+            assert!(text.contains("input_tokens"));
+            assert!(text.contains("cost_usd"));
+        }
+    }
+
+    #[test]
+    fn headless_precheck_accepts_large_multiline_briefs_and_refuses_unsupported_targets() {
+        use crate::headless::{LaunchEndpoint, LaunchSpec};
+        let mut spec = LaunchSpec::for_session(
+            std::path::PathBuf::from("/tmp"),
+            "claude".into(),
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+            "sess-2",
+            LaunchEndpoint::Shared,
+        );
+        let long = "line\n".repeat(2000);
+        assert!(dispatch_mode_precheck("sess-2", &long, None).is_err());
+        assert_eq!(
+            dispatch_mode_precheck("sess-2", &long, Some(&spec)).unwrap_err(),
+            "refused: sess-2 has no per-session endpoint; restart the pane or send a pane brief"
+        );
+        spec.endpoint = LaunchEndpoint::Dedicated {
+            url: "http://localhost".into(),
+            token: "test".into(),
+        };
+        assert!(dispatch_mode_precheck("sess-2", &long, Some(&spec)).is_ok());
+        for program in ["codex", "opencode", "bash"] {
+            spec.program = program.into();
+            assert!(dispatch_mode_precheck("sess-2", &long, Some(&spec))
+                .unwrap_err()
+                .contains(program));
+        }
+        let prompt = dispatch_prompt_raw("sess-1", "id", &long);
+        assert!(prompt.contains(&long));
+        assert!(prompt.contains("complete_task"));
+        assert!(prompt.contains("task_id id"));
+    }
+
+    #[test]
+    fn headless_quiet_window_requires_connection_and_thirty_seconds() {
+        use super::headless_ready;
+        assert!(!headless_ready(None, true));
+        assert!(!headless_ready(Some(30_000), false));
+        assert!(!headless_ready(Some(29_999), true));
+        assert!(headless_ready(Some(30_000), true));
+        assert!(headless_ready(Some(40_000), true));
+        // shared_for_test has no PTY SessionHandle and therefore no last_output.
+        // The start path reads that value from the engine and uses this predicate.
+    }
+
+    #[test]
+    fn headless_success_finishes_through_the_review_contract() {
+        for reviewer in ["", "sess-3"] {
+            let (shared, _dir) = shared_for_test();
+            let mut t = headless_task();
+            t.reviewer = reviewer.into();
+            shared.tasks.lock().unwrap().push(t.clone());
+            shared.headless_exited(&t, headless_outcome(0));
+            let saved = shared.tasks_snapshot().remove(0);
+            assert_eq!(
+                saved.status,
+                if reviewer.is_empty() {
+                    "done"
+                } else {
+                    "in_review"
+                }
+            );
+            assert_eq!(saved.done_ms.is_some(), reviewer.is_empty());
+            assert_eq!(saved.result, "CLI result");
+            assert_eq!(saved.exit_code, Some(0));
+            assert_eq!(saved.usage.unwrap().input_tokens, Some(12));
+        }
+    }
+
+    #[test]
+    fn headless_failures_stamp_done_and_preserve_the_reason() {
+        use crate::headless::HeadlessError;
+        let cases = [
+            (headless_outcome(1), "error", "exited 1: stderr tail"),
+            (
+                Err(HeadlessError::Exited {
+                    exit_code: Some(1),
+                    message: "Reached maximum budget".into(),
+                    stderr: "tail".into(),
+                    usage: None,
+                }),
+                "error",
+                "exited 1: Reached maximum budget",
+            ),
+            (
+                Err(HeadlessError::InvalidJson {
+                    exit_code: Some(0),
+                    error: "bad".into(),
+                    stdout: "bad output".into(),
+                    stderr: "tail".into(),
+                }),
+                "error",
+                "exited 0: tail",
+            ),
+            (
+                Err(HeadlessError::Timeout {
+                    exit_code: None,
+                    timeout: Duration::from_millis(HEADLESS_MAX_MS),
+                    stderr: "tail".into(),
+                }),
+                "error",
+                "wall-clock cap exceeded",
+            ),
+            (
+                Err(HeadlessError::Cancelled {
+                    exit_code: None,
+                    usage: None,
+                }),
+                "cancelled",
+                "headless child cancelled",
+            ),
+            (
+                Err(HeadlessError::SessionNotFound("sess-2".into())),
+                "cancelled",
+                "no live session",
+            ),
+            (
+                Err(HeadlessError::Spawn(std::io::Error::other("spawn failure"))),
+                "error",
+                "spawn failure",
+            ),
+        ];
+        for (outcome, status, reason) in cases {
+            let mut t = headless_task();
+            apply_headless_exit(&mut t, &outcome, 42);
+            assert_eq!(t.status, status);
+            assert_eq!(t.done_ms, Some(42));
+            assert!(t.result.contains(reason), "{}", t.result);
+        }
+    }
+
+    #[test]
+    fn headless_exit_only_adds_metadata_after_a_child_completed_even_if_review_rejected() {
+        for exit_code in [0, 1] {
+            let (shared, _dir) = shared_for_test();
+            let mut t = headless_task();
+            t.reviewer = "sess-3".into();
+            shared.tasks.lock().unwrap().push(t.clone());
+            shared
+                .headless_running
+                .lock()
+                .unwrap()
+                .insert(t.id.clone(), t.target.clone());
+            shared.finish_task(&t.target, &t.id, "tool result").unwrap();
+            shared
+                .review_task("sess-3", &t.id, false, "fix this")
+                .unwrap();
+            shared.headless_exited(&t, headless_outcome(exit_code));
+            let saved = shared.tasks_snapshot().remove(0);
+            assert_eq!(saved.status, "rework");
+            assert_eq!(saved.result, "tool result");
+            assert_eq!(saved.done_ms, None);
+            assert_eq!(saved.exit_code, Some(exit_code));
+            assert!(saved.usage.is_some());
+        }
+    }
+
+    #[test]
+    fn headless_exit_cannot_resurrect_cancelled_work() {
+        let (shared, _dir) = shared_for_test();
+        let t = headless_task();
+        shared.tasks.lock().unwrap().push(t.clone());
+        shared.cancel_tasks(std::slice::from_ref(&t.id), "cancel reason");
+        shared.headless_exited(&t, headless_outcome(0));
+        let saved = shared.tasks_snapshot().remove(0);
+        assert_eq!(saved.status, "cancelled");
+        assert_eq!(saved.result, "Cancelled by the conductor: cancel reason");
+        assert_eq!(saved.exit_code, Some(0));
+    }
+
+    #[test]
+    fn loading_abandons_only_open_headless_tasks() {
+        let mut tasks = Vec::new();
+        for state in [
+            "pending",
+            "queued",
+            "blocked",
+            "overdue",
+            "in_review",
+            "rework",
+            "done",
+            "error",
+            "cancelled",
+        ] {
+            let mut t = headless_task();
+            t.status = state.into();
+            tasks.push(t);
+        }
+        tasks.push(task_at("pane", "pending", 1));
+        abandon_headless_on_load(&mut tasks);
+        for t in &tasks[..6] {
+            assert_eq!(t.status, "abandoned");
+            assert!(t.done_ms.is_some());
+        }
+        assert_eq!(tasks[6].status, "done");
+        assert_eq!(tasks[7].status, "error");
+        assert_eq!(tasks[8].status, "cancelled");
+        assert_eq!(tasks[9].status, "pending");
+    }
+
+    #[test]
+    fn headless_old_task_records_default_to_pane_mode() {
+        let mut value = serde_json::to_value(headless_task()).unwrap();
+        for field in ["mode", "exit_code", "cli_session", "usage"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        let t: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(t.mode, "pane");
+        assert_eq!(t.exit_code, None);
+        assert!(t.usage.is_none());
+    }
+
+    #[test]
+    fn headless_queue_promotes_one_task_without_attempting_pty_delivery() {
+        let (shared, _dir) = shared_for_test();
+        let mut t = headless_task();
+        t.status = STATUS_QUEUED.into();
+        let mut next = t.clone();
+        next.id = "next".into();
+        next.ts_ms = 2;
+        shared.tasks.lock().unwrap().extend([t.clone(), next]);
+        shared.mark_connected(&t.target);
+        shared.drain_pane(&t.target);
+        let saved = shared.tasks_snapshot();
+        assert_eq!(saved[0].status, "pending");
+        assert_eq!(saved[1].status, STATUS_QUEUED);
+        // No live engine exists here: a submit_to attempt would set error.
+    }
+
+    #[test]
+    fn headless_child_keeps_occupancy_after_its_task_completes() {
+        let (shared, _dir) = shared_for_test();
+        let mut t = headless_task();
+        t.status = STATUS_QUEUED.into();
+        shared.tasks.lock().unwrap().push(t.clone());
+        shared
+            .headless_running
+            .lock()
+            .unwrap()
+            .insert("older-child".into(), t.target.clone());
+        shared.mark_connected(&t.target);
+        assert_eq!(shared.tasks_snapshot()[0].status, STATUS_QUEUED);
+        shared.headless_running.lock().unwrap().clear();
+        shared.drain_pane(&t.target);
+        assert_eq!(shared.tasks_snapshot()[0].status, "pending");
+    }
+
+    #[derive(Default)]
+    struct HeadlessKillProbe {
+        terminated: AtomicBool,
+        killed: AtomicBool,
+    }
+    impl crate::headless::ProcessTree for HeadlessKillProbe {
+        fn terminate(&self) -> std::io::Result<()> {
+            self.terminated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn kill(&self) -> std::io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancel_and_halt_reach_registered_headless_process_trees() {
+        for halt in [false, true] {
+            let (shared, _dir) = shared_for_test();
+            let mut t = headless_task();
+            t.status = "blocked".into();
+            shared.tasks.lock().unwrap().push(t.clone());
+            shared
+                .headless_running
+                .lock()
+                .unwrap()
+                .insert(t.id.clone(), t.target.clone());
+            let probe = Arc::new(HeadlessKillProbe::default());
+            shared.engine.headless.lock().unwrap().insert(
+                "uuid".into(),
+                crate::ActiveHeadless {
+                    pane_id: t.target.clone(),
+                    tree: probe.clone(),
+                    cancellation: Arc::new(crate::HeadlessCancellation::default()),
+                },
+            );
+            let started = std::time::Instant::now();
+            if halt {
+                shared.set_halted(true);
+            } else {
+                shared.cancel_tasks(std::slice::from_ref(&t.id), "stop");
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "cancel must not wait for the ten-second grace"
+            );
+            assert!(probe.terminated.load(Ordering::SeqCst));
+            let deadline = std::time::Instant::now() + Duration::from_secs(11);
+            while !probe.killed.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            // No actual wait thread exists in this fixture to remove the
+            // completed registry entry, unlike run_headless_registered.
+            assert!(shared
+                .engine
+                .headless
+                .lock()
+                .unwrap()
+                .values()
+                .all(|child| child.cancellation.requested.load(Ordering::Acquire)));
+            assert_eq!(shared.tasks_snapshot()[0].status, "cancelled");
+            // Real PTY close/Stop IPC cannot run in shared_for_test, but both
+            // SessionManager close paths call this same process-tree terminator.
+        }
+    }
 
     #[test]
     fn a_free_pane_carries_no_busy_marker() {
@@ -4137,6 +5278,10 @@ mod tests {
             reviewer_gone: false,
             done_ms: None,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }]
     }
 
@@ -4266,6 +5411,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }
     }
 
@@ -4402,7 +5551,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let shared = Arc::new(Shared {
             app: Notifier::silent(),
-            dir: Mutex::new(dir.path().to_path_buf()),
+            loaded_dirs: Mutex::new(HashSet::from([dir.path().canonicalize().unwrap()])),
+            store_gate: RwLock::new(()),
+            dir: Mutex::new(dir.path().canonicalize().unwrap()),
             entries: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
             name_to_room: Mutex::new(HashMap::new()),
@@ -4414,6 +5565,8 @@ mod tests {
             dispatches: Mutex::new(0),
             delivery: RwLock::new(()),
             pane_delivery: Mutex::new(HashMap::new()),
+            headless_running: Mutex::new(HashMap::new()),
+            headless_reported: Mutex::new(HashSet::new()),
             test_seam: Mutex::new(None),
         });
         // `app` owns the runtime the handle points at, so it has to outlive the
@@ -4539,6 +5692,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -4568,6 +5725,10 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         };
         assert!(render_task(&base).starts_with("[error]"));
     }
@@ -4616,6 +5777,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
@@ -4650,6 +5815,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
 
         assert_eq!(
@@ -4679,6 +5848,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
 
         assert!(
@@ -4773,6 +5946,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
         assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
@@ -4797,6 +5974,10 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
         assert!(!mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "cancelled");
@@ -4818,6 +5999,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         };
 
         let mut pending = base.clone();
@@ -4852,6 +6037,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -4884,6 +6073,10 @@ mod tests {
                 ts_ms: 0,
                 done_ms: None,
                 notice_delivered: true,
+                mode: pane_mode(),
+                exit_code: None,
+                cli_session: String::new(),
+                usage: None,
             }];
             assert_eq!(
                 finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite", 0),
@@ -4911,6 +6104,10 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-3", "abc123", "stolen", 0),
@@ -4950,6 +6147,10 @@ mod tests {
             ts_ms: 2,
             done_ms: None,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         };
         let done = Task {
             status: "done".into(),
@@ -4959,8 +6160,8 @@ mod tests {
 
         append_record(&dir, &StoreRecord::Entry(entry.clone())).unwrap();
         append_record(&dir, &StoreRecord::Session(session.clone())).unwrap();
-        append_record(&dir, &StoreRecord::Task(pending)).unwrap();
-        append_record(&dir, &StoreRecord::Task(done.clone())).unwrap();
+        append_record(&dir, &StoreRecord::Task(Box::new(pending))).unwrap();
+        append_record(&dir, &StoreRecord::Task(Box::new(done.clone()))).unwrap();
 
         let loaded = load_brain(&dir);
         assert_eq!(loaded.entries, vec![entry]);
@@ -4987,6 +6188,10 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            mode: pane_mode(),
+            exit_code: None,
+            cli_session: String::new(),
+            usage: None,
         }
     }
 
@@ -7018,7 +8223,7 @@ mod tests {
         let new_dir = tempfile::tempdir().expect("tempdir");
         append_record(
             new_dir.path(),
-            &StoreRecord::Task(task_at("t1", STATUS_QUEUED, 0)),
+            &StoreRecord::Task(Box::new(task_at("t1", STATUS_QUEUED, 0))),
         )
         .unwrap();
 
@@ -7465,7 +8670,7 @@ mod tests {
     fn a_queued_task_stays_in_a_wait_and_renders_with_a_plain_status_tag() {
         let t = task_at("t1", STATUS_QUEUED, 0);
         assert_eq!(
-            still_open(&[t.clone()], &["t1".to_string()]),
+            still_open(std::slice::from_ref(&t), &["t1".to_string()]),
             vec!["t1".to_string()],
             "wait_for_tasks must keep treating a queued task as still running"
         );
