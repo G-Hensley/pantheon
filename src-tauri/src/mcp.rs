@@ -234,6 +234,12 @@ pub struct Task {
     pub cli_session: String,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// The headless budget in effect for this task, in US dollars. `None` for
+    /// a pane-mode task, which has no per-run budget of its own.
+    /// `serde(default)` for the same reason as the other headless fields:
+    /// tasks written before this existed predate it and load as `None`.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
     pub id: String,
     pub from: String,
     pub target: String,
@@ -340,6 +346,26 @@ fn abandon_headless_on_load(tasks: &mut [Task]) -> Vec<Task> {
     changed
 }
 
+/// Append a `permission denials: <n> (<tool names>)` line when the run's
+/// usage carries any, so a task that completed after being silently refused
+/// a tool reads differently from a clean one (design section 6's silent-
+/// denial mitigation). A no-op, returning `result` unchanged, when there are
+/// none, which is the common case.
+fn append_denial_note(mut result: String, usage: Option<&Usage>) -> String {
+    let denials = usage.map(|u| u.permission_denials.as_slice()).unwrap_or(&[]);
+    if !denials.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&format!(
+            "permission denials: {} ({})",
+            denials.len(),
+            denials.join(", ")
+        ));
+    }
+    result
+}
+
 fn apply_headless_exit(
     t: &mut Task,
     outcome: &Result<crate::headless::HeadlessOutcome, crate::headless::HeadlessError>,
@@ -421,10 +447,13 @@ fn apply_headless_exit(
             }
             .into();
             t.done_ms = Some(now);
-            t.result = format!(
-                "exited {}: {reason}",
-                code.map(|c| c.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+            t.result = append_denial_note(
+                format!(
+                    "exited {}: {reason}",
+                    code.map(|c| c.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ),
+                t.usage.as_ref(),
             );
         }
     }
@@ -436,7 +465,38 @@ fn pane_mode() -> String {
 
 pub type Usage = crate::headless::HeadlessUsage;
 const HEADLESS_MAX_MS: u64 = 2 * TASK_OVERDUE_MS;
-const HEADLESS_BUDGET_USD: f64 = 1.0;
+/// Applied when a conductor dispatches headless without naming `budget_usd`.
+/// A cold-cache first call alone can bill $0.17 to $0.25 in cache_creation
+/// before any real work happens (measured fact, category
+/// `headless-measurement`), so this has to leave real headroom above that,
+/// not merely above zero.
+const HEADLESS_BUDGET_DEFAULT_USD: f64 = 5.00;
+/// Refused outright above this, never silently clamped: a conductor asking
+/// for more than this is almost always a mistyped amount, and clamping it
+/// would hide that instead of surfacing it.
+const HEADLESS_BUDGET_CEILING_USD: f64 = 25.00;
+
+/// The budget a headless dispatch should run with: the conductor's own
+/// figure when they gave one and it is usable, the default otherwise, or a
+/// refusal when it is not usable. Non-finite and non-positive amounts are
+/// refused rather than defaulted, on the theory that a conductor who typed
+/// one meant it, and silently ignoring a bad value is worse than saying so.
+fn effective_headless_budget(requested: Option<f64>) -> Result<f64, String> {
+    let Some(requested) = requested else {
+        return Ok(HEADLESS_BUDGET_DEFAULT_USD);
+    };
+    if !requested.is_finite() || requested <= 0.0 {
+        return Err(format!(
+            "budget_usd must be a finite number greater than zero, got {requested}"
+        ));
+    }
+    if requested > HEADLESS_BUDGET_CEILING_USD {
+        return Err(format!(
+            "budget_usd {requested} exceeds the ${HEADLESS_BUDGET_CEILING_USD:.2} ceiling; dispatch again under that"
+        ));
+    }
+    Ok(requested)
+}
 
 /// One question from a working agent and the conductor's answer to it.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -915,10 +975,23 @@ impl Shared {
         let prompt = dispatch_prompt_raw(&task.from, &task.id, &task.task);
         // The callback runs synchronously after registration. Cancel/Stop cannot
         // obtain delivery.write until the new process is visible to their kill.
+        //
+        // The three guards below (store_gate, gate, pane_gate) are moved into
+        // this closure, which is the only place that explicitly drops them.
+        // That is still safe on every path out of `run_headless_registered`,
+        // including one that never calls this closure at all (the session
+        // vanishing between the liveness check above and its own lookup, or
+        // the child failing to spawn): a moved-but-never-invoked `FnOnce`
+        // still drops its captured environment when the closure itself is
+        // dropped, which happens at that function's own early return. There
+        // is no window where `headless_exited_at` below runs while any of
+        // the three are still held; see
+        // `run_headless_registered_drops_an_uninvoked_callbacks_captured_guard_on_session_not_found`
+        // in lib.rs for a test pinning that down.
         let outcome = self.engine.run_headless_registered(
             &task.target,
             &prompt,
-            HEADLESS_BUDGET_USD,
+            task.budget_usd.unwrap_or(HEADLESS_BUDGET_DEFAULT_USD),
             Duration::from_millis(HEADLESS_MAX_MS),
             |session| {
                 self.mutate_and_journal(|tasks| {
@@ -984,11 +1057,12 @@ impl Shared {
             if !reported {
                 if let Ok(o) = &outcome {
                     if o.exit_code == Some(0) {
+                        let result = append_denial_note(o.result.clone(), o.usage.as_ref());
                         let _ = finish_pending(
                             &mut brain.tasks,
                             &original.target,
                             &original.id,
-                            &o.result,
+                            &result,
                             Self::now_ms(),
                         );
                     }
@@ -1000,7 +1074,9 @@ impl Shared {
             return;
         }
         let success = match &outcome {
-            Ok(o) if o.exit_code == Some(0) => Some(o.result.clone()),
+            Ok(o) if o.exit_code == Some(0) => {
+                Some(append_denial_note(o.result.clone(), o.usage.as_ref()))
+            }
             _ => None,
         };
         self.mutate_and_journal(|tasks| {
@@ -1800,7 +1876,7 @@ impl Shared {
         task: &str,
         reviewer: &str,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_task_mode(from, target, task, reviewer, false)
+        self.dispatch_task_mode(from, target, task, reviewer, false, None)
     }
 
     fn dispatch_task_mode(
@@ -1810,6 +1886,7 @@ impl Shared {
         task: &str,
         reviewer: &str,
         headless: bool,
+        budget_usd: Option<f64>,
     ) -> Result<DispatchOutcome, String> {
         // Liveness, not membership, and it settles dead panes' tasks on the way
         // past. Dispatching into a pane whose process has exited was the way
@@ -1839,13 +1916,16 @@ impl Shared {
             target_is_live,
             if headless { "" } else { &injection },
         )?;
-        if headless {
+        let budget_usd = if headless {
             let launch = self
                 .engine
                 .launch_of(target)
                 .ok_or_else(|| format!("no live session '{target}'"))?;
             dispatch_mode_precheck(target, task, Some(&launch))?;
-        }
+            Some(effective_headless_budget(budget_usd)?)
+        } else {
+            None
+        };
 
         // Held from here through the write (when there is one): `set_halted`
         // and `cancel_tasks` both take `delivery` exclusively before they
@@ -1890,6 +1970,7 @@ impl Shared {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd,
         }) {
             Err(refusal) => {
                 drop(pane_gate);
@@ -3289,6 +3370,9 @@ fn render_execution(t: &Task) -> String {
     if !t.cli_session.is_empty() {
         text.push_str(&format!(", cli_session: {}", t.cli_session));
     }
+    if let Some(budget) = t.budget_usd {
+        text.push_str(&format!(", budget: ${budget:.2}"));
+    }
     if let Some(usage) = &t.usage {
         text.push_str(&format!(
             ", usage: {}",
@@ -3614,6 +3698,11 @@ pub struct DispatchArgs {
     /// Run a separate Claude print-mode child after 30 seconds of pane quiet.
     #[serde(default)]
     pub headless: bool,
+    /// Budget for a headless run, in US dollars. Defaults to $5.00 when
+    /// absent; refused above $25.00 or when not finite and positive. Ignored
+    /// for pane-mode dispatch (headless: false).
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
     /// The session to hand the task to: use an id from list_sessions.
     pub target: String,
     /// The task, written the way you'd say it to a teammate.
@@ -3882,7 +3971,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. Pass headless: true to run a Claude print-mode child with a $1 budget and 40 minute deadline after 30 seconds of pane quiet; this accepts multiline briefs without the pane byte limit. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. Pass headless: true to run a Claude print-mode child with a 40 minute deadline after 30 seconds of pane quiet; this accepts multiline briefs without the pane byte limit. Its budget defaults to $5.00 and can be set with budget_usd, up to a $25.00 ceiling; a cold-cache first call alone can cost $0.17 to $0.25, so raise it for anything beyond a small task. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -3896,10 +3985,14 @@ impl BrainHandler {
             return refusal;
         }
 
-        match self
-            .shared
-            .dispatch_task_mode(&me, &p.target, &p.task, &p.reviewer, p.headless)
-        {
+        match self.shared.dispatch_task_mode(
+            &me,
+            &p.target,
+            &p.task,
+            &p.reviewer,
+            p.headless,
+            p.budget_usd,
+        ) {
             Err(e) if e.starts_with("refused:") => e,
             Err(e) => format!("Refused: {e}"),
             Ok(o) if p.headless => {
@@ -4669,8 +4762,9 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::{
-        abandon_headless_on_load, apply_headless_exit, dispatch_mode_precheck, dispatch_prompt_raw,
-        pane_mode, HEADLESS_MAX_MS,
+        abandon_headless_on_load, append_denial_note, apply_headless_exit, dispatch_mode_precheck,
+        dispatch_prompt_raw, effective_headless_budget, pane_mode, Usage, HEADLESS_BUDGET_CEILING_USD,
+        HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS,
     };
     use super::{
         abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
@@ -4912,16 +5006,57 @@ mod tests {
         let args: super::DispatchArgs =
             serde_json::from_str(r#"{"target":"sess-2","task":"brief"}"#).unwrap();
         assert!(!args.headless);
+        assert_eq!(args.budget_usd, None);
+    }
+
+    // ---- effective_headless_budget: conductor-settable, bounded ----
+
+    #[test]
+    fn effective_headless_budget_defaults_when_the_conductor_names_none() {
+        // $1 failed any real task (a cold-cache first call alone bills $0.17
+        // to $0.25, per the headless-measurement fact); $5 leaves headroom.
+        assert_eq!(
+            effective_headless_budget(None),
+            Ok(HEADLESS_BUDGET_DEFAULT_USD)
+        );
+    }
+
+    #[test]
+    fn effective_headless_budget_honours_a_conductor_override() {
+        assert_eq!(effective_headless_budget(Some(12.5)), Ok(12.5));
+    }
+
+    #[test]
+    fn effective_headless_budget_refuses_above_the_ceiling_rather_than_clamping() {
+        let err = effective_headless_budget(Some(25.01)).unwrap_err();
+        assert!(err.contains("25.00"), "{err}");
+        // The ceiling itself is still allowed: refused is strictly above it.
+        assert_eq!(
+            effective_headless_budget(Some(HEADLESS_BUDGET_CEILING_USD)),
+            Ok(HEADLESS_BUDGET_CEILING_USD)
+        );
+    }
+
+    #[test]
+    fn effective_headless_budget_refuses_non_finite_and_non_positive_values() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                effective_headless_budget(Some(bad)).is_err(),
+                "{bad} should be refused, not defaulted or clamped"
+            );
+        }
     }
 
     #[test]
     fn task_renderers_include_execution_metadata() {
         let mut t = headless_task();
+        t.budget_usd = Some(7.5);
         apply_headless_exit(&mut t, &headless_outcome(0), 42);
         for text in [render_task(&t), render_task_summary(&t)] {
             assert!(text.contains("mode: headless"));
             assert!(text.contains("exit code: 0"));
             assert!(text.contains("cli_session: uuid"));
+            assert!(text.contains("budget: $7.50"));
             assert!(text.contains("input_tokens"));
             assert!(text.contains("cost_usd"));
         }
@@ -5060,6 +5195,86 @@ mod tests {
             assert_eq!(t.done_ms, Some(42));
             assert!(t.result.contains(reason), "{}", t.result);
         }
+    }
+
+    // ---- design section 6's silent-denial mitigation ----
+
+    #[test]
+    fn append_denial_note_is_a_no_op_without_denials() {
+        assert_eq!(append_denial_note("clean result".into(), None), "clean result");
+        let usage = Usage::default();
+        assert_eq!(
+            append_denial_note("clean result".into(), Some(&usage)),
+            "clean result"
+        );
+    }
+
+    #[test]
+    fn append_denial_note_names_the_refused_tools() {
+        let usage = Usage {
+            permission_denials: vec!["Bash".into(), "WebFetch".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            append_denial_note("did the work".into(), Some(&usage)),
+            "did the work\npermission denials: 2 (Bash, WebFetch)"
+        );
+        // No result text yet (e.g. building the failure line) still gets a
+        // clean note, not a stray leading newline.
+        assert_eq!(
+            append_denial_note(String::new(), Some(&usage)),
+            "permission denials: 2 (Bash, WebFetch)"
+        );
+    }
+
+    #[test]
+    fn a_failed_headless_run_surfaces_which_tools_were_denied() {
+        use crate::headless::HeadlessError;
+        let mut t = headless_task();
+        apply_headless_exit(
+            &mut t,
+            &Err(HeadlessError::Exited {
+                exit_code: Some(1),
+                message: "Reached maximum budget".into(),
+                stderr: "tail".into(),
+                usage: Some(Box::new(Usage {
+                    permission_denials: vec!["Bash".into()],
+                    ..Default::default()
+                })),
+            }),
+            42,
+        );
+        assert!(t.result.contains("exited 1: Reached maximum budget"));
+        assert!(t.result.contains("permission denials: 1 (Bash)"), "{}", t.result);
+    }
+
+    #[test]
+    fn a_completed_headless_run_surfaces_which_tools_were_denied() {
+        let (shared, dir) = shared_for_test();
+        let task = headless_task();
+        shared.tasks.lock().unwrap().push(task.clone());
+        shared.headless_exited_at(
+            dir.path(),
+            &task,
+            Ok(crate::headless::HeadlessOutcome {
+                result: "did the work".into(),
+                cli_session: "uuid".into(),
+                exit_code: Some(0),
+                stderr: String::new(),
+                usage: Some(crate::headless::HeadlessUsage {
+                    permission_denials: vec!["Bash".into()],
+                    ..Default::default()
+                }),
+            }),
+        );
+        let saved = shared.tasks_snapshot().remove(0);
+        assert_eq!(saved.status, "done");
+        assert!(saved.result.contains("did the work"));
+        assert!(
+            saved.result.contains("permission denials: 1 (Bash)"),
+            "{}",
+            saved.result
+        );
     }
 
     #[test]
@@ -5282,6 +5497,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }]
     }
 
@@ -5415,6 +5631,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }
     }
 
@@ -5696,6 +5913,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -5729,6 +5947,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         };
         assert!(render_task(&base).starts_with("[error]"));
     }
@@ -5781,6 +6000,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
@@ -5819,6 +6039,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
 
         assert_eq!(
@@ -5852,6 +6073,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
 
         assert!(
@@ -5950,6 +6172,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
         assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
@@ -5978,6 +6201,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
         assert!(!mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "cancelled");
@@ -6003,6 +6227,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         };
 
         let mut pending = base.clone();
@@ -6041,6 +6266,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -6066,6 +6292,7 @@ mod tests {
                 task: "t".into(),
                 status: status.into(),
                 result: "original".into(),
+                budget_usd: None,
                 reviewer: String::new(),
                 findings: String::new(),
                 exchanges: Vec::new(),
@@ -6108,6 +6335,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-3", "abc123", "stolen", 0),
@@ -6151,6 +6379,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         };
         let done = Task {
             status: "done".into(),
@@ -6192,6 +6421,7 @@ mod tests {
             exit_code: None,
             cli_session: String::new(),
             usage: None,
+            budget_usd: None,
         }
     }
 

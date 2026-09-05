@@ -1935,6 +1935,55 @@ mod tests {
     }
 
     #[test]
+    fn run_headless_registered_drops_an_uninvoked_callbacks_captured_guard_on_session_not_found() {
+        use crate::headless::HeadlessError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::RwLock;
+
+        // mcp.rs's run_headless_task moves a store_gate/delivery/pane-lock
+        // guard into the `registered` callback and relies on that callback
+        // being the thing that drops it. A pre-review flagged the path where
+        // the callback never runs at all (the session is gone before
+        // `run_headless_registered` reaches its own lookup) as a possible
+        // guard leak into `headless_exited_at`, which re-acquires one of the
+        // same guards. This reproduces that shape directly: no live session
+        // exists here at all, so the callback below can never run, yet the
+        // guard it would have dropped must still be free the moment this
+        // call returns, because dropping an un-invoked `FnOnce` drops
+        // whatever it captured by move; there is no code path in
+        // `run_headless_registered` that holds `registered` open past its
+        // own early return. Nothing needed changing to make this pass; it
+        // pins the guarantee mcp.rs's comment at that call site now relies on.
+        let manager = SessionManager::default();
+        let held = std::sync::Arc::new(RwLock::new(()));
+        let guard = held.read().unwrap();
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let called_from_closure = called.clone();
+        let result = manager.run_headless_registered(
+            "no-such-session",
+            "brief",
+            5.0,
+            Duration::from_secs(1),
+            move |_session| {
+                called_from_closure.store(true, Ordering::SeqCst);
+                drop(guard);
+            },
+        );
+        assert!(
+            matches!(&result, Err(HeadlessError::SessionNotFound(id)) if id == "no-such-session"),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "the callback must not run when the session is gone"
+        );
+        assert!(
+            held.try_write().is_ok(),
+            "the callback's captured guard leaked past a call that never invoked it"
+        );
+    }
+
+    #[test]
     fn kill_all_returns_quickly_then_kills_an_active_headless_tree() {
         let manager = SessionManager::default();
         let mut command = std::process::Command::new("sh");

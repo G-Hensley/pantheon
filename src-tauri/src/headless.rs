@@ -275,6 +275,11 @@ pub struct HeadlessUsage {
     pub turns: Option<u64>,
     pub duration_ms: Option<u64>,
     pub duration_api_ms: Option<u64>,
+    /// One entry per tool the child was refused, named where the JSON says
+    /// so, so a task that completed after being silently refused a tool is
+    /// visibly different from a clean one. Empty in the common case.
+    #[serde(default)]
+    pub permission_denials: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -413,6 +418,12 @@ struct ClaudeJson {
     duration_ms: Option<u64>,
     #[serde(default)]
     duration_api_ms: Option<u64>,
+    /// Present on every measured response, always empty in the runs on
+    /// record; the shape of a non-empty entry has not been observed, so
+    /// this is deliberately loose (`serde_json::Value`) rather than a typed
+    /// struct that could fail to deserialize a shape it has never seen.
+    #[serde(default)]
+    permission_denials: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -427,6 +438,22 @@ struct ClaudeTokenUsage {
     cache_read_input_tokens: Option<u64>,
 }
 
+/// A denial entry's shape has never been observed non-empty (see the
+/// `permission_denials` field above), so this reads defensively: a plain
+/// string, or an object naming the tool under `tool_name` or `tool`,
+/// whichever a real response turns out to use.
+fn denial_tool_name(entry: &serde_json::Value) -> String {
+    if let Some(name) = entry.as_str() {
+        return name.to_string();
+    }
+    entry
+        .get("tool_name")
+        .or_else(|| entry.get("tool"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown tool".to_string())
+}
+
 fn parse_claude_output(
     stdout: &[u8],
     stderr: String,
@@ -439,11 +466,17 @@ fn parse_claude_output(
             stdout: String::from_utf8_lossy(stdout).into_owned(),
             stderr: stderr.clone(),
         })?;
+    let permission_denials: Vec<String> = parsed
+        .permission_denials
+        .iter()
+        .map(denial_tool_name)
+        .collect();
     let usage = if parsed.usage.is_some()
         || parsed.total_cost_usd.is_some()
         || parsed.num_turns.is_some()
         || parsed.duration_ms.is_some()
         || parsed.duration_api_ms.is_some()
+        || !permission_denials.is_empty()
     {
         let tokens = parsed.usage.unwrap_or(ClaudeTokenUsage {
             input_tokens: None,
@@ -460,6 +493,7 @@ fn parse_claude_output(
             turns: parsed.num_turns,
             duration_ms: parsed.duration_ms,
             duration_api_ms: parsed.duration_api_ms,
+            permission_denials,
         })
     } else {
         None
@@ -823,6 +857,33 @@ mod tests {
             ),
             Err(HeadlessError::Exited { .. })
         ));
+    }
+
+    #[test]
+    fn a_successful_run_carries_its_permission_denials_by_tool_name() {
+        let outcome = parse_claude_output(
+            br#"{"session_id":"uuid","is_error":false,"result":"done",
+                "permission_denials":[{"tool_name":"Bash"},{"tool":"WebFetch"},"Read"]}"#,
+            String::new(),
+            Some(0),
+        )
+        .unwrap();
+        let usage = outcome.usage.expect("denials imply usage");
+        assert_eq!(usage.permission_denials, vec!["Bash", "WebFetch", "Read"]);
+    }
+
+    #[test]
+    fn no_denials_is_the_common_case_and_stays_empty() {
+        let outcome = parse_claude_output(
+            br#"{"session_id":"uuid","is_error":false,"result":"done","permission_denials":[]}"#,
+            String::new(),
+            Some(0),
+        )
+        .unwrap();
+        assert!(outcome
+            .usage
+            .map(|u| u.permission_denials.is_empty())
+            .unwrap_or(true));
     }
 
     #[test]
