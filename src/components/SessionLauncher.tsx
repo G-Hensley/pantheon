@@ -14,18 +14,25 @@ type ModelChoice = { value: string; label: string };
 // model id so a select's value can tell the two apart.
 const CUSTOM_MODEL = "__custom__";
 
-// Small, fixed option sets for the CLIs that don't have a list command.
-// claude's are the aliases `claude --help` documents for --model; codex's
-// "Config default" (empty value, no -m flag) reproduces what an empty model
-// already meant before this picker existed: Codex falls back to its own
-// ~/.codex/config.toml. opencode has no entry here: its options come from
-// `list_models` instead.
+// A small, fixed option set for the one CLI with no list command at all.
+// claude's are the aliases `claude --help` documents for --model. codex and
+// opencode have no entry here: their options come from `list_models` instead
+// (codex via `codex debug models`, opencode via `opencode models`).
 const STATIC_MODEL_OPTIONS: Record<string, ModelChoice[]> = {
   claude: [
     { value: "fable", label: "Fable 5.1" },
     { value: "opus", label: "Opus 5" },
     { value: "sonnet", label: "Sonnet 5" },
   ],
+};
+
+// Fixed options a dynamic CLI's select carries in addition to its fetched
+// list, always present regardless of whether the fetch has finished or
+// failed. codex's "Config default" (empty value, no -m flag) reproduces what
+// an empty model already meant before this picker existed: Codex falls back
+// to its own ~/.codex/config.toml, so this option must never depend on the
+// fetch succeeding.
+const DYNAMIC_LEADING_OPTIONS: Record<string, ModelChoice[]> = {
   codex: [{ value: "", label: "Config default" }],
 };
 
@@ -49,8 +56,10 @@ function groupByProvider(ids: string[]): Array<[string, string[]]> {
 
 // The model row for one CLI: a styled select over its known options, plus a
 // "Custom..." choice that reveals a styled text input for an id not in the
-// list. opencode's options are fetched once per launcher open; claude's and
-// codex's are static and available immediately.
+// list. opencode's and codex's options are fetched once per launcher open;
+// claude's are static and available immediately. codex also carries fixed
+// leading options (see `DYNAMIC_LEADING_OPTIONS`) that show up front, before
+// the fetch resolves and even if it fails.
 function ModelPicker({
   type,
   value,
@@ -63,6 +72,7 @@ function ModelPicker({
   missing: boolean;
 }) {
   const staticOptions = STATIC_MODEL_OPTIONS[type.id];
+  const leadingOptions = DYNAMIC_LEADING_OPTIONS[type.id];
   const isDynamic = staticOptions === undefined;
 
   const [dynamicOptions, setDynamicOptions] = useState<string[] | null>(null);
@@ -70,12 +80,16 @@ function ModelPicker({
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // Preselect the remembered value if it's one of the known options, else
-  // start in Custom mode with it filled in. For a dynamic CLI the options
-  // aren't known yet at mount, so this starts as Custom and the effect below
-  // corrects it once the list arrives.
-  const [customMode, setCustomMode] = useState<boolean>(() =>
-    staticOptions ? !staticOptions.some((o) => o.value === value) : true,
-  );
+  // start in Custom mode with it filled in. For a dynamic CLI with no leading
+  // options (opencode) the options aren't known yet at mount, so this starts
+  // as Custom and the effect below corrects it once the list arrives. A
+  // dynamic CLI with leading options (codex) can already tell at mount
+  // whether the remembered value is one of those.
+  const [customMode, setCustomMode] = useState<boolean>(() => {
+    if (staticOptions) return !staticOptions.some((o) => o.value === value);
+    if (leadingOptions) return !leadingOptions.some((o) => o.value === value);
+    return true;
+  });
 
   useEffect(() => {
     if (!isDynamic) return;
@@ -115,7 +129,19 @@ function ModelPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dynamicOptions]);
 
-  const selectableOptions = isDynamic ? dynamicOptions : staticOptions;
+  // Ids fetched so far for a dynamic CLI, or none yet. codex's fixed leading
+  // options are shown regardless of this, so its select never depends on the
+  // fetch having resolved.
+  const fetchedIds = dynamicOptions ?? [];
+
+  // Whether the select renders at all. Static options and leading options are
+  // both known synchronously, so claude and codex always show a select.
+  // opencode has neither, so it stays hidden (Custom mode fills in instead)
+  // until its fetch resolves.
+  const showSelect =
+    staticOptions !== undefined ||
+    leadingOptions !== undefined ||
+    dynamicOptions !== null;
 
   return (
     // The row's whole label area is a <button onClick={pick}>, so without
@@ -123,7 +149,7 @@ function ModelPicker({
     // custom input would bubble up and launch the session before the
     // operator finished choosing a model.
     <span className="ll-model-field" onClick={(e) => e.stopPropagation()}>
-      {selectableOptions && (
+      {showSelect && (
         <select
           className="ll-model-select"
           value={customMode ? CUSTOM_MODEL : value}
@@ -137,9 +163,23 @@ function ModelPicker({
             }
           }}
         >
-          {isDynamic
-            ? groupByProvider(selectableOptions as string[]).map(
-                ([provider, ids]) => (
+          {staticOptions
+            ? staticOptions.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))
+            : leadingOptions
+              ? // codex: no "/" in its slugs, so a flat list rather than
+                // opencode's provider optgroups.
+                [...leadingOptions, ...fetchedIds.map((id) => ({ value: id, label: id }))].map(
+                  (o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ),
+                )
+              : groupByProvider(fetchedIds).map(([provider, ids]) => (
                   <optgroup key={provider} label={provider}>
                     {ids.map((id) => (
                       <option key={id} value={id}>
@@ -147,13 +187,7 @@ function ModelPicker({
                       </option>
                     ))}
                   </optgroup>
-                ),
-              )
-            : (selectableOptions as ModelChoice[]).map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
+                ))}
           <option value={CUSTOM_MODEL}>Custom…</option>
         </select>
       )}

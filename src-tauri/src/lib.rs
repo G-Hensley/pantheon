@@ -276,6 +276,43 @@ fn parse_and_filter_models(raw: &str) -> Vec<String> {
     models
 }
 
+/// Parse `codex debug models` output (one JSON object holding a `models`
+/// array) and keep only the slugs the picker may offer: entries whose
+/// `visibility` is exactly "list", ordered by ascending `priority`. An entry
+/// with no `priority` sorts after every entry that has one; `sort_by_key` is
+/// stable, so entries that tie (including two entries both missing priority)
+/// keep the catalog's own order. Pulled out of `list_models` so the parsing
+/// and filtering is testable without spawning a process, mirroring
+/// `parse_and_filter_models` for opencode. Fields other than `slug`,
+/// `visibility`, and `priority` (the catalog carries plenty, including long
+/// prompt text) are ignored rather than rejected.
+fn parse_and_filter_codex_models(raw: &str) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        slug: String,
+        visibility: String,
+        #[serde(default)]
+        priority: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Catalog {
+        models: Vec<Entry>,
+    }
+
+    let catalog: Catalog = serde_json::from_str(raw)
+        .map_err(|e| format!("failed to parse codex model catalog: {e}"))?;
+
+    let mut listed: Vec<Entry> = catalog
+        .models
+        .into_iter()
+        .filter(|m| m.visibility == "list")
+        .collect();
+    // (priority.is_none(), priority): entries carrying a priority sort before
+    // those without one, and ascend by priority among themselves.
+    listed.sort_by_key(|m| (m.priority.is_none(), m.priority));
+    Ok(listed.into_iter().map(|m| m.slug).collect())
+}
+
 /// How often `run_with_timeout` polls for the child having exited.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -353,12 +390,26 @@ fn run_with_timeout(
 
 /// List the models a CLI offers, for the launcher's model picker.
 ///
-/// Only opencode has a list command; every other program returns an empty
-/// list so the frontend falls back to its static options plus Custom. The
-/// child is given `LIST_MODELS_TIMEOUT` to finish and is killed if it
-/// overruns, so a hung `opencode models` cannot hang the launcher with it.
+/// opencode and codex both have a list command; every other program returns
+/// an empty list so the frontend falls back to its static options plus
+/// Custom. codex has no `models` subcommand, but `codex debug models` prints
+/// its whole catalog as JSON, which `parse_and_filter_codex_models` reduces
+/// to the listable slugs. The child is given `LIST_MODELS_TIMEOUT` to finish
+/// and is killed if it overruns, so a hung child cannot hang the launcher
+/// with it.
 #[tauri::command]
 fn list_models(program: String) -> Result<Vec<String>, String> {
+    if is_codex(&program) {
+        let mut cmd = Command::new(&program);
+        cmd.arg("debug").arg("models");
+        let (status, out, err) = run_with_timeout(cmd, LIST_MODELS_TIMEOUT)
+            .map_err(|e| format!("'{program} debug models' {e}"))?;
+        if !status.success() {
+            return Err(format!("'{program} debug models' failed: {}", err.trim()));
+        }
+        return parse_and_filter_codex_models(&out);
+    }
+
     if !is_opencode(&program) {
         return Ok(Vec::new());
     }
@@ -1796,11 +1847,12 @@ mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
-        list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_models,
-        ready_to_submit, resolve_isolation, run_with_timeout, submit_ceiling_ms, submit_floor_ms,
-        validate_human_dispatch, worktree, ActiveHeadless, IsolationReason, SessionManager,
-        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
-        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_codex_models,
+        parse_and_filter_models, ready_to_submit, resolve_isolation, run_with_timeout,
+        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, ActiveHeadless,
+        IsolationReason, SessionManager, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV,
+        SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS,
+        SUBMIT_QUIET_MS,
     };
     use std::fs;
     use std::process::Command;
@@ -2718,21 +2770,39 @@ mod tests {
     }
 
     #[test]
-    fn list_models_skips_programs_other_than_opencode() {
+    fn list_models_skips_programs_with_no_list_command() {
         // These must not spawn anything: an empty Ok is returned immediately so
         // the frontend falls back to Custom for CLIs with no list command.
+        // codex does have one now (`codex debug models`), so it needs a real
+        // binary and is covered via `parse_and_filter_codex_models` instead.
         assert_eq!(
             list_models("claude".to_string()).unwrap(),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            list_models("codex".to_string()).unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(
             list_models("bash".to_string()).unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn parse_and_filter_codex_models_keeps_list_entries_ordered_by_priority() {
+        let raw = r#"{"models":[
+            {"slug":"gpt-reserve","display_name":"hidden","visibility":"hide","priority":3},
+            {"slug":"gpt-5.6-sol","visibility":"list","priority":6},
+            {"slug":"gpt-6-astra","visibility":"list","priority":1,"supported_reasoning_levels":[{"effort":"low"}]},
+            {"slug":"gpt-test-unranked","visibility":"list"}
+        ]}"#;
+        assert_eq!(
+            parse_and_filter_codex_models(raw).unwrap(),
+            vec!["gpt-6-astra", "gpt-5.6-sol", "gpt-test-unranked"]
+        );
+    }
+
+    #[test]
+    fn parse_and_filter_codex_models_rejects_malformed_json() {
+        assert!(parse_and_filter_codex_models("{not json").is_err());
+        assert!(parse_and_filter_codex_models("").is_err());
     }
 
     // `run_with_timeout` is exercised directly with real child processes

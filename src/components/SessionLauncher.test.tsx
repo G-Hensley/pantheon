@@ -1,14 +1,44 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { SessionLauncher } from "./SessionLauncher";
 import { listModels } from "../lib/ipc";
 
+// vi.mock's factory is hoisted above any top-level `let`, so the reference it
+// closes over has to be created with vi.hoisted instead, or assigning into it
+// below throws a TDZ error at import time.
+const hoisted = vi.hoisted(() => ({
+  actualListModels: undefined as unknown as typeof listModels,
+}));
+
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
+  hoisted.actualListModels = actual.listModels;
   return {
     ...actual,
     listModels: vi.fn(actual.listModels),
   };
+});
+
+// codex and opencode are both dynamic CLIs, so every render of the launcher
+// calls listModels for both of them. mockResolvedValueOnce/mockRejectedValueOnce
+// queue against whichever call happens *next*, with no regard for its
+// argument, and codex's row always mounts (and so calls listModels) before
+// opencode's, so a plain "once" set up for one program can be consumed by
+// the other's call instead. Routing by argument avoids that, and resetting
+// between tests keeps one test's queued behaviour from leaking into the next
+// (there is no global clearMocks/restoreMocks in vitest.config.ts).
+function mockListModelsFor(program: string, result: string[] | string) {
+  vi.mocked(listModels).mockImplementation((p) => {
+    if (p !== program) return hoisted.actualListModels(p);
+    return typeof result === "string"
+      ? Promise.reject(result)
+      : Promise.resolve(result);
+  });
+}
+
+afterEach(() => {
+  vi.mocked(listModels).mockReset();
+  vi.mocked(listModels).mockImplementation(hoisted.actualListModels);
 });
 
 describe("<SessionLauncher>", () => {
@@ -71,7 +101,7 @@ describe("<SessionLauncher>", () => {
     );
   });
 
-  it("renders the documented static options for claude and codex", () => {
+  it("renders the documented static options for claude", () => {
     render(
       <SessionLauncher onPick={vi.fn()} onClose={() => {}} project={null} />,
     );
@@ -83,7 +113,15 @@ describe("<SessionLauncher>", () => {
       "Sonnet 5",
       "Custom…",
     ]);
+  });
 
+  it("shows Config default and Custom for codex before its model fetch resolves", () => {
+    // codex is a dynamic CLI like opencode, but its leading options
+    // ("Config default") must be there immediately, not only once the fetch
+    // resolves, so the select is never empty while codex debug models runs.
+    render(
+      <SessionLauncher onPick={vi.fn()} onClose={() => {}} project={null} />,
+    );
     const codexItem = screen.getByText("Codex").closest(".launcher-item")!;
     const codexSelect = codexItem.querySelector("select") as HTMLSelectElement;
     expect(Array.from(codexSelect.options).map((o) => o.textContent)).toEqual([
@@ -94,6 +132,54 @@ describe("<SessionLauncher>", () => {
     // yet, so it's preselected rather than falling to Custom.
     expect(codexSelect.value).toBe("");
     expect(codexItem.querySelector("input")).toBeNull();
+  });
+
+  it("populates the codex select from the mocked list_models result", async () => {
+    mockListModelsFor("codex", ["gpt-6-astra", "gpt-5.6-sol"]);
+    render(
+      <SessionLauncher onPick={vi.fn()} onClose={() => {}} project={null} />,
+    );
+    const codexItem = screen
+      .getByText("Codex")
+      .closest(".launcher-item") as HTMLElement;
+    const codexCalls = vi
+      .mocked(listModels)
+      .mock.calls.filter(([program]) => program === "codex");
+    expect(codexCalls).toHaveLength(1);
+
+    const select = codexItem.querySelector("select") as HTMLSelectElement;
+    await within(codexItem).findByText("gpt-6-astra", { selector: "option" });
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      "Config default",
+      "gpt-6-astra",
+      "gpt-5.6-sol",
+      "Custom…",
+    ]);
+    // Codex slugs have no "/", so they render as plain options, not grouped
+    // under an <optgroup> the way opencode's ids are.
+    expect(select.querySelector("optgroup")).toBeNull();
+  });
+
+  it("still shows Config default and Custom for codex when the model fetch fails", async () => {
+    mockListModelsFor("codex", "codex debug models failed");
+    render(
+      <SessionLauncher onPick={vi.fn()} onClose={() => {}} project={null} />,
+    );
+    const codexItem = screen
+      .getByText("Codex")
+      .closest(".launcher-item") as HTMLElement;
+    const select = codexItem.querySelector("select") as HTMLSelectElement;
+    // Present immediately, and still present once the rejection lands.
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      "Config default",
+      "Custom…",
+    ]);
+    const alert = await within(codexItem).findByRole("alert");
+    expect(alert.textContent).toBe("codex debug models failed");
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      "Config default",
+      "Custom…",
+    ]);
   });
 
   it("clicking or editing the model controls does not launch the row", () => {
@@ -151,7 +237,7 @@ describe("<SessionLauncher>", () => {
   });
 
   it("populates the opencode select from the mocked list_models result", async () => {
-    vi.mocked(listModels).mockResolvedValueOnce([
+    mockListModelsFor("opencode", [
       "openrouter/free",
       "opencode/gpt-oss-120b-free",
       "llama-3.1-8b",
