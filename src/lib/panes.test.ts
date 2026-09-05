@@ -100,3 +100,43 @@ describe("restoreConductor", () => {
     expect(notice).toBeNull();
   });
 });
+
+describe("restoreConductor repairs the mount-time persist race", () => {
+  // On mount, App.tsx's own conductor state starts null, so its persist
+  // effect (keyed on that state and the panes) runs before restoreConductor's
+  // setConductor call resolves, and writes an empty conductor to storage in
+  // the meantime. These tests reproduce that ordering directly against the
+  // storage functions, without needing a live App.tsx render.
+  beforeEach(() => localStorage.clear());
+  afterEach(() => vi.mocked(setConductor).mockReset().mockResolvedValue(undefined));
+
+  it("leaves the saved id in storage after a persist(null) lands before restore resolves", async () => {
+    saveConductorId("sess-1", ["sess-1"]);
+    expect(loadConductorId()).toBe("sess-1");
+
+    // The mount-time persist effect, firing with conductor still null.
+    saveConductorId(null, ["sess-1"]);
+    expect(loadConductorId()).toBeNull();
+
+    // The saved id passed in here is the one captured before the first
+    // render, independent of the persist effect that already cleared
+    // storage, matching how App.tsx calls this with a ref taken at mount.
+    const notice = await restoreConductor("sess-1", ["sess-1"]);
+
+    expect(notice).toBeNull();
+    expect(loadConductorId()).toBe("sess-1");
+  });
+
+  it("returns a notice, rather than silence, when the restore's setConductor rejects", async () => {
+    saveConductorId("sess-1", ["sess-1"]);
+    saveConductorId(null, ["sess-1"]);
+    vi.mocked(setConductor).mockRejectedValueOnce(new Error("no such pane"));
+
+    const notice = await restoreConductor("sess-1", ["sess-1"]);
+
+    expect(notice).toContain("sess-1");
+    // The pane was not actually promoted, so leaving the id cleared is
+    // correct here; what must not happen is losing the failure silently.
+    expect(loadConductorId()).toBeNull();
+  });
+});

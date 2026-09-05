@@ -193,6 +193,20 @@ export function decideConductorRestore(
  * failure the caller learns about later (see `noteSpawnFailure` in App.tsx)
  * and must retract the same way: clear the conductor, never hand it to a
  * different pane.
+ *
+ * On a successful restore this also writes the id back to storage. On
+ * mount, `conductor` state starts null, so App.tsx's own persist effect
+ * (keyed on the live conductor and panes) runs before this function's
+ * `setConductor` call resolves and writes an empty conductor to storage in
+ * the meantime, erasing the very id this function is about to restore.
+ * Storage would eventually repair itself once the backend's
+ * `conductor-changed` event round-trips back to that effect, but relying on
+ * that round trip means a rejected `setConductor`, or the app closing before
+ * the event arrives, would lose the saved id with nothing to show for it.
+ * Writing it back here, immediately after the promotion actually succeeds,
+ * closes that window instead of hoping the round trip wins the race. A
+ * rejection is reported as a notice rather than swallowed, for the same
+ * reason: silence is what made the original loss invisible.
  */
 export async function restoreConductor(
   savedId: string | null,
@@ -201,7 +215,12 @@ export async function restoreConductor(
   const decision = decideConductorRestore(savedId, paneIds);
   if (decision.id === null) return null;
   if (decision.restore) {
-    await setConductor(decision.id).catch(() => {});
+    try {
+      await setConductor(decision.id);
+    } catch {
+      return `Conductor was not restored: pane ${decision.id} could not be promoted.`;
+    }
+    saveConductorId(decision.id, paneIds);
     return null;
   }
   saveConductorId(null, paneIds);
