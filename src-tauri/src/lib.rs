@@ -2791,11 +2791,11 @@ mod tests {
             {"slug":"gpt-reserve","display_name":"hidden","visibility":"hide","priority":3},
             {"slug":"gpt-5.6-sol","visibility":"list","priority":6},
             {"slug":"gpt-6-astra","visibility":"list","priority":1,"supported_reasoning_levels":[{"effort":"low"}]},
-            {"slug":"codex-auto-review","visibility":"list"}
+            {"slug":"gpt-test-unranked","visibility":"list"}
         ]}"#;
         assert_eq!(
             parse_and_filter_codex_models(raw).unwrap(),
-            vec!["gpt-6-astra", "gpt-5.6-sol", "codex-auto-review"]
+            vec!["gpt-6-astra", "gpt-5.6-sol", "gpt-test-unranked"]
         );
     }
 
