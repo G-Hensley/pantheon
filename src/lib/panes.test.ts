@@ -51,7 +51,7 @@ describe("decideConductorRestore", () => {
   });
 
   it("clears a saved conductor whose pane is absent, rather than reassigning it", () => {
-    // The roster has other panes, but none of them is the saved id — the
+    // The roster has other panes, but none of them is the saved id, so the
     // decision must carry the saved id back for clearing, never substitute
     // one of the panes that *is* present.
     expect(decideConductorRestore("sess-1", ["sess-2", "sess-3"])).toEqual({
