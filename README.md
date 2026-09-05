@@ -289,6 +289,19 @@ exchange is kept on the task, so an answer given once is not asked again.
 - **Dirty worktree recovery is manual.** Closing a session refuses to remove
   its dirty worktree, preserving uncommitted edits on disk, but the UI does
   not yet show the preserved path or offer a recovery workflow.
+- **Conductor identity now survives a relaunch, but only to the recorded
+  pane.** The role is restored automatically once the saved roster has been
+  reopened, and only to the exact pane that held it. If that pane is missing
+  from the roster, or fails to spawn, the saved conductor is cleared and a
+  short notice explains why, rather than promoting a different pane. The
+  roster and the conductor id it restores are both a single global
+  `localStorage` bucket rather than scoped per project, so switching projects
+  does not switch which pane, if any, is remembered as conductor. The
+  restored pane also gets no composer briefing: `set_conductor` only briefs a
+  pane already connected to MCP, and restore runs before any pane has
+  spawned, so the promoted pane learns its role only when it calls
+  `list_sessions` on connect, the same way every agent is told to. Fixing
+  that belongs in the backend, at connect time.
 - The markdown mirror under `.pantheon/context/` is written for humans to read
   and is never read back. The shared context itself does persist: entries,
   sessions, and tasks are rehydrated from `brain.jsonl` when the app opens a

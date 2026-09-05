@@ -12,10 +12,11 @@
 // on every pane change, and keeping it beside the project it belongs with means
 // one place to look when a restore misbehaves.
 
-import { SESSION_TYPES, type SavedWorktree, type SessionType } from "./ipc";
+import { SESSION_TYPES, setConductor, type SavedWorktree, type SessionType } from "./ipc";
 import { readStored, writeStored } from "./storage";
 
 const KEY = "panes";
+const CONDUCTOR_KEY = "conductor";
 
 // What is persisted per pane. The session *type id* is stored rather than the
 // type object, so a pane restored after an upgrade picks up the current
@@ -121,6 +122,109 @@ export function saveRoster(panes: StoredPane[]): void {
   } catch {
     /* ignore — persistence is best-effort, it must never break the app */
   }
+}
+
+// The conductor pane, alongside the roster it must belong to. Stored under
+// its own key (same storage as the roster) rather than folded into the
+// roster JSON, so a pane save does not have to reason about conductor state
+// and vice versa. A missing key and an empty string both mean "no conductor".
+
+/** Read the persisted conductor pane id, or null if none is stored. */
+export function loadConductorId(): string | null {
+  try {
+    const raw = readStored(CONDUCTOR_KEY);
+    return raw ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the conductor id, but only while it names a pane still in the
+ * roster. An id pointing at a pane that is no longer open is worse than no
+ * conductor at all: left in storage, the next launch would try to restore a
+ * role to a pane that will never be spawned. Called whenever the conductor
+ * changes (promote, demote) and whenever the roster does (a pane closing can
+ * take the conductor's pane with it), so a stale id never lingers.
+ */
+export function saveConductorId(conductor: string | null, paneIds: string[]): void {
+  try {
+    const id = conductor !== null && paneIds.includes(conductor) ? conductor : null;
+    writeStored(CONDUCTOR_KEY, id ?? "");
+  } catch {
+    /* ignore, persistence is best-effort, it must never break the app */
+  }
+}
+
+// What launch should do with a saved conductor id, given which panes are
+// actually part of the roster about to run. There are only ever two
+// outcomes for a non-null saved id: restore that exact pane, or none at all.
+// Never a substitute: a missing or failed pane means no conductor, not a
+// different one.
+export type ConductorRestoreDecision =
+  | { restore: true; id: string }
+  | { restore: false; id: string | null };
+
+/**
+ * Decide, without touching the backend, whether a saved conductor id can be
+ * restored. Pure, so "never promote a different pane" can be checked without
+ * a live app or a spawned process: the id is either exactly the saved one or
+ * the decision carries no id to promote.
+ */
+export function decideConductorRestore(
+  savedId: string | null,
+  paneIds: string[],
+): ConductorRestoreDecision {
+  if (savedId === null) return { restore: false, id: null };
+  if (paneIds.includes(savedId)) return { restore: true, id: savedId };
+  return { restore: false, id: savedId };
+}
+
+/**
+ * Apply a launch-time conductor restore: promote the saved pane if it is
+ * part of the roster, or clear the stale saved id if it is not. Returns a
+ * short notice to surface when the id could not be restored (the saved
+ * conductor was null, so there is nothing to say), or null when there is
+ * nothing to report.
+ *
+ * This only covers what is knowable at launch, before any pane has actually
+ * spawned: whether the saved pane is part of the roster at all. A pane that
+ * is part of the roster but then fails to spawn is a separate, asynchronous
+ * failure the caller learns about later (see `noteSpawnFailure` in App.tsx)
+ * and must retract the same way: clear the conductor, never hand it to a
+ * different pane.
+ *
+ * On a successful restore this also writes the id back to storage. On
+ * mount, `conductor` state starts null, so App.tsx's own persist effect
+ * (keyed on the live conductor and panes) runs before this function's
+ * `setConductor` call resolves and writes an empty conductor to storage in
+ * the meantime, erasing the very id this function is about to restore.
+ * Storage would eventually repair itself once the backend's
+ * `conductor-changed` event round-trips back to that effect, but relying on
+ * that round trip means a rejected `setConductor`, or the app closing before
+ * the event arrives, would lose the saved id with nothing to show for it.
+ * Writing it back here, immediately after the promotion actually succeeds,
+ * closes that window instead of hoping the round trip wins the race. A
+ * rejection is reported as a notice rather than swallowed, for the same
+ * reason: silence is what made the original loss invisible.
+ */
+export async function restoreConductor(
+  savedId: string | null,
+  paneIds: string[],
+): Promise<string | null> {
+  const decision = decideConductorRestore(savedId, paneIds);
+  if (decision.id === null) return null;
+  if (decision.restore) {
+    try {
+      await setConductor(decision.id);
+    } catch {
+      return `Conductor was not restored: pane ${decision.id} could not be promoted.`;
+    }
+    saveConductorId(decision.id, paneIds);
+    return null;
+  }
+  saveConductorId(null, paneIds);
+  return `Conductor was not restored: pane ${decision.id} is no longer open.`;
 }
 
 // Where the `sess-N` counter has to resume from.
