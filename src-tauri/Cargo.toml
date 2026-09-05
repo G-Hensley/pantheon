@@ -37,6 +37,19 @@ uuid = { version = "1.24.0", features = ["v4"] }
 schemars = "1"
 tauri-plugin-dialog = "2.7.2"
 
+[target.'cfg(unix)'.dependencies]
+# Process groups let Pantheon terminate a headless agent and every tool it forked.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects are the Windows process-tree boundary and kill children if the
+# owning Pantheon process closes its last job handle.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
-
