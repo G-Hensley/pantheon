@@ -516,6 +516,35 @@ button.ghost.on {
   font-family: "JetBrains Mono", Consolas, monospace;
 }
 
+.ll-model-select,
+.ll-model-input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  color: var(--txt);
+  background: var(--panel2);
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+}
+
+.ll-model-input::placeholder {
+  color: var(--dim);
+}
+
+.ll-model-select:focus,
+.ll-model-input:focus {
+  outline: none;
+  border-color: var(--acc);
+}
+
+.ll-model-loading {
+  display: block;
+  margin-top: 4px;
+  color: var(--dim);
+}
+
 .launcher-item .ll-key {
   margin-left: auto;
   font-family: inherit;

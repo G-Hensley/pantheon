@@ -253,6 +253,126 @@ fn opencode_model_guard(model: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// How long `list_models` waits for `opencode models` before giving up on it.
+/// Measured locally at ~2s for 379 ids, so 15s leaves ample room for a slower
+/// machine or a cold model cache without leaving the launcher hung indefinitely
+/// on a CLI that never returns.
+const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parse `opencode models` output (one id per line) and drop every id the
+/// free-model guard would refuse, so the launcher only ever offers models that
+/// can actually be picked. Pulled out of `list_models` so the parsing and
+/// filtering is testable without spawning a process.
+fn parse_and_filter_models(raw: &str) -> Vec<String> {
+    let mut models: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !is_paid_openrouter_model(line))
+        .map(str::to_string)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// How often `run_with_timeout` polls for the child having exited.
+const RUN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Run `cmd` to completion, killing it if it has not exited within `timeout`.
+/// Returns its exit status and captured stdout/stderr.
+///
+/// Reads stdout and stderr on their own threads rather than one after the
+/// other: a child that fills one pipe while it is still blocked writing to
+/// the other would otherwise deadlock the sequential read waiting on the
+/// pipe that is not being drained.
+///
+/// The deadline is enforced by polling `try_wait` rather than by racing the
+/// output reads, so it bounds the child's whole run, not just how long its
+/// output takes to arrive. A child that closes both pipes early but keeps
+/// running is exactly the case a read-only race would miss: the reads would
+/// finish immediately, and a follow-up blocking `wait()` would then have no
+/// deadline of its own and could hang forever.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = out_tx.send(buf);
+    });
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        let _ = err_tx.send(buf);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(RUN_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Err(e) => return Err(format!("failed to wait on child: {e}")),
+        }
+    };
+
+    // The child itself has exited, but a descendant it spawned (a
+    // backgrounded shell job, for example) can inherit the pipe and keep its
+    // write end open long after nothing more will ever arrive on it:
+    // `read_to_string` then blocks for that descendant's remaining lifetime,
+    // not the exited child's. Collecting through a channel with the *same*
+    // deadline the exit wait above used, rather than an unbounded thread
+    // join, is what keeps this call bounded by `timeout` no matter which
+    // process is still holding a pipe open.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let out = out_rx
+        .recv_timeout(remaining)
+        .map_err(|_| format!("timed out after {}s waiting for output", timeout.as_secs()))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let err = err_rx
+        .recv_timeout(remaining)
+        .map_err(|_| format!("timed out after {}s waiting for output", timeout.as_secs()))?;
+    Ok((status, out, err))
+}
+
+/// List the models a CLI offers, for the launcher's model picker.
+///
+/// Only opencode has a list command; every other program returns an empty
+/// list so the frontend falls back to its static options plus Custom. The
+/// child is given `LIST_MODELS_TIMEOUT` to finish and is killed if it
+/// overruns, so a hung `opencode models` cannot hang the launcher with it.
+#[tauri::command]
+fn list_models(program: String) -> Result<Vec<String>, String> {
+    if !is_opencode(&program) {
+        return Ok(Vec::new());
+    }
+
+    let mut cmd = Command::new(&program);
+    cmd.arg("models");
+    let (status, out, err) = run_with_timeout(cmd, LIST_MODELS_TIMEOUT)
+        .map_err(|e| format!("'{program} models' {e}"))?;
+    if !status.success() {
+        return Err(format!("'{program} models' failed: {}", err.trim()));
+    }
+    Ok(parse_and_filter_models(&out))
+}
+
 /// Whether the Enter that submits a prompt can be sent yet.
 ///
 /// Split out from the waiting loop so the policy is testable without a live PTY.
@@ -1646,6 +1766,7 @@ pub fn run() {
             set_project,
             project_is_repo,
             init_project_repo,
+            list_models,
             human_dispatch
         ])
         .on_window_event(|window, event| {
@@ -1675,14 +1796,15 @@ mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
-        migrate_legacy_dir, opencode_model_guard, ready_to_submit, resolve_isolation,
-        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, ActiveHeadless,
-        IsolationReason, SessionManager, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV,
-        SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS,
-        SUBMIT_QUIET_MS,
+        list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_models,
+        ready_to_submit, resolve_isolation, run_with_timeout, submit_ceiling_ms, submit_floor_ms,
+        validate_human_dispatch, worktree, ActiveHeadless, IsolationReason, SessionManager,
+        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
+        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
-    use std::time::Duration;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     #[test]
@@ -2559,5 +2681,137 @@ mod tests {
         assert!(is_paid_openrouter_model("\topenrouter/gpt-4o\n"));
         // Free-tier with whitespace is still free.
         assert!(!is_paid_openrouter_model(" openrouter/free "));
+    }
+
+    #[test]
+    fn parse_and_filter_models_drops_paid_openrouter_ids() {
+        let raw = "openrouter/free\n\
+                    openrouter/gpt-4o\n\
+                    openrouter/anthropic/claude-3-5-sonnet:free\n\
+                    ollama/llama3\n";
+        assert_eq!(
+            parse_and_filter_models(raw),
+            vec![
+                "ollama/llama3",
+                "openrouter/anthropic/claude-3-5-sonnet:free",
+                "openrouter/free"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_and_filter_models_trims_dedupes_and_sorts() {
+        // Blank lines, surrounding whitespace, a duplicate id, and out-of-order
+        // input are all things real CLI output can contain; none of them should
+        // survive into the launcher's list.
+        let raw = "\n  opencode/gpt-oss-120b-free  \nllama-3.1-8b\nllama-3.1-8b\n\topencode/gpt-oss-120b-free\t\n";
+        assert_eq!(
+            parse_and_filter_models(raw),
+            vec!["llama-3.1-8b", "opencode/gpt-oss-120b-free"]
+        );
+    }
+
+    #[test]
+    fn parse_and_filter_models_of_empty_input_is_empty() {
+        assert!(parse_and_filter_models("").is_empty());
+        assert!(parse_and_filter_models("\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn list_models_skips_programs_other_than_opencode() {
+        // These must not spawn anything: an empty Ok is returned immediately so
+        // the frontend falls back to Custom for CLIs with no list command.
+        assert_eq!(
+            list_models("claude".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            list_models("codex".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            list_models("bash".to_string()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    // `run_with_timeout` is exercised directly with real child processes
+    // (rather than only through `list_models`, which is pinned to the
+    // literal program name "opencode") so the timeout and concurrent-read
+    // behaviour is covered without needing an `opencode` binary on PATH.
+    // `sh` makes these Unix-only.
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_kills_a_child_that_closes_its_pipes_but_keeps_running() {
+        // Closes stdout and stderr immediately, then sleeps far longer than
+        // the timeout below. A timeout that only bounded reading the (now
+        // closed, immediately-EOF) pipes would let this sleep run to
+        // completion instead of killing it.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec >/dev/null 2>&1; sleep 5"]);
+        let started = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        // Killed at the deadline, not left to run out its 5s sleep.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}, should have been killed well before the child's sleep finished",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_drains_a_full_stderr_without_stalling_stdout() {
+        // Writes 200000 bytes to stderr (comfortably past a pipe's default
+        // buffer size) before writing to stdout and exiting. Reading stdout
+        // to EOF first (the sequential-read bug this replaces) would block
+        // forever here: the child cannot finish (and so cannot close stdout)
+        // until its stderr write is drained, which a sequential reader never
+        // gets to until stdout already closed.
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' 'e' 1>&2; printf out",
+        ]);
+        let started = Instant::now();
+        let (status, out, err) = run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(status.success());
+        assert_eq!(out, "out");
+        assert_eq!(err.len(), 200_000);
+        assert!(err.chars().all(|c| c == 'e'));
+        // Finished on its own long before the generous timeout above; this
+        // guards against a regression back to a stall that only the timeout
+        // would eventually break.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}, should have completed almost immediately",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_is_bounded_even_when_a_descendant_outlives_the_child() {
+        // The shell backgrounds `sleep 2` (which inherits the piped stdout
+        // and stderr) and then exits immediately itself. try_wait sees the
+        // shell exit almost instantly, well inside the timeout, but the
+        // sleep process is still holding the write end of both pipes open:
+        // a plain `read_to_string`/thread join would then block for the
+        // sleep's remaining 2s, not the shell's near-zero runtime. The
+        // deadline on collecting output is what has to catch this, since the
+        // process-exit deadline above already passed.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2 & exit 0"]);
+        let started = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}, should have returned around the 200ms deadline, \
+             not waited out the backgrounded sleep",
+            started.elapsed()
+        );
     }
 }
