@@ -846,7 +846,12 @@ is caught separately, once that failure is known: `noteSpawnFailure` retracts
 the role the same way, clear rather than reassigned. The Tauri command at
 `src-tauri/src/lib.rs` still only forwards the value, and `src-tauri/src/mcp.rs`
 still keeps it in memory; nothing on the backend persists, so this restore is
-frontend-owned end to end, matching the roster it rides beside.
+frontend-owned end to end, matching the roster it rides beside. One gap this
+does not close: `Shared::set_conductor` in mcp.rs only briefs a pane already
+connected to MCP, and restore runs before any pane has spawned, so the
+restored pane gets no composer briefing and discovers the role only when it
+calls `list_sessions` on connect. That fix belongs in the backend, at connect
+time, not here.
 
 **The shape still to aim for.** Key roster and conductor state by a stable
 project identity instead of one global `localStorage` bucket. Continue
