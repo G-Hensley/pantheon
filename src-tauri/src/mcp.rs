@@ -352,7 +352,9 @@ fn abandon_headless_on_load(tasks: &mut [Task]) -> Vec<Task> {
 /// denial mitigation). A no-op, returning `result` unchanged, when there are
 /// none, which is the common case.
 fn append_denial_note(mut result: String, usage: Option<&Usage>) -> String {
-    let denials = usage.map(|u| u.permission_denials.as_slice()).unwrap_or(&[]);
+    let denials = usage
+        .map(|u| u.permission_denials.as_slice())
+        .unwrap_or(&[]);
     if !denials.is_empty() {
         if !result.is_empty() {
             result.push('\n');
@@ -4763,8 +4765,8 @@ pub fn start(
 mod tests {
     use super::{
         abandon_headless_on_load, append_denial_note, apply_headless_exit, dispatch_mode_precheck,
-        dispatch_prompt_raw, effective_headless_budget, pane_mode, Usage, HEADLESS_BUDGET_CEILING_USD,
-        HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS,
+        dispatch_prompt_raw, effective_headless_budget, pane_mode, Usage,
+        HEADLESS_BUDGET_CEILING_USD, HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS,
     };
     use super::{
         abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
@@ -5201,7 +5203,10 @@ mod tests {
 
     #[test]
     fn append_denial_note_is_a_no_op_without_denials() {
-        assert_eq!(append_denial_note("clean result".into(), None), "clean result");
+        assert_eq!(
+            append_denial_note("clean result".into(), None),
+            "clean result"
+        );
         let usage = Usage::default();
         assert_eq!(
             append_denial_note("clean result".into(), Some(&usage)),
@@ -5245,7 +5250,11 @@ mod tests {
             42,
         );
         assert!(t.result.contains("exited 1: Reached maximum budget"));
-        assert!(t.result.contains("permission denials: 1 (Bash)"), "{}", t.result);
+        assert!(
+            t.result.contains("permission denials: 1 (Bash)"),
+            "{}",
+            t.result
+        );
     }
 
     #[test]
