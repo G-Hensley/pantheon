@@ -5259,11 +5259,12 @@ mod tests {
 
     #[test]
     fn a_completed_headless_run_surfaces_which_tools_were_denied() {
-        let (shared, dir) = shared_for_test();
+        let (shared, _dir) = shared_for_test();
         let task = headless_task();
         shared.tasks.lock().unwrap().push(task.clone());
-        shared.headless_exited_at(
-            dir.path(),
+        // Go through the on-screen path: the raw temp path is not canonical on
+        // Windows, and a mismatch would route the exit to the other-project branch.
+        shared.headless_exited(
             &task,
             Ok(crate::headless::HeadlessOutcome {
                 result: "did the work".into(),
