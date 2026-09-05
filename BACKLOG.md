@@ -290,8 +290,9 @@ reproduction spawns the real agent CLIs with deterministic startup and inspects
 the editor buffer before submission, comparing one write against paced chunks.
 
 **Fixed by bounding the payload, 2026-08-12.** `dispatch` now refuses any
-injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src/mcp.rs`) instead
-of sending it and hoping. The mechanism drops *complete* leading chunks only, so
+injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src-tauri/src/mcp.rs`)
+instead of sending it and hoping. The mechanism drops *complete* leading chunks
+only, so
 an injection under one chunk has no complete leading chunk and cannot lose a
 byte. That is a guarantee rather than a mitigation, and it does not depend on
 ever finding the cause.
@@ -579,19 +580,13 @@ guesses have been wrong in practice: broad web research kept going to OpenCode
 sessions on a free-tier model, which is close to the worst available match for
 it.
 
-**Pantheon does not merely omit the model, it never learns it.** `SESSION_TYPES`
-in `src/lib/ipc.ts` launches each agent CLI bare: `{ id: "opencode", program:
-"opencode", args: [] }`, and the same for `claude` and `codex`. No model flag is
-passed, so the model is whatever that CLI's own config selects, and Pantheon has
-no channel to find out. Any fix here starts by *acquiring* the fact, not by
-plumbing one Pantheon already holds.
-
-Two places currently overstate what is known, which is worth correcting whether
-or not the larger item is built. The `list_sessions` tool description advertises
-"their model/CLI, brain", and the comment at `src-tauri/src/mcp.rs:110` says
-"Just id and model". Both describe the roster's `(opencode)` as a model; it is
-the `SessionType.label` from the launcher. A conductor reading either
-description reasonably believes it has information it does not have.
+**The model is now acquired, but not routed on.** `SESSION_TYPES` in
+`src/lib/ipc.ts:35-41` gives each CLI a `modelFlag` (`--model` for claude, `-m`
+for codex and opencode), `src-tauri/src/lib.rs:995-998` declares the optional
+`model` override and `src-tauri/src/lib.rs:1122-1127` prepends the flag, and
+`note_session` (`src-tauri/src/mcp.rs:788`) stores it so the roster prints it
+as `- {id} ({kind}, {model})` (`src-tauri/src/mcp.rs:915-916`). What is still
+open is the capability profile and the routing decision.
 
 **Confirmed the expensive way, 2026-08-13.** Three tasks were dispatched to
 sess-4 (codex), sess-6 (opencode) and sess-8 (opencode). sess-8 was a local
@@ -648,8 +643,10 @@ This is a privilege escalation and needs treating as such:
 ## Guardrail: OpenCode sessions must stay on free OpenRouter models
 
 OpenRouter is configured with a real account, so an OpenCode pane can select a
-paid model and silently spend money. Nothing in Pantheon currently constrains
-this, and the conductor cannot see what a pane costs.
+paid model and silently spend money. Pantheon now refuses a paid opencode model
+at launch (`is_paid_openrouter_model`, `src-tauri/src/lib.rs:173-184`, enforced
+at 1014-1024), but it still cannot see what a pane costs and the account-side
+budget remains unenforced.
 
 The naive implementation is wrong in a specific way worth writing down:
 

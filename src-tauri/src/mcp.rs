@@ -33,7 +33,7 @@ use tauri::{AppHandle, Emitter};
 /// The real ceiling a conductor feels is lower: the wrapper costs 82 bytes of
 /// header (matching the measured prefix) and 111 of completion contract, so
 /// about **830 bytes of brief** get through. That is tight, and deliberately
-/// so â€” a brief that does not fit is one that should have been split or put in
+/// so: a brief that does not fit is one that should have been split or put in
 /// a file. Once the chunking is found and fixed this constant is the single
 /// place to raise.
 const MAX_INJECTION_BYTES: usize = 1024;
@@ -158,19 +158,19 @@ fn rework_notice(id: &str, reviewer: &str, findings: &str) -> String {
 
 /// What a pane is told, in its own terminal, at the moment it becomes conductor.
 ///
-/// This is *typed into the composer and left there unsent* â€” see `set_conductor`
+/// This is *typed into the composer and left there unsent*: see `set_conductor`
 /// for why. That shapes the text: it has to be short enough to read at a glance
 /// and to type after, because the user is expected to append their actual first
 /// instruction to it and send both together.
 ///
 /// So this carries only what MCP cannot: the role is live *now*, and who is
-/// actually running. The playbook â€” how to write a task, recording decisions
-/// first, subagents versus sessions â€” is already in BRAIN_INSTRUCTIONS, which
+/// actually running. The playbook for writing a task, recording decisions, and
+/// choosing subagents versus sessions is already in BRAIN_INSTRUCTIONS, which
 /// every agent receives on connect. Repeating it here just buried the two facts
 /// that were new.
 fn conductor_briefing(peers: &[String]) -> String {
     // Single line: a newline lands in most composers as a submit, which would
-    // fire this off half-written â€” exactly what we are avoiding.
+    // fire this off half-written: exactly what we are avoiding.
     let roster = if peers.is_empty() {
         "No other sessions are open yet (Ctrl+K opens one).".to_string()
     } else {
@@ -255,7 +255,7 @@ pub struct Task {
     #[serde(default)]
     pub findings: String,
     /// When this task reached a terminal state, if it has. Distinct from
-    /// `ts_ms`, which is stamped once at dispatch and never moves â€” reading
+    /// `ts_ms`, which is stamped once at dispatch and never moves: reading
     /// that as a completion time says a task "finished" the moment it was
     /// handed out.
     ///
@@ -319,7 +319,7 @@ pub struct Exchange {
     pub asked_ms: u64,
 }
 
-/// Terminal states â€” the ones that stamp `done_ms` and never accept a result
+/// Terminal states: the ones that stamp `done_ms` and never accept a result
 /// afterwards. `in_review` and `rework` are deliberately absent: the work
 /// exists but has not been signed off, which is the whole point of them.
 ///
@@ -451,7 +451,7 @@ const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 /// Measured 2026-09-03: a Claude Code pane's MCP transport kills the call
 /// somewhere between 45 and 110 seconds ("The operation timed out"), while a
 /// 45 second call reliably returns. The previous ten-minute default never
-/// fired on that host at all â€” the transport gave up first, so the caller got
+/// fired on that host at all: the transport gave up first, so the caller got
 /// a transport error rather than the honest "still running" this tool exists
 /// to report, and had no way to tell the two apart. 45 sits inside the
 /// measured working range rather than at its edge, and the tool description
@@ -469,7 +469,7 @@ const WAIT_DEFAULT_SECS: u64 = 45;
 /// Capped at 55, not 1800: the same transport measurement that set
 /// `WAIT_DEFAULT_SECS` puts failure somewhere between 45 and 110 seconds, so a
 /// cap anywhere near the old 30 minutes was never reachable from a Claude Code
-/// pane â€” the call would die en route and look like a hang rather than the
+/// pane: the call would die en route and look like a hang rather than the
 /// timeout report this tool is supposed to hand back.
 const WAIT_MAX_SECS: u64 = 55;
 
@@ -511,7 +511,7 @@ pub struct DispatchOutcome {
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
-/// order they're applied â€” that order is what decides which message wins when
+/// order they're applied: that order is what decides which message wins when
 /// more than one would refuse. Kept pure (no lock, no I/O) so it's testable
 /// without a live `Shared`, which needs a real `AppHandle` to construct.
 ///
@@ -551,7 +551,7 @@ fn dispatch_precheck(
 /// A seam, for one reason: `Shared` used to hold an `AppHandle` directly, and
 /// an `AppHandle` cannot be built outside a running app. That made every policy
 /// living on a `Shared` method unreachable from a test, so it could only be
-/// verified by reading the code â€” which is exactly how the dispatch gate's
+/// verified by reading the code, which is exactly how the dispatch gate's
 /// ordering went untested until a reviewer asked.
 ///
 /// `tauri::test::mock_app()` is the other way to solve this, but its handle is
@@ -562,7 +562,7 @@ fn dispatch_precheck(
 /// point. Holding an `AppHandle` anywhere in `Shared`'s type graph makes the
 /// compiler instantiate `AppHandle<Wry>`'s drop glue for any test that builds a
 /// `Shared`, which drags Wry's runtime into the test binary and fails it at
-/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND` â€” before a single test runs,
+/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND`: before a single test runs,
 /// with no hint as to the cause. Erasing the handle behind `dyn Fn` keeps it
 /// out of `Shared` entirely.
 /// Named so the `Notifier` field stays readable; clippy flags the raw form as
@@ -591,7 +591,7 @@ impl Notifier {
     }
 }
 
-/// The shared store â€” one instance, cloned by Arc into every agent's handler.
+/// The shared store: one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
     app: Notifier,
     /// Where entries are mirrored as markdown. Follows the picked project, so it
@@ -601,7 +601,8 @@ pub struct Shared {
     sessions: Mutex<Vec<AgentSession>>,
     /// agent name -> brain (room). The app owns this; drag reassigns it live.
     name_to_room: Mutex<HashMap<String, String>>,
-    /// The live session engine â€” lets dispatch type into a target's terminal.
+    /// The live session engine, which lets dispatch type into a target's
+    /// terminal.
     engine: Arc<crate::SessionManager>,
     /// Which agent (if any) is the conductor. Set by the app, never self-claimed.
     conductor: Mutex<Option<String>>,
@@ -931,8 +932,8 @@ impl Shared {
     ///
     /// The briefing is typed into the composer but deliberately NOT submitted.
     /// Auto-sending it made promotion silently spend a turn on a prompt the user
-    /// never wrote, and left them no way to say what they actually wanted done â€”
-    /// the pane just started talking. Leaving it unsent turns a hijacked turn
+    /// never wrote, and left them no way to say what they actually wanted done.
+    /// The pane just started talking. Leaving it unsent turns a hijacked turn
     /// into a prefilled one: the user appends their real first instruction and
     /// sends both together, so the agent learns its role and its task at once.
     /// Dispatch still submits, because there no human is at the keyboard.
@@ -1357,11 +1358,11 @@ impl Shared {
 
     /// Validate and hand a task to a live session: the shared core of the
     /// agent-facing `dispatch` MCP tool and the human-facing `human_dispatch`
-    /// Tauri command (lib.rs) â€” one ledger and one set of rules regardless of
+    /// Tauri command (lib.rs): one ledger and one set of rules regardless of
     /// who started the task. Conductor-only enforcement is deliberately NOT
     /// here: that's an MCP-specific policy the `dispatch` tool applies before
     /// calling this, and `human_dispatch` has no agent identity to check it
-    /// against â€” the human already decided who to promote.
+    /// to check it against: the human already decided who to promote.
     ///
     /// The task record is created in "pending" (or, when the target is
     /// occupied, "queued") status BEFORE `submit_to` is called. That closes
@@ -2095,7 +2096,7 @@ fn age(t: &mut Task, now: u64) {
 ///
 /// `in_review` is a second fix for a related bug: this used to check the
 /// *target*'s liveness for every open status, including `in_review`, even
-/// though the target has already submitted and is no longer the actor â€” the
+/// though the target has already submitted and is no longer the actor: the
 /// reviewer is. That meant a target closing its pane after a clean submission
 /// could erase a result the reviewer had not even looked at yet, while a task
 /// stuck on a reviewer that no longer existed (the actual failure, see
@@ -2967,8 +2968,8 @@ pub struct BrainHandler {
     shared: Arc<Shared>,
     identity: Arc<Mutex<Option<AgentSession>>>,
     /// Set when this handler serves ONE specific session on its own endpoint.
-    /// Identity then comes from the connection â€” it can't be forgotten or spoofed,
-    /// so the agent never has to declare a name.
+    /// Identity then comes from the connection: it can't be forgotten or
+    /// spoofed, so the agent never has to declare a name.
     bound: Option<String>,
     // Used by the #[tool_handler]-generated code, which dead-code analysis can't see.
     #[allow(dead_code)]
@@ -2985,7 +2986,7 @@ impl BrainHandler {
         }
     }
 
-    /// A handler dedicated to one session â€” used by that session's own endpoint.
+    /// A handler dedicated to one session, used by that session's own endpoint.
     pub fn bound_to(shared: Arc<Shared>, session: String) -> Self {
         Self {
             shared,
@@ -3009,7 +3010,7 @@ impl BrainHandler {
 
     /// The gate `dispatch`, `cancel_task`, and `reassign_task` all share:
     /// conductor-only, checked here rather than on `Shared`, because it is
-    /// MCP-specific policy â€” `human_dispatch` (lib.rs) has no agent identity
+    /// MCP-specific policy: `human_dispatch` (lib.rs) has no agent identity
     /// to check it against, since the human already decided who to promote.
     fn require_conductor(&self) -> Result<(), String> {
         let me = self.author();
@@ -3065,7 +3066,7 @@ pub struct SearchArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DispatchArgs {
-    /// The session to hand the task to â€” use an id from list_sessions.
+    /// The session to hand the task to: use an id from list_sessions.
     pub target: String,
     /// The task, written the way you'd say it to a teammate.
     pub task: String,
@@ -3183,7 +3184,7 @@ impl BrainHandler {
                     return format!("Refused: {e}.");
                 }
             }
-            return format!("Already identified as '{b}' â€” Pantheon knows this session.");
+            return format!("Already identified as '{b}': Pantheon knows this session.");
         }
         // Preserve the model the session was launched with: an agent that
         // re-identifies must not lose the model that was set at spawn, because
@@ -3237,7 +3238,7 @@ impl BrainHandler {
         let body = if p.rationale.is_empty() {
             p.decision
         } else {
-            format!("{} â€” {}", p.decision, p.rationale)
+            format!("{}: {}", p.decision, p.rationale)
         };
         self.shared.add("decision", &self.author(), &p.topic, &body);
         "Decision recorded to the shared brain.".to_string()
@@ -3269,7 +3270,7 @@ impl BrainHandler {
         if mine.is_empty() {
             return format!("No shared context yet in brain '{room}'.");
         }
-        let mut out = format!("# Shared context â€” brain '{room}' (most recent first)\n");
+        let mut out = format!("# Shared context: brain '{room}' (most recent first)\n");
         for e in mine.iter().rev().take(50) {
             out.push_str(&format!(
                 "- [{}] ({}) {}: {}\n",
@@ -3325,7 +3326,7 @@ impl BrainHandler {
             ));
         } else {
             out.push_str(
-                "\nYou are not the conductor, so dispatch will refuse â€” that is expected. \
+                "\nYou are not the conductor, so dispatch will refuse: that is expected. \
                  You can still reach these agents through record_decision, record_fact and broadcast.\n",
             );
         }
@@ -3339,7 +3340,7 @@ impl BrainHandler {
         let me = self.author();
 
         // Conductor-only is MCP-specific policy, so it's checked here rather
-        // than in `dispatch_task` â€” see that method's doc comment.
+        // than in `dispatch_task`: see that method's doc comment.
         if self.shared.is_halted() {
             return "Refused: dispatch is halted by the user (Stop). Do not retry.".to_string();
         }
@@ -3470,7 +3471,7 @@ impl BrainHandler {
                 "Result recorded and sent to {} for review. It is NOT done yet: if they send                  it back the status becomes 'rework' and you should fix what they raise and                  call complete_task again.",
                 t.reviewer
             ),
-            Ok(_) => "Result recorded â€” the conductor can now read it.".to_string(),
+            Ok(_) => "Result recorded: the conductor can now read it.".to_string(),
             Err(TaskAccessError::Forbidden) => {
                 "Refused: this task is assigned to a different session.".to_string()
             }
@@ -3860,13 +3861,13 @@ impl BrainHandler {
 /// told to consult shared context simply won't, and the brain stays empty while
 /// two agents build incompatible halves of the same thing. MCP carries these
 /// instructions on the connection itself, which is why this lives here rather
-/// than in each project's AGENTS.md â€” it reaches every session automatically,
+/// than in each project's AGENTS.md: it reaches every session automatically,
 /// in whichever repo it was launched against.
 ///
 /// The workspace section exists for a second, distinct failure: an agent that
 /// treats Pantheon as a nicer terminal and never notices the other panes are
 /// usable capacity. Because MCP delivers this text once, at connect time, it can
-/// only describe the role an agent *might* be given â€” the conductor briefing
+/// only describe the role an agent *might* be given: the conductor briefing
 /// injected by `set_conductor` is what covers the role it actually has.
 const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Pantheon, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
 
@@ -3874,12 +3875,12 @@ Pantheon already knows who you are from this connection. You do not need to call
 
 ## The workspace
 
-The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
+The other panes are not logs or history. They are live AI coding agents, often different models with their own separate context windows, sitting idle until given work. Call list_sessions to see who is here.
 
 Pantheon gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
 
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
-- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
+- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices, such as different files or subsystems, separate research questions, or a second opinion from a different model, are what the other sessions are for.
 - dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
 - wait_for_tasks blocks until the ids you name are finished, so you do not have to guess an interval and poll. Dispatch the whole fan-out, then wait on it once. "I will report when it lands" is only true if you actually wait; otherwise nothing brings you back. A single call returns within about 45-55 seconds either way, finished or not: that is one call in a short series, not the whole wait, so a timeout just means call it again with the same ids.
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
@@ -3888,22 +3889,22 @@ If you ARE the conductor, the rest of the workspace is yours to direct, and usin
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Pantheon session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
 
-If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[pantheon] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+If you are NOT the conductor, dispatch will refuse: that is expected, not an error to work around. When a line starting with "[pantheon] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
 
 If that brief turns out to be ambiguous, call ask_conductor with your task_id and the specific question rather than guessing or asking the human in your terminal. The conductor wrote the brief and holds the reasoning it compressed away, so it is usually the better answerer as well as the right one; the human often lacks the context and did not ask to be the routing point for five panes. Your task shows as blocked while you wait, and you get the answer back in the same call. If nobody answers in time you are told to use your own judgement, and then you should say in your result what you assumed.
 
 ## Shared context
 
-- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
+- BEFORE making a decision that affects shared work, such as architecture, dependencies, data models, API shapes, file layout, or naming conventions, call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
 - Use search_context to check one specific topic before you spend effort researching it.
-- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here: it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
 - Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
 - Use broadcast for blockers, or anything the others need to know immediately."#;
 
 #[tool_handler]
 impl ServerHandler for BrainHandler {
     // Supplying get_info suppresses the macro's generated one, so both the tools
-    // capability and our own name/version have to be restated here â€” otherwise
+    // capability and our own name/version have to be restated here: otherwise
     // no tools are advertised, and the server introduces itself to agents as
     // "rmcp" (the default is resolved inside that crate, not ours).
     fn get_info(&self) -> ServerInfo {
@@ -3917,7 +3918,7 @@ impl ServerHandler for BrainHandler {
 /// and the shared store (also used by the frontend `get_context` command).
 /// Bind a loopback endpoint dedicated to ONE session. Because only that session
 /// is registered against this port, every request on it is provably from that
-/// session â€” identity without a handshake.
+/// session: identity without a handshake.
 /// The caller owns the returned handle: dropping it does NOT stop the server, so
 /// it must be aborted explicitly when the session ends, or the listener outlives
 /// the session it was bound to.
@@ -4481,7 +4482,7 @@ mod tests {
     // Both terminal injections share the same hard constraint: an embedded
     // newline submits the message to the target CLI in fragments, so the agent
     // acts on half a briefing. It matters more for the briefing than for a
-    // dispatch, because the briefing is left unsent on purpose â€” a stray newline
+    // dispatch, because the briefing is left unsent on purpose: a stray newline
     // would fire it off before the user has added anything.
     #[test]
     fn conductor_briefing_is_single_line_and_names_the_peers() {

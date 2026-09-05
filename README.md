@@ -190,7 +190,9 @@ happens; it is the only channel that reaches an already-running agent.
 
 Dispatch returns a `task_id` immediately rather than blocking, so a conductor
 is meant to fan several tasks out and then collect them; `get_task_result`
-with no `task_id` returns every task that conductor dispatched in one call.
+with no `task_id` returns every open task plus the most recent finished ones
+(`RECENT_FINISHED` in `src-tauri/src/mcp.rs`), with the whole history behind
+an `include_all` flag.
 
 `wait_for_tasks` is the other half. It blocks until the ids it is given reach a
 terminal state, then returns the same results, so a conductor with nothing else
