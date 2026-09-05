@@ -147,6 +147,17 @@ Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
 only), `cancel_task` (conductor only), `reassign_task` (conductor only),
 `complete_task`, `review_task`, `get_task_result`, `wait_for_tasks`,
 `ask_conductor`, `answer_question` (conductor only), `set_session_identity`.
+
+`dispatch` accepts `headless: true` for a Claude pane with a dedicated endpoint.
+It runs a separate print-mode child with the pane's cwd, model, and MCP identity,
+accepts multiline briefs without the pane byte limit, and waits for 30 seconds
+of pane quiet before starting. Occupied panes use the same three-task queue.
+The child has a $1 budget and a 40 minute wall-clock cap. Its exit completes the
+task through normal review, or records an error with CLI details; `complete_task`
+is optional. Tasks expose mode, CLI session UUID, exit code, and usage through
+MCP; the drawer shows mode and exit code. Cancel, Stop, and pane close kill the
+child, and open headless tasks are abandoned after app restart.
+
 `cancel_task` closes any open task with a reason, several at once if you name
 them together, queued tasks included: nothing is journaled for a queued task
 that never got dispatched, the same as any other refusal. `reassign_task`
@@ -275,10 +286,16 @@ exchange is kept on the task, so an answer given once is not asked again.
 
 ## Known gaps and limitations
 
+- **Headless rework stays in the pane.** Review rejection sends the existing
+  pane notice; this increment does not implement CLI `--resume`. Headless
+  dispatch supports Claude only, has no live transcript stream, and requires
+  cancel plus a fresh dispatch to retarget. The quiet window is a delay, not a
+  worktree lock: a pane thinking silently can still be active.
+
 - **Isolated work has no merge path.** A session's branch (`pantheon/<id>-<uid>`)
   survives when it has commits, but the UI never shows the branch name or a
   diff.
-- **A finished agent can leave its task open.** Completion is an explicit
+- **A finished pane agent can leave its task open.** Pane-mode completion is an explicit
   `complete_task` call, so a session that does the work and never makes that
   call is indistinguishable, to the conductor, from one still thinking. A pane
   whose *process* has exited is now handled: its open tasks reach a terminal
