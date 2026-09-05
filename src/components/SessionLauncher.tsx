@@ -43,7 +43,21 @@ export function SessionLauncher({
     return initial;
   });
 
+  // Which CLI was picked without the model it requires, so the row can say so
+  // instead of spawning a pane that fails on the backend's guard.
+  const [modelMissing, setModelMissing] = useState<string | null>(null);
+
   const effectiveIsolate = isolate && isRepo !== false;
+
+  function pick(t: SessionType) {
+    const model = models.get(t.id)?.trim() || undefined;
+    if (t.modelRequired && !model) {
+      setModelMissing(t.id);
+      return;
+    }
+    setModelMissing(null);
+    onPick(t, effectiveIsolate, model);
+  }
 
   async function runGitInit() {
     if (!project || initializing) return;
@@ -72,13 +86,13 @@ export function SessionLauncher({
       if (e.key === "Escape") onClose();
       const n = Number(e.key);
       if (n >= 1 && n <= SESSION_TYPES.length) {
-        const selected = SESSION_TYPES[n - 1];
-        const model = models.get(selected.id) || undefined;
-        onPick(selected, effectiveIsolate, model);
+        pick(SESSION_TYPES[n - 1]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // pick closes over onPick, effectiveIsolate and models.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onPick, onClose, effectiveIsolate, models]);
 
   // Sync model changes to localStorage when models change
@@ -99,7 +113,7 @@ export function SessionLauncher({
             <button
               key={t.id}
               className="launcher-item"
-              onClick={() => onPick(t, effectiveIsolate, models.get(t.id))}
+              onClick={() => pick(t)}
             >
               <span className="dot" style={{ background: t.color }} />
               <span className="ll-label">{t.label}</span>
@@ -116,8 +130,15 @@ export function SessionLauncher({
                         setModels(newModels);
                       }}
                       className="ll-model-input"
+                      placeholder={t.modelRequired ? "model required" : undefined}
                     />
                     {models.get(t.id) || ""}
+                    {modelMissing === t.id && (
+                      <span className="launcher-repo-error" role="alert">
+                        {t.label} needs a model: a free OpenRouter id such as
+                        openrouter/free, or a local provider's model.
+                      </span>
+                    )}
                   </span>
                 )}
               </span>

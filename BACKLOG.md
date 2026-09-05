@@ -380,15 +380,15 @@ routing, and it is what `#24` should replace.
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
 **Shipped, task dq3s0j.** `wait_for_tasks` blocks until the named ids reach a
-terminal status or the timeout fires (600 s default, 1800 s ceiling), returns
+terminal status or the timeout fires (45 s default, 55 s ceiling), returns
 the same rendering `get_task_result` would, words a timeout distinctly from
 completion, cancels nothing, and returns early when a task becomes `blocked`.
 Evidence: `wait_for_tasks` in `src-tauri/src/mcp.rs` with its tests, and the
 tool list under "How agents connect" in `README.md`. One caveat, measured
 2026-09-03: from a Claude Code pane a wait of 110 s or more fails at the MCP
-transport with "The operation timed out" while 45 s returns, so the 600 s
-default is not usable from that host; tracked in the repair plan at
-`~/Projects/docs/plans/2026-09-03-pantheon-repair.md`.
+transport with "The operation timed out" while 45 s returns, so the shipped
+default of 45 s and cap of 55 s are deliberate (`WAIT_DEFAULT_SECS` and
+`WAIT_MAX_SECS` in mcp.rs), not the 600 s default discussed below.
 
 `get_task_result` is a poll. There is no call that blocks until a task
 finishes, and no notification when one does. So a conductor that dispatches
@@ -484,19 +484,25 @@ Interacts with the `wait_for_tasks` entry above: both are about a conductor and
 a pane needing to communicate between dispatch and completion, and they should
 share one mechanism rather than grow two.
 
-## Nothing enforces cross-model review, so "done" means self-certified
+## Nothing enforced cross-model review, so "done" meant self-certified
 
-**Shipped, task d575h4, in PR #16 (`3efebac`).** A task now carries a
+**Shipped, task d575h4, in PR #16 (`3efebac`); the cross-model rule and the
+delivery gap this section named both shipped later in Phase 2 of
+`docs/plans/2026-09-03-pantheon-repair.md`.** A task now carries a
 `reviewer`, `complete_task` moves it to `in_review` rather than `done`, and only
 `review_task` from that reviewer closes it or sends it back as `rework`.
 `dispatch` picks a reviewer unless one is named or review is explicitly waived,
-and `get_task_result` says which. What shipped is the lifecycle, not the
-cross-model rule in this heading: `choose_reviewer` requires only a different
-live session id, never compares CLI or model, and may pick the conductor. A
-reviewer of a different kind is still the conductor's job to name. Evidence:
-`review_task` in
-`src-tauri/src/mcp.rs`, and the `get_task_result` tool description there, which
-spells out what `in_review` and `rework` mean to a conductor.
+and `get_task_result` says which. `choose_reviewer` now prefers a live session
+running a different CLI kind than the target before falling back to any other
+live session, closing the cross-model gap this heading named; a reviewer of
+the same kind is still possible only when no other kind is live. Both halves
+of the review result are also delivered rather than left for the conductor to
+relay: `complete_task` types a review request straight into the reviewer's
+pane, and a rejected `review_task` types a rework notice into the target's,
+each readable in full through `get_task_result`, which the task's target and
+reviewer may now call by id and not only its dispatcher. Evidence:
+`choose_reviewer`, `review_request_notice`, `rework_notice`, and
+`task_for_reader` in `src-tauri/src/mcp.rs`, and their tests.
 
 The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
 you commit") lays out six steps: implement, route to a **different-model**
@@ -544,6 +550,26 @@ board to be useful.
 Related: `IMPROVEMENT-AUDIT.md`'s task-board sketch (explicitly marked "the
 design is still open") is the only other place this appears, and it is a
 drawing rather than a plan.
+
+## Dispatch to a busy pane typed the new brief over the running one
+
+**Shipped, Phase 2 of `docs/plans/2026-09-03-pantheon-repair.md`.** Measured
+2026-09-03: `dispatch_precheck` checked halted, self-dispatch, target
+liveness, and injection size, never whether the target already had open work,
+so a second brief landed in the pane mid-task and both instructions ended up
+in whatever the running agent was reading. A dispatch to an occupied pane
+(target of a pending, overdue, rework, or blocked task, or reviewer of an
+in_review one) now creates the task with status `queued` instead of typing it,
+naming which task it is queued behind and at what position; each pane holds
+at most `QUEUE_CAP` (3) queued briefs, a fourth refused with the reason and
+the queued ids, nothing journaled for the refusal. Whenever a pane stops being
+occupied, whatever is next for it (an undelivered review request or rework
+notice first, then the oldest queued brief, FIFO) is delivered through the
+same path automatically, gated against halted and against typing into a pane
+that is still occupied. `cancel_task` and `reassign_task` both work on a
+queued task. Evidence: `queue_predecessor`, `queue_cap_refusal`,
+`next_delivery_for`, `occupying_task`, and `Shared::drain_pane` in
+`src-tauri/src/mcp.rs`, and their tests.
 
 ## Model-aware dispatch
 
@@ -672,6 +698,17 @@ Care is needed with the sibling routers. `openrouter/free` prices prompt and
 completion at 0, but `openrouter/auto`, `openrouter/fusion`, and
 `openrouter/pareto-code` all report `-1`, meaning variable and billable. Pinning
 the wrong router looks equally tidy and spends money.
+
+**Launch-time enforcement, 2026-09-04.** Pantheon now refuses to start an
+opencode pane without an explicit model, and refuses any `openrouter/*` id that
+is not `openrouter/free`, `openrouter/openrouter/free`, or a `:free` id, compared
+case-insensitively (`opencode_model_guard` in `src-tauri/src/lib.rs`, with the
+launcher marking the field required). The missing-model refusal is the point:
+without `-m`, opencode falls back to its config's `model` and then to whatever
+model it used last, and Pantheon can see neither. The 2026-08-11 config pin is
+no longer in force on the development machine (the global config carries no
+top-level `model` as of this date), which is exactly the case the launch guard
+covers.
 
 Still outstanding, and still the only real guarantee: the account-side state
 (zero balance, auto top-up off, payment method removed, no BYOK keys). Config
