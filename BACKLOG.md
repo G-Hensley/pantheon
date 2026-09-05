@@ -833,22 +833,28 @@ tracked or untracked files. The current implementation chose frontend
 ownership, so the next step is to make that choice project-aware rather than
 reviving `layout.json`.
 
-Conductor identity is the remaining obvious hole. The frontend initializes it
-to `null` at `src/App.tsx:97-100`. The Tauri command at
-`src-tauri/src/lib.rs:1166-1171` only forwards the new value, and
-`src-tauri/src/mcp.rs:551-576` keeps it in memory. Reopened panes retain their
-ids and brains, but the user must promote the conductor again. Persisting the id
-is truthful because it restores a role assignment, not agent state. If that
-pane fails to restore, Pantheon must clear the saved conductor and say why rather
-than transferring authority to another pane.
+Conductor identity restore is now implemented. `src/lib/panes.ts` persists the
+conductor pane id beside the roster, under its own storage key, and only while
+that id names a pane still in the roster; a promote, a demote, or the
+conductor's own pane closing all pass through this on every change. On launch,
+`src/App.tsx` restores the role only to that exact pane once the roster has
+been built: `restoreConductor` calls `setConductor` for the saved id when it
+is part of the roster, or clears the saved id and adds a notice to the
+existing restore-problems banner when it is not, without ever promoting a
+different pane instead. A pane that is part of the roster but fails to spawn
+is caught separately, once that failure is known: `noteSpawnFailure` retracts
+the role the same way, clear rather than reassigned. The Tauri command at
+`src-tauri/src/lib.rs` still only forwards the value, and `src-tauri/src/mcp.rs`
+still keeps it in memory; nothing on the backend persists, so this restore is
+frontend-owned end to end, matching the roster it rides beside.
 
-**The shape to aim for.** Keep the existing frontend-owned restore path, key
-roster and conductor state by a stable project identity, and restore the
-conductor only after its pane has spawned successfully. Continue treating each
-pane as a new process, preserve saved worktree references, and make partial
-restore failures visible without discarding the panes that remain valid. Layout
-settings may stay machine-local; the question is which settings are genuinely
-project-specific, not whether every setting can be put into one file.
+**The shape still to aim for.** Key roster and conductor state by a stable
+project identity instead of one global `localStorage` bucket. Continue
+treating each pane as a new process, preserve saved worktree references, and
+make partial restore failures visible without discarding the panes that
+remain valid. Layout settings may stay machine-local; the question is which
+settings are genuinely project-specific, not whether every setting can be put
+into one file.
 
 Open questions worth settling before building:
 
@@ -861,9 +867,6 @@ Open questions worth settling before building:
 - **Restore timing.** Automatic reopening is fast and is today's behavior. An
   explicit prompt gives the user a way to start fresh when a saved roster is
   large or stale.
-- **Conductor failure.** The role must be restored only to the recorded pane.
-  A missing or failed pane clears it; Pantheon must never silently promote a
-  substitute.
 - **What layout belongs to the project.** Pane membership and worktrees clearly
   do. Window height and column preference may be user and machine preferences
   rather than repository state.

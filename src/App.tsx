@@ -26,7 +26,14 @@ import {
   type SessionType,
   type SessionWorktreeEvent,
 } from "./lib/ipc";
-import { loadRoster, saveRoster, seedCounter } from "./lib/panes";
+import {
+  loadConductorId,
+  loadRoster,
+  restoreConductor,
+  saveConductorId,
+  saveRoster,
+  seedCounter,
+} from "./lib/panes";
 import { brainColorMap } from "./lib/brains";
 import { readStored, writeStored } from "./lib/storage";
 import "./App.css";
@@ -58,6 +65,10 @@ function App() {
   // so one bad pane is a message rather than a silently missing agent.
   const [restoreProblems, setRestoreProblems] = useState<string[]>(() => roster.problems);
   const restoredIds = useRef(new Set(roster.panes.map((p) => p.id)));
+  // The conductor pane recorded before this app was last closed, if any. Read
+  // once alongside the roster: restoring the role only makes sense against
+  // the exact set of panes that roster is about to spawn.
+  const savedConductorId = useRef(loadConductorId()).current;
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [layoutOpen, setLayoutOpen] = useState(false);
@@ -131,6 +142,23 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Restore the conductor role, but only to the exact pane that held it. If
+  // that pane is not part of the roster at all (closed before this launch, or
+  // dropped because its session type no longer exists), the saved id is
+  // stale: clear it and say so in the same banner restore problems already
+  // use, rather than leaving a promotion pointing at nothing or picking a
+  // different pane. A pane that *is* part of the roster but then fails to
+  // spawn is caught separately, in `noteSpawnFailure` below, once that
+  // failure is actually known.
+  useEffect(() => {
+    restoreConductor(savedConductorId, roster.panes.map((p) => p.id)).then((notice) => {
+      if (notice) setRestoreProblems((problems) => [...problems, notice]);
+    });
+    // Runs once, against the roster and saved conductor captured before the
+    // first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Remember the roster on every change, so a restart brings back whatever was
   // open at the moment it happened. Status is deliberately not stored: a
   // restored pane is a new process, so its state is whatever the new spawn
@@ -147,6 +175,17 @@ function App() {
       })),
     );
   }, [panes]);
+
+  // Persist the conductor id alongside the roster, so a relaunch can restore
+  // the role. Keyed on both conductor and panes: a promote or demote changes
+  // the id itself, and a pane closing can take the conductor's own pane with
+  // it, in which case it must not be left pointing at a pane that is gone.
+  useEffect(() => {
+    saveConductorId(
+      conductor,
+      panes.map((p) => p.id),
+    );
+  }, [conductor, panes]);
 
   // The backend reports which worktree an isolated session actually got, once it
   // is live. Recording it is what lets the next launch return the pane to that
@@ -165,12 +204,25 @@ function App() {
   // A pane that never started. Only reported for restored panes: a session the
   // user just launched by hand has their attention already, and the failure is
   // printed in its terminal either way.
+  //
+  // If the pane that failed is the one the launch tried to restore as
+  // conductor, the role is retracted here rather than left standing: the
+  // roster-time restore above could not have known the spawn would fail, and
+  // this is the only place that finds out. It is never handed to a different
+  // pane, only cleared.
   function noteSpawnFailure(id: string, message: string) {
     if (!restoredIds.current.has(id)) return;
+    const isConductorPane = savedConductorId === id;
     setRestoreProblems((problems) => {
-      const note = `Could not restore ${id}: ${message}`;
+      const note = isConductorPane
+        ? `Could not restore ${id}: ${message} The conductor role was not restored either.`
+        : `Could not restore ${id}: ${message}`;
       return problems.includes(note) ? problems : [...problems, note];
     });
+    if (isConductorPane) {
+      setConductorName(null);
+      setConductor(null).catch(() => {});
+    }
   }
 
   useEffect(() => {
