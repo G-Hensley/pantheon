@@ -485,7 +485,7 @@ Interacts with the `wait_for_tasks` entry above: both are about a conductor and
 a pane needing to communicate between dispatch and completion, and they should
 share one mechanism rather than grow two.
 
-## Nothing enforces cross-model review, so "done" means self-certified
+## Nothing enforced cross-model review, so "done" meant self-certified
 
 **Shipped, task d575h4, in PR #16 (`3efebac`); the cross-model rule and the
 delivery gap this section named both shipped later in Phase 2 of
@@ -695,6 +695,17 @@ Care is needed with the sibling routers. `openrouter/free` prices prompt and
 completion at 0, but `openrouter/auto`, `openrouter/fusion`, and
 `openrouter/pareto-code` all report `-1`, meaning variable and billable. Pinning
 the wrong router looks equally tidy and spends money.
+
+**Launch-time enforcement, 2026-09-04.** Pantheon now refuses to start an
+opencode pane without an explicit model, and refuses any `openrouter/*` id that
+is not `openrouter/free`, `openrouter/openrouter/free`, or a `:free` id, compared
+case-insensitively (`opencode_model_guard` in `src-tauri/src/lib.rs`, with the
+launcher marking the field required). The missing-model refusal is the point:
+without `-m`, opencode falls back to its config's `model` and then to whatever
+model it used last, and Pantheon can see neither. The 2026-08-11 config pin is
+no longer in force on the development machine (the global config carries no
+top-level `model` as of this date), which is exactly the case the launch guard
+covers.
 
 Still outstanding, and still the only real guarantee: the account-side state
 (zero balance, auto top-up off, payment method removed, no BYOK keys). Config

@@ -170,6 +170,15 @@ fn is_codex(program: &str) -> bool {
     p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
 }
 
+/// Whether `program` is the opencode CLI, normalised the same way as
+/// `is_codex`: case-folded and stripped of a Windows `.exe` or `.cmd` suffix.
+/// The free-model guard keys on this, so a differently spelled program name
+/// must not slip past it.
+fn is_opencode(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    p.trim_end_matches(".exe").trim_end_matches(".cmd") == "opencode"
+}
+
 /// Whether a model id is a paid OpenRouter model that must be refused for opencode.
 ///
 /// OpenRouter free-tier models have ids ending in `:free`, or exactly
@@ -181,7 +190,10 @@ fn is_codex(program: &str) -> bool {
 /// paste or a quoted shell argument leaves behind — cannot silently downgrade a
 /// paid id to a free one. Empty model is allowed (the CLI picks its own default).
 fn is_paid_openrouter_model(model: &str) -> bool {
-    let trimmed = model.trim();
+    // Case-folded so a re-cased id ("OpenRouter/...") cannot slip past the
+    // prefix check; OpenRouter resolves ids case-insensitively.
+    let trimmed = model.trim().to_ascii_lowercase();
+    let trimmed = trimmed.as_str();
     if trimmed.is_empty() {
         return false;
     }
@@ -201,6 +213,34 @@ fn is_paid_openrouter_model(model: &str) -> bool {
         return false;
     }
     true
+}
+
+/// The free-model guard for an opencode launch. Returns the refusal message
+/// when the launch must not proceed.
+///
+/// A missing model is refused, not waved through: without `-m`, opencode falls
+/// back to its config's `model`, then to whatever model it used last, and this
+/// guard cannot see either. Requiring an explicit id is what makes the paid
+/// check cover every launch path rather than only the typed one.
+fn opencode_model_guard(model: Option<&str>) -> Result<(), String> {
+    let model = model.map(str::trim).unwrap_or("");
+    if model.is_empty() {
+        return Err(
+            "Refused: opencode needs an explicit model. Without one it falls back to its \
+             config or its last-used model, which the free-model guard cannot check. Enter a \
+             free OpenRouter id (openrouter/free, or one ending in ':free') or a local \
+             provider's model in the launcher."
+                .to_string(),
+        );
+    }
+    if is_paid_openrouter_model(model) {
+        return Err(format!(
+            "Refused: model '{model}' is a paid OpenRouter model. opencode will only launch \
+             with openrouter/* models that end in ':free' or equal 'openrouter/free' (or \
+             'openrouter/openrouter/free')."
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the Enter that submits a prompt can be sent yet.
@@ -1011,16 +1051,12 @@ async fn spawn_session(
         )));
     }
 
-    // Free-model guard for opencode: only allow openrouter/* models that are
-    // free-tier. Local providers (ollama, lmstudio, etc.) are allowed.
-    if program == "opencode" {
-        if let Some(ref m) = model {
-            if is_paid_openrouter_model(m) {
-                return Err(SpawnError::failed(format!(
-                    "Refused: model '{}' is a paid OpenRouter model. opencode will only launch with openrouter/* models that end in ':free' or equal 'openrouter/free' (or 'openrouter/openrouter/free').",
-                    m
-                )));
-            }
+    // Free-model guard for opencode: an explicit model is required, and only
+    // free-tier openrouter/* ids or local providers (ollama, lmstudio, etc.)
+    // pass. See `opencode_model_guard` for why a missing model is refused.
+    if is_opencode(&program) {
+        if let Err(reason) = opencode_model_guard(model.as_deref()) {
+            return Err(SpawnError::failed(reason));
         }
     }
 
@@ -1464,11 +1500,11 @@ pub fn run() {
 mod tests {
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
-        delivery_allowance_ms, is_agent_cli, is_codex, is_paid_openrouter_model,
-        migrate_legacy_dir, ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
-        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
-        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
-        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
+        migrate_legacy_dir, opencode_model_guard, ready_to_submit, resolve_isolation,
+        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, IsolationReason,
+        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
+        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
 
@@ -2081,6 +2117,19 @@ mod tests {
     }
 
     #[test]
+    fn is_opencode_normalizes_case_and_windows_suffixes() {
+        // The free-model guard keys on this, so every spelling a PATH lookup or
+        // a custom command could produce has to be recognised.
+        assert!(is_opencode("opencode"));
+        assert!(is_opencode("OpenCode"));
+        assert!(is_opencode("opencode.cmd"));
+        assert!(is_opencode("OPENCODE.EXE"));
+        assert!(!is_opencode("opencode-cli"));
+        assert!(!is_opencode("codex"));
+        assert!(!is_opencode("claude"));
+    }
+
+    #[test]
     fn is_agent_cli_recognizes_the_wired_clis_and_excludes_shells() {
         assert!(is_agent_cli("claude"));
         assert!(is_agent_cli("Codex.cmd"));
@@ -2239,6 +2288,38 @@ mod tests {
         assert!(!is_paid_openrouter_model("llama"));
         assert!(!is_paid_openrouter_model("lmstudio/mistral"));
         assert!(!is_paid_openrouter_model(""));
+    }
+
+    #[test]
+    fn free_model_guard_ignores_case_in_the_prefix_and_suffix() {
+        // OpenRouter resolves ids case-insensitively, so a re-cased id must be
+        // judged the same as its lower-case form.
+        assert!(is_paid_openrouter_model(
+            "OpenRouter/anthropic/claude-3-5-sonnet"
+        ));
+        assert!(is_paid_openrouter_model("OPENROUTER/GPT-4O"));
+        assert!(!is_paid_openrouter_model("OpenRouter/Free"));
+        assert!(!is_paid_openrouter_model("OpenRouter/any-model:FREE"));
+    }
+
+    #[test]
+    fn opencode_guard_requires_an_explicit_model() {
+        // Without -m opencode falls back to config or its last-used model,
+        // neither of which the guard can see, so the launch is refused.
+        for missing in [None, Some(""), Some("   "), Some("\t\n")] {
+            let err = opencode_model_guard(missing).unwrap_err();
+            assert!(err.contains("needs an explicit model"), "{err}");
+        }
+    }
+
+    #[test]
+    fn opencode_guard_judges_the_supplied_model() {
+        let err = opencode_model_guard(Some("openrouter/gpt-4o")).unwrap_err();
+        assert!(err.contains("paid OpenRouter model"), "{err}");
+        assert!(opencode_model_guard(Some("openrouter/free")).is_ok());
+        assert!(opencode_model_guard(Some("openrouter/x:free")).is_ok());
+        assert!(opencode_model_guard(Some("ollama/llama3")).is_ok());
+        assert!(opencode_model_guard(Some(" lmstudio/mistral ")).is_ok());
     }
 
     #[test]
