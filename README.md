@@ -152,11 +152,16 @@ only), `cancel_task` (conductor only), `reassign_task` (conductor only),
 It runs a separate print-mode child with the pane's cwd, model, and MCP identity,
 accepts multiline briefs without the pane byte limit, and waits for 30 seconds
 of pane quiet before starting. Occupied panes use the same three-task queue.
-The child has a $1 budget and a 40 minute wall-clock cap. Its exit completes the
-task through normal review, or records an error with CLI details; `complete_task`
-is optional. Tasks expose mode, CLI session UUID, exit code, and usage through
-MCP; the drawer shows mode and exit code. Cancel, Stop, and pane close kill the
-child, and open headless tasks are abandoned after app restart.
+The child has a 40 minute wall-clock cap and a budget in US dollars, `budget_usd`
+on the dispatch call: $5.00 by default, refused outright above a $25.00 ceiling
+or when not finite and positive, never silently clamped. A cold-cache first
+call alone can cost $0.17 to $0.25, so raise it for anything beyond a small
+task. Its exit completes the task through normal review, or records an error
+with CLI details, including any tools the child was refused permission to use;
+`complete_task` is optional. Tasks expose mode, CLI session UUID, exit code,
+budget, and usage (including permission denials) through MCP; the drawer shows
+mode and exit code. Cancel, Stop, and pane close kill the child, and open
+headless tasks are abandoned after app restart.
 
 `cancel_task` closes any open task with a reason, several at once if you name
 them together, queued tasks included: nothing is journaled for a queued task
