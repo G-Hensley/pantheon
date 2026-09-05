@@ -6,15 +6,17 @@
 // the background. In later milestones this grows a TOML registry + git-worktree
 // isolation; here it's the flat, working core.
 
+pub mod headless;
 mod mcp;
 mod worktree;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,10 +40,18 @@ struct SessionHandle {
     /// The program this session launched, so `submit_to` can tell which CLI it is
     /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
     program: String,
+    /// The resolved launch inputs retained for headless work in this pane's
+    /// checkout and against this pane's MCP endpoint.
+    launch: headless::LaunchSpec,
     /// This session's dedicated MCP listener. Present unless the endpoint failed
     /// and the session fell back to the shared one. Aborted on teardown; without
     /// this, one listener leaks per session for the life of the app.
     server: Option<mcp::SessionServer>,
+}
+
+struct ActiveHeadless {
+    pane_id: String,
+    tree: Arc<dyn headless::ProcessTree>,
 }
 
 /// Process-monotonic millisecond clock, used to time the gap between a prompt
@@ -408,6 +418,11 @@ fn ready_to_submit(
 #[derive(Default)]
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    headless: Mutex<HashMap<String, ActiveHeadless>>,
+    /// Only the first window-close request starts graceful cleanup. Later close
+    /// events wait for that cleanup's exit callback instead of starting an empty
+    /// second pass that could exit the app before the first pass kills its trees.
+    shutting_down: AtomicBool,
     /// Serialize ConPTY openpty+spawn: concurrent spawns can stall a PTY pipe on
     /// Windows, so only one session is created at a time.
     spawn_lock: Mutex<()>,
@@ -493,7 +508,9 @@ impl Drop for SpawnRollback {
 
 impl SessionManager {
     fn kill(&self, id: &str) {
-        if let Some(mut h) = self.sessions.lock().unwrap().remove(id) {
+        let handle = self.sessions.lock().unwrap().remove(id);
+        self.kill_headless_for_pane(id);
+        if let Some(mut h) = handle {
             let _ = h.child.kill();
             release_session(id, h);
         }
@@ -623,17 +640,135 @@ impl SessionManager {
             .map(|h| h.program.clone())
     }
 
-    /// Kill every session — used on window close so no agent process is orphaned
-    /// and no worktree is left behind.
-    fn kill_all(&self) {
-        let mut map = self.sessions.lock().unwrap();
-        for (id, mut h) in map.drain() {
-            let _ = h.child.kill();
-            if let Some(wt) = &h.worktree {
-                report_worktree_cleanup(wt);
-            }
-            let _ = std::fs::remove_dir_all(session_config_dir(&id));
+    /// The launch inputs for a live session, if it is still held.
+    pub fn launch_of(&self, id: &str) -> Option<headless::LaunchSpec> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|handle| handle.launch.clone())
+    }
+
+    /// Run one Claude print-mode child with the live pane's cwd, model, MCP
+    /// endpoint, and identity. Dispatch lifecycle and quiet-gate policy remain
+    /// with the caller.
+    pub fn run_headless(
+        &self,
+        id: &str,
+        brief: &str,
+        budget_usd: f64,
+        timeout: Duration,
+    ) -> Result<headless::HeadlessOutcome, headless::HeadlessError> {
+        let (child, cli_session) = {
+            // Hold the session map through registration so pane close cannot
+            // remove the worktree between lookup and child tracking.
+            let sessions = self.sessions.lock().unwrap();
+            let launch = sessions
+                .get(id)
+                .map(|handle| handle.launch.clone())
+                .ok_or_else(|| headless::HeadlessError::SessionNotFound(id.to_string()))?;
+            let child = headless::HeadlessChild::spawn(id, &launch, brief, budget_usd)?;
+            let cli_session = child.cli_session().to_string();
+            self.headless.lock().unwrap().insert(
+                cli_session.clone(),
+                ActiveHeadless {
+                    pane_id: id.to_string(),
+                    tree: child.process_tree(),
+                },
+            );
+            (child, cli_session)
+        };
+        let result = child.wait(timeout);
+        self.headless.lock().unwrap().remove(&cli_session);
+        result
+    }
+
+    fn kill_headless_for_pane(&self, pane_id: &str) {
+        let trees = {
+            let mut active = self.headless.lock().unwrap();
+            let ids = active
+                .iter()
+                .filter(|(_, child)| child.pane_id == pane_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id).map(|child| child.tree))
+                .collect::<Vec<_>>()
+        };
+        terminate_headless_trees(trees, headless::HEADLESS_TERMINATION_GRACE);
+    }
+
+    /// Start graceful cleanup away from the event-loop thread. Returns the one
+    /// cleanup thread to the caller so it can exit the app only after the final
+    /// kill pass finishes. A repeated close request returns `None`; the first
+    /// request's thread and exit callback remain authoritative.
+    fn kill_all(&self) -> Option<thread::JoinHandle<()>> {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return None;
         }
+        let mut handles = self.sessions.lock().unwrap().drain().collect::<Vec<_>>();
+        let trees = self
+            .headless
+            .lock()
+            .unwrap()
+            .values()
+            .map(|child| child.tree.clone())
+            .collect::<Vec<_>>();
+        // These calls are non-blocking syscalls. Send both kinds of child their
+        // first shutdown signal before returning, so even an unusually prompt OS
+        // exit does not depend on the cleanup thread having been scheduled yet.
+        for tree in &trees {
+            let _ = tree.terminate();
+        }
+        for (_, handle) in &mut handles {
+            let _ = handle.child.kill();
+        }
+        Some(thread::spawn(move || {
+            thread::sleep(headless::HEADLESS_CLOSE_GRACE);
+            for tree in trees {
+                let _ = tree.kill();
+            }
+            kill_session_handles(handles);
+        }))
+    }
+
+    /// App exit cannot wait for a grace period: kill every retained process tree
+    /// immediately. The Windows Job Object's kill-on-close setting remains the
+    /// final backstop if the process exits before this callback completes.
+    fn kill_all_immediate(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let handles = self.sessions.lock().unwrap().drain().collect::<Vec<_>>();
+        let trees = self
+            .headless
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, child)| child.tree)
+            .collect::<Vec<_>>();
+        for tree in trees {
+            let _ = tree.kill();
+        }
+        kill_session_handles(handles);
+    }
+}
+
+fn kill_session_handles(handles: Vec<(String, SessionHandle)>) {
+    for (id, mut handle) in handles {
+        let _ = handle.child.kill();
+        release_session(&id, handle);
+    }
+}
+
+fn terminate_headless_trees(trees: Vec<Arc<dyn headless::ProcessTree>>, grace: Duration) {
+    if trees.is_empty() {
+        return;
+    }
+    for tree in &trees {
+        let _ = tree.terminate();
+    }
+    thread::sleep(grace);
+    for tree in &trees {
+        let _ = tree.kill();
     }
 }
 
@@ -837,6 +972,26 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// observer the token exists to stop.
 const CODEX_TOKEN_ENV: &str = "PANTHEON_MCP_TOKEN";
 
+/// Write a token-bearing session config. Unix permissions are forced to 0600.
+/// Windows still uses the containing directory's default ACL; explicit ACL
+/// hardening is pending operator policy and is not implemented here.
+fn write_private_file(path: &Path, body: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(body.as_bytes())
+}
+
 fn agent_mcp_wiring(
     program: &str,
     session_id: &str,
@@ -865,7 +1020,7 @@ fn agent_mcp_wiring(
             let body = format!(
                 r#"{{"mcpServers":{{"pantheon":{{"type":"http","url":"{url}"{headers}}}}}}}"#
             );
-            match std::fs::write(&path, body) {
+            match write_private_file(&path, &body) {
                 Ok(_) => (
                     vec![
                         "--mcp-config".to_string(),
@@ -903,7 +1058,7 @@ fn agent_mcp_wiring(
             let body = format!(
                 r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"pantheon":{{"type":"remote","url":"{url}"{headers}}}}}}}"#
             );
-            match std::fs::write(&path, body) {
+            match write_private_file(&path, &body) {
                 Ok(_) => (
                     vec![],
                     vec![(
@@ -1212,7 +1367,7 @@ async fn spawn_session(
     // provably from it — so identity needs no handshake and can't be spoofed or
     // forgotten. Sessions sharing one endpoint would all authenticate as
     // "unknown", which silently breaks brain assignment and the conductor.
-    let (extra_args, extra_env) =
+    let (mcp_args, mcp_env, endpoint) =
         match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
             Ok(server) => {
                 let url = format!("http://127.0.0.1:{}/mcp", server.port);
@@ -1220,7 +1375,12 @@ async fn spawn_session(
                 rollback.server = Some(server);
                 let model_str = model.as_deref().unwrap_or("");
                 shared.note_session(&session_id, &program, model_str);
-                agent_mcp_wiring(&program, &session_id, &url, Some(&token))
+                let (args, env) = agent_mcp_wiring(&program, &session_id, &url, Some(&token));
+                (
+                    args,
+                    env,
+                    headless::LaunchEndpoint::Dedicated { url, token },
+                )
             }
             // Endpoint failed: fall back to the shared one. The agent can still reach
             // the brain, it just has to declare who it is.
@@ -1233,11 +1393,21 @@ async fn spawn_session(
                 eprintln!("[pantheon] session endpoint failed, using shared: {e}");
                 let model_str = model.as_deref().unwrap_or("");
                 shared.note_session(&session_id, &program, model_str);
-                agent_mcp_wiring(&program, &session_id, &mcp.url, None)
+                let (args, env) = agent_mcp_wiring(&program, &session_id, &mcp.url, None);
+                (args, env, headless::LaunchEndpoint::Shared)
             }
         };
-    let mut args = args;
-    args.extend(extra_args);
+    let launch = headless::LaunchSpec::for_session(
+        session_cwd.clone(),
+        program.clone(),
+        args,
+        model.as_deref(),
+        model_flag.as_deref(),
+        mcp_args,
+        mcp_env,
+        &session_id,
+        endpoint,
+    );
 
     // Starts "active now" so a session that never writes anything is governed by
     // SUBMIT_FLOOR_MS rather than looking quiet since the epoch.
@@ -1275,18 +1445,7 @@ async fn spawn_session(
             )));
         }
 
-        // Prepend the model flag and model to the command when both are provided.
-        // The model_flag comes from the frontend's SessionType definition, so
-        // there's a single source of truth for which CLI uses which flag.
-        if let (Some(ref m), Some(ref flag)) = (model, model_flag) {
-            args.insert(0, flag.clone());
-            args.insert(1, m.clone());
-        }
-
-        let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
-        // The agent's Pantheon name = its session id, so the collab skill can
-        // self-identify and the app can map it to a brain.
-        cmd.env("PANTHEON_SESSION", &session_id);
+        let cmd = build_command(&launch.program, &launch.args, &launch.cwd, &launch.env);
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave); // so the reader hits EOF when the child exits
 
@@ -1302,6 +1461,7 @@ async fn spawn_session(
                 worktree,
                 last_output: activity.clone(),
                 program: program.clone(),
+                launch,
                 server,
             },
         );
@@ -1360,6 +1520,7 @@ async fn spawn_session(
     // stranding a directory, a branch, and a port for every session that wasn't
     // closed by hand.
     let handle = state.sessions.lock().unwrap().remove(&session_id);
+    state.kill_headless_for_pane(&session_id);
     if let Some(h) = handle {
         release_session(&session_id, h);
     } else {
@@ -1563,7 +1724,7 @@ fn human_dispatch(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1609,12 +1770,25 @@ pub fn run() {
             human_dispatch
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                window.state::<Arc<SessionManager>>().kill_all();
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let manager = window.state::<Arc<SessionManager>>().inner().clone();
+                if let Some(cleanup) = manager.kill_all() {
+                    let app = window.app_handle().clone();
+                    thread::spawn(move || {
+                        let _ = cleanup.join();
+                        app.exit(0);
+                    });
+                }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            app.state::<Arc<SessionManager>>().kill_all_immediate();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1624,13 +1798,55 @@ mod tests {
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
         list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_models,
         ready_to_submit, resolve_isolation, run_with_timeout, submit_ceiling_ms, submit_floor_ms,
-        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
-        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
-        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        validate_human_dispatch, worktree, ActiveHeadless, IsolationReason, SessionManager,
+        SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
+        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_all_returns_quickly_then_kills_an_active_headless_tree() {
+        let manager = SessionManager::default();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 60 & sleep 60"]);
+        let mut process = crate::headless::spawn_process_tree(&mut command).unwrap();
+        let process_group = process.child.id() as libc::pid_t;
+        manager.headless.lock().unwrap().insert(
+            "shutdown-test".to_string(),
+            ActiveHeadless {
+                pane_id: "sess-test".to_string(),
+                tree: process.tree.clone(),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let cleanup = manager.kill_all().expect("first close starts cleanup");
+        // This is well below HEADLESS_CLOSE_GRACE (500 ms), so moving that
+        // sleep back onto the caller thread makes this assertion fail.
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "kill_all blocked the caller for {:?}",
+            started.elapsed()
+        );
+        cleanup.join().unwrap();
+        process.child.wait().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process group {process_group} survived app cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn legacy_data_directory_moves_to_the_pantheon_identity() {
@@ -2292,11 +2508,21 @@ mod tests {
             .position(|a| a == "--mcp-config")
             .map(|i| args[i + 1].clone())
             .expect("claude gets a --mcp-config path");
-        let body = std::fs::read_to_string(path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
         assert!(
             body.contains(r#""Authorization":"Bearer secret123""#),
             "{body}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                file_mode & 0o777,
+                0o600,
+                "token file mode was {file_mode:o}"
+            );
+        }
         assert!(
             env.is_empty(),
             "claude reads the token from its config file"
