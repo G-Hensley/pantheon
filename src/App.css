@@ -888,6 +888,25 @@ button.ghost.on {
   white-space: nowrap;
 }
 
+.cond-budget {
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.cond-budget.exhausted {
+  color: var(--danger);
+}
+
+.cond-budget-reset {
+  white-space: nowrap;
+}
+
+.cond-budget-error {
+  font-size: 11px;
+  color: var(--danger);
+  white-space: nowrap;
+}
+
 /* ---- Tasks button (opens <TaskDrawer>) ---- */
 .cond-tasks {
   display: inline-flex;

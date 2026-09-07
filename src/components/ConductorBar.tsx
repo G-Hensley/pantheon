@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { type ConductorTask } from "../lib/ipc";
+import { type ConductorTask, type DispatchBudget } from "../lib/ipc";
 import { groupTasks } from "../lib/tasks";
 
 type ConductorBarProps = {
@@ -11,6 +11,11 @@ type ConductorBarProps = {
   onOpenDispatch: () => void;
   onOpenTasks: () => void;
   panes: { id: string; type: import("../lib/ipc").SessionType; status: string }[];
+  // null until the backend snapshot has actually been read; see App.tsx.
+  budget: DispatchBudget | null;
+  onResetBudget: () => void;
+  budgetResetPending: boolean;
+  budgetResetError: string | null;
 };
 
 // Live view of what the conductor is doing, plus the global kill-switch.
@@ -28,6 +33,10 @@ export function ConductorBar({
   onOpenDispatch,
   onOpenTasks,
   panes,
+  budget,
+  onResetBudget,
+  budgetResetPending,
+  budgetResetError,
 }: ConductorBarProps) {
   const availableTargets = useMemo(
     () => panes.filter((p) => p.status === "running" && p.id !== conductor && p.type.id !== "shell"),
@@ -48,9 +57,30 @@ export function ConductorBar({
       <span className="cond-title">
         ⌁ Conductor <b>{conductor}</b>
       </span>
-      <span className="cond-count">
-        {pending} pending · {tasks.length} dispatched
+      <span className="cond-count">{pending} pending</span>
+      <span
+        className={"cond-budget" + (budget && budget.remaining === 0 ? " exhausted" : "")}
+        title="App-wide dispatch allowance since app start, cleared only by a human reset or Resume"
+      >
+        {budget
+          ? `${budget.used}/${budget.limit} dispatch budget used · ${budget.remaining} left`
+          : "dispatch budget unknown"}
       </span>
+      <button
+        type="button"
+        className="ghost cond-budget-reset"
+        onClick={onResetBudget}
+        disabled={budgetResetPending}
+        aria-label="Reset dispatch budget"
+        title="Give the app a fresh dispatch allowance; tasks and halt state are unaffected"
+      >
+        {budgetResetPending ? "Resetting…" : "Reset dispatch budget"}
+      </button>
+      {budgetResetError && (
+        <span className="cond-budget-error" role="alert">
+          Reset failed: {budgetResetError}
+        </span>
+      )}
 
       <button
         className={"ghost cond-tasks" + (needsAttention ? " attention" : "")}

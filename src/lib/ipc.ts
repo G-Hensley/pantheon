@@ -184,10 +184,21 @@ export type ConductorTask = {
   // with an empty `answer` is the open question, if any.
   exchanges: Exchange[];
 };
+// The app-wide dispatch allowance: one counter for the whole app, not per
+// session, since app start. See Shared.dispatches in src-tauri/src/mcp.rs.
+// remaining is carried rather than computed client-side (limit - used) so
+// the frontend never has its own arithmetic to get wrong about exhaustion.
+export type DispatchBudget = {
+  used: number;
+  limit: number;
+  remaining: number;
+};
+
 export type ConductorState = {
   conductor: string | null;
   halted: boolean;
   tasks: ConductorTask[];
+  dispatch_budget: DispatchBudget;
 };
 
 export const conductorState = (): Promise<ConductorState> => invoke("conductor_state");
@@ -195,6 +206,13 @@ export const setConductor = (name: string | null): Promise<void> =>
   invoke("set_conductor", { name });
 export const haltConductor = (halted: boolean): Promise<void> =>
   invoke("halt_conductor", { halted });
+
+// Human-only: renews the dispatch allowance without cancelling tasks or
+// changing halted state. No agent-facing MCP equivalent exists on purpose;
+// this is a plain Tauri command, unreachable from the MCP loopback port an
+// agent CLI talks to.
+export const resetDispatchBudget = (): Promise<DispatchBudget> =>
+  invoke("reset_dispatch_budget");
 
 // ---- Dispatch (human-initiated) ----
 export const dispatchTask = (target: string, task: string): Promise<{ task_id: string }> =>

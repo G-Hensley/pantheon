@@ -1052,3 +1052,41 @@ Open questions before building:
 - **Who is told.** A silent automatic recovery hides exactly the signal the
   human needs when a provider is degrading. Recovery should be loud in the
   conductor feed even when it succeeds.
+
+
+## Dispatch allowance is invisible and reset is coupled to Stop
+
+Tracked by task `s9xc2s`. Observed 2026-09-07 during the Lexicon tracker pilot:
+legitimate multi-project work reached the 40-dispatch cap, and subsequent turns
+continued to receive "dispatch budget exhausted for this run." Independent review
+and fresh-session task discovery could no longer be dispatched.
+
+This is a dispatch-count guardrail, separate from headless dollar budgets. The
+counter is shared by the running app, starts at zero, increments on accepted task
+admission and is cleared by `set_halted(false)`. Completing tasks or starting a
+new conversation turn does not refresh it. The conductor bar instead displays
+the task ledger's total, which cannot tell a user how much allowance remains.
+
+The existing human recovery is Stop then Resume. Resume clears the counter, but
+Stop can cancel pending and queued work and terminate headless attempts. Requiring
+that side effect just to renew an allowance is the defect. The agent-facing error
+also omits the limit, scope and available recovery action. No MCP reset is exposed.
+
+Correction in progress: show used, maximum and remaining dispatches in the conductor
+bar and MCP roster; provide a dedicated human Reset dispatch budget action which
+preserves task records and halted state; name that recovery in an exhausted
+response. Keep the finite default and atomic charging at admission. Keep reset
+outside agent-controlled MCP mutations: the agent whose looping is bounded must
+not be able to replenish its own allowance. Stop and Resume retain their existing
+behavior. App restart persistence and per-brain budgets are separate decisions.
+
+Acceptance requires evidence that exhaustion blocks admission, a human reset
+permits subsequent admission, and reset leaves both task records and halt state
+unchanged. Refused dispatches must still cost nothing; concurrent admission must
+respect the cap. UI tests must exercise the backend count, explicit reset action
+and failure reporting. Run the repository's Rust and frontend checks and obtain
+a different-model review before commit.
+
+The user performed the existing Stop/Resume recovery on 2026-09-07; subsequent
+Pantheon dispatches succeeded. The correction is being implemented in isolation
+and is not installed in the running app.

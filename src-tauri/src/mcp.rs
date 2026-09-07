@@ -625,6 +625,24 @@ fn append_record(dir: &Path, record: &StoreRecord) -> std::io::Result<()> {
 /// dispatch, so a dispatched agent cannot dispatch onward.
 const MAX_DISPATCHES: u32 = 40;
 
+/// App-wide, in-memory allowance since the last human reset or Resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DispatchBudget {
+    pub used: u32,
+    pub limit: u32,
+    pub remaining: u32,
+}
+
+impl DispatchBudget {
+    fn new(used: u32) -> Self {
+        Self {
+            used,
+            limit: MAX_DISPATCHES,
+            remaining: MAX_DISPATCHES.saturating_sub(used),
+        }
+    }
+}
+
 /// How long before a still-running task is reported as "overdue".
 ///
 /// This is a reporting threshold, not a deadline. Nothing here cancels an
@@ -1545,7 +1563,11 @@ impl Shared {
             self.hit_test_seam("enqueue_within_cap");
             if !self.take_dispatch_budget() {
                 return (
-                    Err("dispatch budget exhausted for this run.".to_string()),
+                    Err(format!(
+                        "App-wide dispatch budget exhausted ({MAX_DISPATCHES} dispatches). \
+                         Ask the human to use Reset dispatch budget in the conductor bar; \
+                         it renews the allowance without cancelling tasks or changing Stop/Resume state."
+                    )),
                     Vec::new(),
                 );
             }
@@ -1618,6 +1640,22 @@ impl Shared {
 
     pub fn tasks_snapshot(&self) -> Vec<Task> {
         self.tasks.lock().unwrap().clone()
+    }
+
+    pub fn dispatch_budget(&self) -> DispatchBudget {
+        DispatchBudget::new(*self.dispatches.lock().unwrap())
+    }
+
+    /// Human IPC only: renew the allowance without cancelling tasks or resuming.
+    /// No delivery, task, or halt lock is needed; admissions serialize on the
+    /// same counter mutex. Notify after releasing it so a UI refresh can read it.
+    pub fn reset_dispatch_budget(&self) -> DispatchBudget {
+        let budget = {
+            *self.dispatches.lock().unwrap() = 0;
+            DispatchBudget::new(0)
+        };
+        self.app.emit("conductor-changed");
+        budget
     }
 
     /// Consume one unit of dispatch budget; false when exhausted.
@@ -3946,11 +3984,17 @@ impl BrainHandler {
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
+        let budget = self.shared.dispatch_budget();
+        let mut out = format!(
+            "# Live sessions\n\nDispatch budget (app-wide, since last human reset or Resume): \
+             {}/{} used, {} remaining. Only the human can use Reset dispatch budget in the conductor bar.\n",
+            budget.used, budget.limit, budget.remaining
+        );
         if lines.is_empty() {
-            return "No live sessions.".to_string();
+            out.push_str("\nNo live sessions.");
+            return out;
         }
         let me = self.author();
-        let mut out = String::from("# Live sessions\n");
         for l in &lines {
             out.push_str(l);
             out.push('\n');
@@ -4765,8 +4809,8 @@ pub fn start(
 mod tests {
     use super::{
         abandon_headless_on_load, append_denial_note, apply_headless_exit, dispatch_mode_precheck,
-        dispatch_prompt_raw, effective_headless_budget, pane_mode, Usage,
-        HEADLESS_BUDGET_CEILING_USD, HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS,
+        dispatch_prompt_raw, effective_headless_budget, pane_mode, DispatchBudget, Usage,
+        HEADLESS_BUDGET_CEILING_USD, HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS, MAX_DISPATCHES,
     };
     use super::{
         abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
@@ -5824,6 +5868,172 @@ mod tests {
             *shared.dispatches.lock().unwrap(),
             0,
             "a refused dispatch charged the budget"
+        );
+    }
+
+    #[test]
+    fn dispatch_budget_exhaustion_refuses_without_a_record_and_human_reset_allows_admission() {
+        let (shared, dir) = shared_for_test();
+        assert_eq!(shared.dispatch_budget(), DispatchBudget::new(0));
+        for i in 0..MAX_DISPATCHES {
+            // Distinct targets avoid exercising the separate per-pane queue cap.
+            let target = format!("sess-budget-{i}");
+            shared
+                .enqueue_within_cap(&target, |_| {
+                    let mut task = task_at(&format!("budget-{i}"), "pending", i as u64);
+                    task.target = target.clone();
+                    task
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            shared.dispatch_budget(),
+            DispatchBudget::new(MAX_DISPATCHES)
+        );
+        let before = std::fs::read(dir.path().join("brain.jsonl")).unwrap();
+        let refusal = shared
+            .enqueue_within_cap("extra-target", |_| {
+                panic!("a refusal must not build a task")
+            })
+            .unwrap_err();
+        assert!(refusal.contains(&MAX_DISPATCHES.to_string()), "{refusal}");
+        assert!(refusal.contains("human"), "{refusal}");
+        assert!(refusal.contains("Reset dispatch budget"), "{refusal}");
+        assert_eq!(shared.tasks_snapshot().len(), MAX_DISPATCHES as usize);
+        assert_eq!(shared.dispatch_budget().remaining, 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("brain.jsonl")).unwrap(),
+            before
+        );
+
+        assert_eq!(shared.reset_dispatch_budget(), DispatchBudget::new(0));
+        assert_eq!(
+            std::fs::read(dir.path().join("brain.jsonl")).unwrap(),
+            before
+        );
+        shared
+            .enqueue_within_cap("after-reset", |_| task_at("renewed", "pending", 100))
+            .unwrap();
+        assert_eq!(shared.dispatch_budget(), DispatchBudget::new(1));
+        assert_eq!(shared.tasks_snapshot().len(), MAX_DISPATCHES as usize + 1);
+    }
+
+    #[test]
+    fn dispatch_budget_reset_preserves_tasks_journal_and_both_halt_states() {
+        for halted in [false, true] {
+            let (shared, dir) = shared_for_test();
+            *shared.halted.lock().unwrap() = halted;
+            shared.mutate_and_journal(|tasks| {
+                let records: Vec<_> = ["pending", STATUS_QUEUED, "blocked", "in_review", "done"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, status)| task_at(&format!("t{i}"), status, i as u64))
+                    .collect();
+                *tasks = records.clone();
+                ((), records)
+            });
+            assert!(shared.take_dispatch_budget());
+            let tasks_before = serde_json::to_value(shared.tasks_snapshot()).unwrap();
+            let journal_before = std::fs::read(dir.path().join("brain.jsonl")).unwrap();
+
+            assert_eq!(shared.reset_dispatch_budget(), DispatchBudget::new(0));
+
+            assert_eq!(shared.is_halted(), halted);
+            assert_eq!(
+                serde_json::to_value(shared.tasks_snapshot()).unwrap(),
+                tasks_before
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("brain.jsonl")).unwrap(),
+                journal_before
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_budget_reset_uses_no_task_delivery_or_halt_lock() {
+        let (shared, _dir) = shared_for_test();
+        assert!(shared.take_dispatch_budget());
+        let tasks = shared.tasks.lock().unwrap();
+        let delivery = shared.delivery.write().unwrap();
+        let halted = shared.halted.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reset = thread::spawn({
+            let shared = shared.clone();
+            move || tx.send(shared.reset_dispatch_budget()).unwrap()
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Release locks before asserting so a regression cannot strand the worker.
+        drop(halted);
+        drop(delivery);
+        drop(tasks);
+        reset.join().unwrap();
+        assert_eq!(result.unwrap(), DispatchBudget::new(0));
+    }
+
+    #[test]
+    fn dispatch_budget_reset_emits_after_releasing_counter_lock() {
+        let (mut shared, _dir) = shared_for_test();
+        let target = Arc::new(Mutex::new(None::<std::sync::Weak<Shared>>));
+        let (tx, rx) = mpsc::channel();
+        Arc::get_mut(&mut shared).unwrap().app = Notifier(Some(Box::new({
+            let target = target.clone();
+            move |event| {
+                let shared = target.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                assert!(
+                    shared.dispatches.try_lock().is_ok(),
+                    "notification retained counter lock"
+                );
+                tx.send(event.to_string()).unwrap();
+            }
+        })));
+        *target.lock().unwrap() = Some(Arc::downgrade(&shared));
+        shared.reset_dispatch_budget();
+        assert_eq!(rx.try_recv().unwrap(), "conductor-changed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_budget_concurrent_admissions_cannot_overrun_the_allowance() {
+        let (shared, _dir) = shared_for_test();
+        *shared.dispatches.lock().unwrap() = MAX_DISPATCHES - 1;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|i| {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    shared.enqueue_within_cap(&format!("target-{i}"), |_| {
+                        task_at(&format!("race-{i}"), "pending", i)
+                    })
+                })
+            })
+            .collect();
+        barrier.wait();
+        let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(shared.tasks_snapshot().len(), 1);
+        assert_eq!(
+            shared.dispatch_budget(),
+            DispatchBudget::new(MAX_DISPATCHES)
+        );
+    }
+
+    #[test]
+    fn dispatch_budget_roster_reports_allowance_even_without_sessions() {
+        let (shared, _dir) = shared_for_test();
+        assert!(shared.take_dispatch_budget());
+        let handler = BrainHandler::new(shared.clone());
+        let roster = handler.list_sessions();
+        assert!(roster.contains("1/40 used, 39 remaining"), "{roster}");
+        assert!(roster.contains("app-wide"), "{roster}");
+        assert!(roster.contains("Only the human"), "{roster}");
+        assert!(roster.contains("No live sessions."), "{roster}");
+        assert_eq!(shared.dispatch_budget(), DispatchBudget::new(1));
+        assert_eq!(
+            serde_json::to_value(shared.dispatch_budget()).unwrap(),
+            serde_json::json!({"used": 1, "limit": 40, "remaining": 39})
         );
     }
 
@@ -9638,6 +9848,11 @@ mod tests {
             .expect_err("the target is already at QUEUE_CAP");
 
         assert!(refusal.contains("queue is full"), "{refusal}");
+        assert_eq!(
+            shared.dispatch_budget(),
+            DispatchBudget::new(0),
+            "queue refusal charged budget"
+        );
         assert_eq!(
             shared.tasks_snapshot().len(),
             QUEUE_CAP,
