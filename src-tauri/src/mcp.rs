@@ -2535,15 +2535,21 @@ fn queued_ids_for(tasks: &[Task], pane: &str) -> Vec<String> {
 /// pane (see `drain_pane` and `Shared::reassign_task`, which both check
 /// occupancy of a pane a task is *about* to notify or move to).
 fn occupying_task<'a>(tasks: &'a [Task], pane: &str, excluding: &str) -> Option<&'a Task> {
-    tasks.iter().find(|t| {
-        t.id != excluding
-            && ((t.target == pane
-                && matches!(
-                    t.status.as_str(),
-                    "pending" | "overdue" | "rework" | STATUS_BLOCKED
-                ))
-                || (t.reviewer == pane && t.status == "in_review"))
-    })
+    tasks
+        .iter()
+        .find(|t| t.id != excluding && occupies_pane(t, pane))
+}
+
+/// Whether one task holds `pane`: its target running it, or its reviewer owing
+/// a verdict on it. Extracted verbatim from `occupying_task` so
+/// `next_delivery_for` can apply the same rule without restating it.
+fn occupies_pane(t: &Task, pane: &str) -> bool {
+    (t.target == pane
+        && matches!(
+            t.status.as_str(),
+            "pending" | "overdue" | "rework" | STATUS_BLOCKED
+        ))
+        || (t.reviewer == pane && t.status == "in_review")
 }
 
 fn is_occupied(tasks: &[Task], pane: &str) -> bool {
@@ -2590,20 +2596,37 @@ fn next_delivery_for<'a>(tasks: &'a [Task], pane: &str) -> Option<&'a Task> {
     // notice this function exists to deliver: it must not disqualify
     // itself. Pick the candidate first, then check for occupancy by
     // anything else.
-    let notice = tasks.iter().find(|t| {
-        !t.notice_delivered
-            && ((t.status == "rework" && t.target == pane)
-                || (t.status == "in_review" && t.reviewer == pane))
-    });
+    let notice = tasks.iter().find(|t| undelivered_notice_for(t, pane));
     let candidate = notice.or_else(|| {
         queued_ids_for(tasks, pane)
             .first()
             .and_then(|id| tasks.iter().find(|t| &t.id == id))
     })?;
-    if occupying_task(tasks, pane, &candidate.id).is_some() {
+    // Excluding only the candidate was not enough. A second unseen notice for
+    // the same pane satisfies `occupies_pane`, so each of two undelivered
+    // notices cited the other as occupancy and neither was ever selected.
+    // Nothing was sent, so nothing was marked delivered, and every later drain
+    // repeated the same choice: a pane could hold two review requests it had
+    // never been told about, permanently. A notice the agent has not received
+    // is not work the pane is engaged in, so it cannot be what blocks another.
+    // Only unseen notices are discounted; a live task still blocks.
+    if tasks
+        .iter()
+        .any(|t| t.id != candidate.id && occupies_pane(t, pane) && !undelivered_notice_for(t, pane))
+    {
         return None;
     }
     Some(candidate)
+}
+
+/// A notice this pane owes but has not been shown: a review request where it is
+/// the reviewer, or a rework notice where it is the target. Shared by
+/// `next_delivery_for`'s candidate search and its occupancy test so the two can
+/// never disagree about what counts as unseen.
+fn undelivered_notice_for(t: &Task, pane: &str) -> bool {
+    !t.notice_delivered
+        && ((t.status == "rework" && t.target == pane)
+            || (t.status == "in_review" && t.reviewer == pane))
 }
 
 /// Who holds an open task, and for how long: a session name paired with the
@@ -4200,7 +4223,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Sign off on a task you were named to review, or send it back. Only the named reviewer can call this, and only while the task is in_review. Approving marks it done; rejecting sets its status to 'rework' and keeps your findings on the record, but changes nothing else: nothing is typed into the agent's terminal, and the agent cannot read the record itself (get_task_result is dispatcher-only), so the conductor has to tell it by hand that rework is waiting. Read the work before deciding: an approval you did not earn is worse than no review, because it looks like one."
+        description = "Sign off on a task you were named to review, or send it back. Only the named reviewer can call this, and only while the task is in_review. Approving marks it done; rejecting sets its status to 'rework', keeps your findings on the record, and queues a notice into the agent's own terminal telling it to fix them and call complete_task again, so the conductor does not have to relay it by hand. The agent can also read the record itself: get_task_result is open to a task's dispatcher, target and reviewer. Write findings the agent can act on without you, because it will act on them without you. Read the work before deciding: an approval you did not earn is worse than no review, because it looks like one."
     )]
     fn review_task(&self, Parameters(p): Parameters<ReviewArgs>) -> String {
         if !p.approved && p.findings.trim().is_empty() {
@@ -8985,6 +9008,103 @@ mod tests {
         let tasks = vec![notice];
 
         let next = next_delivery_for(&tasks, "sess-2").expect("the reviewer's pane is free");
+        assert_eq!(next.id, "t1");
+    }
+
+    /// Two review requests for one reviewer, neither yet typed in.
+    ///
+    /// A pane that is disconnected or still booting makes this ordinary:
+    /// `drain_pane` returns before attempting delivery, so the notice stays
+    /// undelivered, and a second review assigned before the first lands
+    /// leaves two. Neither has been seen by the agent, so neither is work the
+    /// pane is engaged in, and one of them has to go first. Selecting nothing
+    /// is unrecoverable: with nothing delivered, both stay undelivered and
+    /// every later drain repeats the same choice.
+    #[test]
+    fn two_undelivered_review_requests_do_not_block_each_other() {
+        let mut first = task_at("t1", "in_review", 0);
+        first.target = "sess-3".into();
+        first.reviewer = "sess-2".into();
+        first.notice_delivered = false;
+        let mut second = task_at("t2", "in_review", 5);
+        second.target = "sess-4".into();
+        second.reviewer = "sess-2".into();
+        second.notice_delivered = false;
+        let tasks = vec![first, second];
+
+        let next = next_delivery_for(&tasks, "sess-2")
+            .expect("neither notice has been seen, so one must be delivered");
+        assert_eq!(next.id, "t1", "the first undelivered notice goes first");
+    }
+
+    /// The other half: once one review is actually in the agent's hands it
+    /// occupies the pane and the rest wait. Reviews stay serialized.
+    #[test]
+    fn a_delivered_review_still_blocks_the_next_notice() {
+        let mut delivered = task_at("t1", "in_review", 0);
+        delivered.target = "sess-3".into();
+        delivered.reviewer = "sess-2".into();
+        delivered.notice_delivered = true;
+        let mut waiting = task_at("t2", "in_review", 5);
+        waiting.target = "sess-4".into();
+        waiting.reviewer = "sess-2".into();
+        waiting.notice_delivered = false;
+        let tasks = vec![delivered, waiting];
+
+        assert!(
+            next_delivery_for(&tasks, "sess-2").is_none(),
+            "a review the agent is holding must block the next one"
+        );
+    }
+
+    /// Finishing the held review releases the one behind it.
+    #[test]
+    fn closing_a_review_releases_the_notice_behind_it() {
+        let mut closed = task_at("t1", "done", 0);
+        closed.target = "sess-3".into();
+        closed.reviewer = "sess-2".into();
+        let mut waiting = task_at("t2", "in_review", 5);
+        waiting.target = "sess-4".into();
+        waiting.reviewer = "sess-2".into();
+        waiting.notice_delivered = false;
+        let tasks = vec![closed, waiting];
+
+        let next = next_delivery_for(&tasks, "sess-2").expect("the pane is free again");
+        assert_eq!(next.id, "t2");
+    }
+
+    /// Work the pane is genuinely running still blocks a notice. Only an
+    /// unseen notice is discounted, never a live task.
+    #[test]
+    fn a_pending_task_still_blocks_an_undelivered_review_request() {
+        let mut running = task_at("t1", "pending", 0);
+        running.target = "sess-2".into();
+        let mut notice = task_at("t2", "in_review", 5);
+        notice.target = "sess-3".into();
+        notice.reviewer = "sess-2".into();
+        notice.notice_delivered = false;
+        let tasks = vec![running, notice];
+
+        assert!(
+            next_delivery_for(&tasks, "sess-2").is_none(),
+            "a pane mid-task must not be interrupted by a review request"
+        );
+    }
+
+    /// The same deadlock shape on the rework side, where the notices are
+    /// keyed to the target rather than the reviewer.
+    #[test]
+    fn two_undelivered_rework_notices_do_not_block_each_other() {
+        let mut first = task_at("t1", "rework", 0);
+        first.target = "sess-2".into();
+        first.notice_delivered = false;
+        let mut second = task_at("t2", "rework", 5);
+        second.target = "sess-2".into();
+        second.notice_delivered = false;
+        let tasks = vec![first, second];
+
+        let next = next_delivery_for(&tasks, "sess-2")
+            .expect("neither rework notice has been seen, so one must be delivered");
         assert_eq!(next.id, "t1");
     }
 
