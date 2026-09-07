@@ -1,0 +1,17 @@
+{
+  "schema": 2,
+  "id": "qf7d1f",
+  "rev": 1,
+  "title": "Two unseen delivery notices for one pane deadlocked each other",
+  "status": "review",
+  "priority": "P1",
+  "rank": 18000,
+  "done_when": "next_delivery_for no longer lets two undelivered notices for the same pane cite each other as occupancy, so the first is delivered instead of both stalling forever. Serialization is preserved: once a notice is delivered it occupies the pane and blocks the rest until completion, and a genuine pending, overdue, rework or blocked task on the target still blocks an undelivered review request. occupying_task, is_occupied, queue_predecessor and dispatch admission are unchanged. Proven by two regression tests that failed on 6111e0c before the fix and three guard tests that pass on both sides of it, plus cargo test, cargo fmt, clippy and pnpm build. Done when a different model has reviewed fix/undelivered-review-queue and it has merged.",
+  "links": [
+    "BACKLOG.md",
+    "src-tauri/src/mcp.rs"
+  ],
+  "created": "2026-09-07T21:31:55Z",
+  "updated": "2026-09-07T21:31:55Z",
+  "status_changed": "2026-09-07T21:31:55Z"
+}

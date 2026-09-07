@@ -590,6 +590,36 @@ queued task. Evidence: `queue_predecessor`, `queue_cap_refusal`,
 `next_delivery_for`, `occupying_task`, and `Shared::drain_pane` in
 `src-tauri/src/mcp.rs`, and their tests.
 
+## Two unseen notices for one pane deadlocked each other
+
+**Fixed on `fix/undelivered-review-queue`, not yet reviewed or merged.** A
+follow-on defect in the delivery path above. `next_delivery_for` picked a
+candidate notice and then excluded only that one id from the occupancy test,
+but `occupying_task` counts every other `in_review` task assigned to the same
+reviewer, delivered or not. So with two undelivered review requests for one
+pane, each cited the other as occupancy: neither was selected, nothing was
+typed, `notice_delivered` stayed false on both, and every later drain repeated
+the same choice. The pane held review requests it had never been told about,
+with no timeout and no path out short of cancelling a task. Two undelivered
+rework notices for one target deadlocked identically.
+
+Reproduced at the unit level before the fix, not from a live pane:
+`two_undelivered_review_requests_do_not_block_each_other` and
+`two_undelivered_rework_notices_do_not_block_each_other` in `mcp.rs` both
+failed on `6111e0c` with "neither notice has been seen, so one must be
+delivered". The fix discounts *other undelivered notices for the same pane*
+from that occupancy test and nothing else: a notice the agent has not received
+is not work the pane is engaged in, so it cannot be what blocks another.
+
+Acceptance is that unseen notices stop blocking each other without loosening
+occupancy anywhere else. Three tests written against the old behaviour pass
+both before and after, which is what shows the guard rather than the fix:
+a delivered review still blocks the next notice, completing a review releases
+the notice behind it, and a genuine pending task on the target still blocks an
+undelivered review request. `occupying_task`, `is_occupied`, `queue_predecessor`
+and dispatch admission are unchanged; `occupies_pane` is that predicate lifted
+out verbatim so the selector cannot restate it and drift.
+
 ## Model-aware dispatch
 
 Today the conductor knows a session's id and CLI (`sess-3 (opencode)`) and
