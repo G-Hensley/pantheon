@@ -1807,6 +1807,7 @@ struct ConductorState {
     conductor: Option<String>,
     halted: bool,
     tasks: Vec<mcp::Task>,
+    dispatch_budget: mcp::DispatchBudget,
 }
 
 #[tauri::command]
@@ -1815,6 +1816,7 @@ fn conductor_state(shared: State<'_, Arc<mcp::Shared>>) -> ConductorState {
         conductor: shared.conductor(),
         halted: shared.is_halted(),
         tasks: shared.tasks_snapshot(),
+        dispatch_budget: shared.dispatch_budget(),
     }
 }
 
@@ -1829,6 +1831,12 @@ fn set_conductor(shared: State<'_, Arc<mcp::Shared>>, name: Option<String>) {
 #[tauri::command]
 fn halt_conductor(shared: State<'_, Arc<mcp::Shared>>, halted: bool) {
     shared.set_halted(halted);
+}
+
+/// Human control on the webview IPC surface, never an agent-facing MCP tool.
+#[tauri::command]
+fn reset_dispatch_budget(shared: State<'_, Arc<mcp::Shared>>) -> mcp::DispatchBudget {
+    shared.reset_dispatch_budget()
 }
 
 /// Let a human dispatch a task to a live agent session directly from the UI,
@@ -1916,6 +1924,7 @@ pub fn run() {
             conductor_state,
             set_conductor,
             halt_conductor,
+            reset_dispatch_budget,
             set_project,
             project_is_repo,
             init_project_repo,

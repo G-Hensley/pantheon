@@ -244,8 +244,16 @@ exchange is kept on the task, so an answer given once is not asked again.
 - Only the conductor can dispatch, and the app assigns that role. An agent
   cannot claim it. Depth is bounded structurally: a dispatched agent is not
   the conductor, so it cannot dispatch onward.
-- 40 dispatches per run, and a Stop that cancels everything still pending.
-  A task older than 20 minutes is relabelled overdue, but that is a reporting
+- An app-wide allowance of 40 dispatches bounds unattended delegation. The
+  conductor bar and MCP session roster show used and remaining dispatches.
+  This is a task count, separate from headless dollar budgets; it persists across
+  conversation turns, completed tasks, conductor changes and brain changes.
+  **Reset dispatch budget** renews the allowance without cancelling tasks or
+  changing whether dispatch is stopped. This is a human UI control, not an agent
+  MCP tool. App startup and the existing Resume action also renew the allowance.
+- **Stop** halts dispatch and cancels pending and queued work, including active
+  headless attempts. Use Reset dispatch budget when only the allowance needs
+  renewing. A task older than 20 minutes is relabelled overdue, but that is a reporting
   signal only: nothing is terminated, the agent process keeps running, and a
   late result is still accepted.
 - A task whose target pane's process has exited is marked `abandoned`, which is

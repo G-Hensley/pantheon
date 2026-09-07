@@ -26,6 +26,7 @@ import {
   type SessionType,
   type SessionWorktreeEvent,
 } from "./lib/ipc";
+import { useDispatchBudget } from "./lib/useDispatchBudget";
 import {
   loadConductorId,
   loadRoster,
@@ -112,6 +113,14 @@ function App() {
   const [conductor, setConductorName] = useState<string | null>(null);
   const [conductorTasks, setConductorTasks] = useState<import("./lib/ipc").ConductorTask[]>([]);
   const [conductorHalted, setConductorHalted] = useState(false);
+  // budget stays null until the first successful conductor_state read, and
+  // again whenever an older backend build hasn't grown the field yet:
+  // treated the same as "not known" rather than guessed at, since a wrong
+  // number here would misreport exhaustion. See src/lib/useDispatchBudget.ts
+  // for the reset call's pending/error handling and the ticket scheme that
+  // keeps a slow, pre-reset poll from ever overwriting a post-reset read,
+  // no matter how late it resolves.
+  const dispatchBudget = useDispatchBudget();
   const [dispatchOpen, setDispatchOpen] = useState(false);
   const [tasksOpen, setTasksOpen] = useState(false);
   const [toasts, setToasts] = useState<string[]>([]); // dismissed task ids
@@ -228,12 +237,18 @@ function App() {
   useEffect(() => {
     let alive = true;
     const refresh = async () => {
+      // Ticketed before the await, not after: a reset that starts and
+      // finishes entirely during this call is what the ticket lets
+      // dispatchBudget.applySnapshot recognize below, however late this
+      // particular read turns out to resolve. See useDispatchBudget.ts.
+      const budgetTicket = dispatchBudget.beginRead();
       try {
         const s = await conductorState();
         if (alive) {
           setConductorName(s.conductor);
           setConductorTasks(s.tasks);
           setConductorHalted(s.halted);
+          dispatchBudget.applySnapshot(s.dispatch_budget, budgetTicket);
         }
       } catch {
         /* backend not ready */
@@ -247,13 +262,17 @@ function App() {
       clearInterval(poll);
       unlisten.then((f) => f());
     };
-  }, []);
+    // dispatchBudget.beginRead and .applySnapshot both have a stable
+    // identity (see useDispatchBudget's own useCallback), so listing them
+    // here does not cause this effect to re-run on every render.
+  }, [dispatchBudget.beginRead, dispatchBudget.applySnapshot]);
 
   async function toggleConductor(id: string) {
     const next = conductor === id ? null : id;
     setConductorName(next);
     await setConductor(next).catch(() => {});
   }
+
 
   // Keep the backend's context directory in step with the active project —
   // on startup (restoring the remembered one) and on every change.
@@ -494,6 +513,10 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
           onOpenDispatch={() => setDispatchOpen(true)}
           onOpenTasks={() => setTasksOpen(true)}
           panes={panes}
+          budget={dispatchBudget.budget}
+          onResetBudget={dispatchBudget.reset}
+          budgetResetPending={dispatchBudget.resetPending}
+          budgetResetError={dispatchBudget.resetError}
         />
       )}
 

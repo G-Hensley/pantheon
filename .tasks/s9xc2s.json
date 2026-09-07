@@ -1,0 +1,16 @@
+{
+  "schema": 2,
+  "id": "s9xc2s",
+  "rev": 3,
+  "title": "Expose and reset the dispatch allowance without cancelling tasks",
+  "status": "review",
+  "priority": "P1",
+  "rank": 17000,
+  "done_when": "The app and MCP report used, remaining and maximum dispatches with explicit scope; a human UI control resets the allowance without cancelling tasks or changing halt state; agents cannot reset their own allowance; the finite cap and atomic admission remain enforced; exhaustion names recovery; regression tests, cargo test, pnpm build and independent review pass.",
+  "links": [
+    "BACKLOG.md#dispatch-allowance-is-invisible-and-reset-is-coupled-to-stop"
+  ],
+  "created": "2026-09-07T18:20:14Z",
+  "updated": "2026-09-07T19:07:18Z",
+  "status_changed": "2026-09-07T19:07:18Z"
+}
