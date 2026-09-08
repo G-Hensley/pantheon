@@ -11,9 +11,15 @@
 // Rust store: the roster is UI state the frontend owns end to end, it is written
 // on every pane change, and keeping it beside the project it belongs with means
 // one place to look when a restore misbehaves.
+//
+// Keyed by project, because a roster names panes, brains and worktree paths that
+// only mean anything inside the repository they were created for. Every entry
+// point therefore takes the scope its caller resolved at startup rather than
+// reading the selected project itself: the window persists to the project it
+// opened with, and `shouldFreezePersistence` below decides when it must stop.
 
 import { SESSION_TYPES, setConductor, type SavedWorktree, type SessionType } from "./ipc";
-import { readStored, writeStored } from "./storage";
+import { readScoped, writeScoped, type ProjectScope } from "./storage";
 
 const KEY = "panes";
 const CONDUCTOR_KEY = "conductor";
@@ -108,19 +114,19 @@ export function parseRoster(raw: string | null): Roster {
 
 // Read the remembered roster. Never throws: a browser that denies localStorage
 // simply starts with no sessions.
-export function loadRoster(): Roster {
+export function loadRoster(scope: ProjectScope): Roster {
   try {
-    return parseRoster(readStored(KEY));
+    return parseRoster(readScoped(KEY, scope));
   } catch {
     return EMPTY;
   }
 }
 
-export function saveRoster(panes: StoredPane[]): void {
+export function saveRoster(scope: ProjectScope, panes: StoredPane[]): void {
   try {
-    writeStored(KEY, JSON.stringify(panes));
+    writeScoped(KEY, scope, JSON.stringify(panes));
   } catch {
-    /* ignore — persistence is best-effort, it must never break the app */
+    /* ignore, persistence is best-effort, it must never break the app */
   }
 }
 
@@ -130,9 +136,9 @@ export function saveRoster(panes: StoredPane[]): void {
 // and vice versa. A missing key and an empty string both mean "no conductor".
 
 /** Read the persisted conductor pane id, or null if none is stored. */
-export function loadConductorId(): string | null {
+export function loadConductorId(scope: ProjectScope): string | null {
   try {
-    const raw = readStored(CONDUCTOR_KEY);
+    const raw = readScoped(CONDUCTOR_KEY, scope);
     return raw ? raw : null;
   } catch {
     return null;
@@ -147,10 +153,14 @@ export function loadConductorId(): string | null {
  * changes (promote, demote) and whenever the roster does (a pane closing can
  * take the conductor's pane with it), so a stale id never lingers.
  */
-export function saveConductorId(conductor: string | null, paneIds: string[]): void {
+export function saveConductorId(
+  scope: ProjectScope,
+  conductor: string | null,
+  paneIds: string[],
+): void {
   try {
     const id = conductor !== null && paneIds.includes(conductor) ? conductor : null;
-    writeStored(CONDUCTOR_KEY, id ?? "");
+    writeScoped(CONDUCTOR_KEY, scope, id ?? "");
   } catch {
     /* ignore, persistence is best-effort, it must never break the app */
   }
@@ -209,6 +219,7 @@ export function decideConductorRestore(
  * reason: silence is what made the original loss invisible.
  */
 export async function restoreConductor(
+  scope: ProjectScope,
   savedId: string | null,
   paneIds: string[],
 ): Promise<string | null> {
@@ -220,10 +231,10 @@ export async function restoreConductor(
     } catch {
       return `Conductor was not restored: pane ${decision.id} could not be promoted.`;
     }
-    saveConductorId(decision.id, paneIds);
+    saveConductorId(scope, decision.id, paneIds);
     return null;
   }
-  saveConductorId(null, paneIds);
+  saveConductorId(scope, null, paneIds);
   return `Conductor was not restored: pane ${decision.id} is no longer open.`;
 }
 
@@ -241,3 +252,78 @@ export function seedCounter(ids: string[]): number {
   }
   return highest;
 }
+
+/**
+ * Whether this window must stop persisting its roster and conductor id.
+ *
+ * The roster is loaded once, against the project the window opened with, but
+ * saved on every pane change. Keying the save by whatever project is selected
+ * at the time would write panes launched under a second project into the first
+ * project's bucket, which is the contamination this scoping exists to stop;
+ * keying it by the startup project would record those same panes as belonging
+ * to a repository they were never opened in. Neither is a roster worth
+ * restoring, so once the selected project changes the window stops writing
+ * altogether and says so, leaving both projects' saved rosters and every live
+ * pane exactly as they are. A restart reloads against the newly selected
+ * project and persistence resumes there.
+ *
+ * Freezing is one-way for the life of the window. Returning to the startup
+ * project does not make the roster trustworthy again, because panes launched
+ * while the other project was selected are still in the list. Pure, so
+ * "a second project can never write into the first" can be checked without a
+ * live app.
+ */
+export function shouldFreezePersistence(
+  startupProject: string | null,
+  selectedProject: string | null,
+  alreadyFrozen: boolean,
+): boolean {
+  if (alreadyFrozen) return true;
+  return selectedProject !== startupProject;
+}
+
+/**
+ * What a window should do when the selected project changes: bind to the new
+ * project and keep persisting, or freeze.
+ *
+ * Binding is one narrow exception to the freeze, for the case the freeze
+ * otherwise breaks: a window that opened with no project at all, which is every
+ * first launch. There, "pick a project, then launch panes" is the ordinary path,
+ * and freezing on the pick would mean a first session's panes are never saved.
+ *
+ * Every one of these has to hold, and each rules out a way binding could lose
+ * something:
+ *
+ * - the window opened with no project, so there is no earlier project whose
+ *   roster this window is the live continuation of;
+ * - it has no panes, live or restored, and no conductor, so there is nothing
+ *   already on screen that belongs to the previous scope;
+ * - it has not frozen already, so this is not a second move;
+ * - and the destination is *provably* unused, so persisting into it cannot
+ *   overwrite a saved roster or strand a pre-scoping value it would otherwise
+ *   have adopted.
+ *
+ * `destinationUnused` is deliberately three-valued and only `true` will do.
+ * Storage that refused a read reports `null`, and an unknown destination is
+ * treated exactly like an occupied one.
+ *
+ * This is not a general live rebind. A window with panes on screen, or one that
+ * has already switched once, still freezes, and so does the A to B to A case.
+ */
+export function shouldBindToProject(
+  boundProject: string | null,
+  alreadyFrozen: boolean,
+  hasPanes: boolean,
+  hasConductor: boolean,
+  destinationUnused: boolean | null,
+): boolean {
+  if (boundProject !== null) return false;
+  if (alreadyFrozen) return false;
+  if (hasPanes || hasConductor) return false;
+  return destinationUnused === true;
+}
+
+/** Shown once the window has stopped persisting, until it is restarted. */
+export const FROZEN_PERSISTENCE_NOTICE =
+  "Project changed. Open sessions keep running, but this window has stopped " +
+  "saving its session list. Restart Pantheon to load the new project's sessions.";
