@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "id": "jz8nsh",
-  "rev": 3,
+  "rev": 7,
   "title": "Let the conductor open sessions, with human approval",
-  "status": "backlog",
+  "status": "review",
   "priority": "P2",
   "rank": 8000,
-  "done_when": "A conductor can request one named session kind, Pantheon shows the human the program, quota and worktree effects before spawning, only explicit approval starts it, denial starts nothing, a tested ceiling prevents request loops, and restored and newly created pane ids cannot collide (BACKLOG.md:549-569).",
+  "done_when": "A conductor can request one named session kind, Pantheon shows the human the program, quota and worktree effects before spawning, only explicit approval starts it, denial starts nothing, a tested ceiling prevents request loops, restored and newly created pane ids cannot collide, and the launch lifecycle holds under review: one gate orders commitment against Stop and context changes, the captured project is the selected project rather than its journal directory, exactly one approval may launch or settle, Started is recorded while the child runs, requester authority is rechecked at admission and commitment, the startup gate a claim installs survives the spawn that follows it rather than being deleted by note_session, and observed session removal is ordered against commitment through one lifecycle gate on SessionManager with a documented lock order, tested in both directions for explicit close and observed exit (BACKLOG.md:549-569).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:58Z",
-  "updated": "2026-08-28T02:29:47Z",
-  "status_changed": "2026-08-13T09:18:58Z"
+  "updated": "2026-09-08T03:21:06Z",
+  "status_changed": "2026-09-08T01:34:47Z"
 }

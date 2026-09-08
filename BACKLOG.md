@@ -688,6 +688,122 @@ This is a privilege escalation and needs treating as such:
 - Interaction with session restore, below: restored panes and
   conductor-created panes should not fight over ids.
 
+**Built on branch `work/session-requests`, not yet merged and not yet accepted
+live.** Every question above was answered the safer way. It is a request, never
+an autonomous action: `request_session` records an intent and starts nothing,
+and only a human `approve_session_request` reaches a spawn. The ceiling is two
+numbers rather than one, because they bound different failures: at most three
+requests may await a decision at once, and at most ten may be admitted in an
+app run. Validation runs before either is charged, so a malformed request costs
+nothing, and a denial does not refund the run total. The host is not
+caller-supplied: an approved request launches one of `claude`, `codex` or
+`opencode` from a table in the backend, pinned against the frontend's
+`SESSION_TYPES` by a test, so a request cannot become arbitrary process
+execution. The existing free-model guard applies at admission as well as at
+launch.
+
+The id fight with restore is settled by a barrier rather than by a convention.
+No id is issued until the frontend reports what it restored; that report raises
+the allocator's floor past every pane on screen and can never lower it, and a
+reserved id is never returned to the pool even when its launch fails, so no
+pane ever wears a dead pane's number.
+
+The part that took the most care is the gap between asking and approving, since
+a human decision is slow and everything can move while it is open. The world a
+request was made in is captured when it is made and rechecked at the moment of
+commitment: a Stop, a project switch (including a switch away and back, which
+leaves the path identical and everything else different), a conductor change, a
+requester that is no longer the conductor, a requester that has moved out of the
+`main` brain (including out and back), a respawned requester or a dead requester
+each settle the request as `Stale` rather than launching into a world it was not
+made for. Stop also settles every pending request as it lands, so resuming for
+an unrelated reason cannot revive one.
+
+An independent review of the first implementation found five defects in exactly
+this area, and they are worth recording because four of them were invisible from
+the tests that existed:
+
+- **Commitment was not ordered against the changes it checked for.** The epochs
+  were individually atomic, which is not the same property. A claim could read
+  `halted == false` and matching epochs, have Stop or a project switch complete,
+  and still reserve an id and write `Launching`. Admission had the mirror
+  problem, reading project A and then stamping B's epoch. There is now one
+  lifecycle gate, taken for write by every mutation that changes the world a
+  request was made in and for read across the coherent capture and the short
+  commit transition. Nothing slow runs under it.
+- **The captured project was the journal directory, not the project.** For
+  `/repo` the brain stores its markdown in `/repo/.pantheon/context`, and that
+  is the path a request captured and an approved agent was launched in. With no
+  project selected it captured the application's own data folder as though it
+  were a project. The selected project is now stored separately from its
+  storage, and the two move together; it cannot be recovered by stripping path
+  segments, because the legacy and default layouts differ.
+- **A repeat approval could mark a running session as failed.** The claim
+  returned the record, so a second Approve read back `Launching` and the command
+  could not tell that from having just won. It called the spawn helper again for
+  the same reserved id, the duplicate check refused, and that observed failure
+  settled a live launch as `Failed`. Exactly one caller now receives the launch
+  capability, and only that caller may spawn or settle.
+- **`Started` was recorded when the session ended.** Approval awaited the whole
+  spawn helper, which returns at EOF on the agent's output, so a healthy agent
+  sat in `Launching` for its entire life, three of them exhausted the
+  outstanding cap permanently, and the pane's startup record was written after
+  its handle had been removed, which let a running agent skip the first-dispatch
+  gate as though it were a manual pane. The child's existence and its output
+  forwarding are now separate: the request settles as soon as the process is
+  inserted, the pane is registered at the claim, and forwarding outlives the
+  command.
+- **Requester authority was proved before a slow probe and never rechecked.** A
+  conductor demoted during the model catalogue lookup still had its request
+  admitted with the new conductor's epoch, and every later epoch check matched.
+  Identity, liveness and brain membership are now rechecked at admission and at
+  commitment, under the gate.
+
+A second review of those corrections found two more, both in the same seam
+between claiming a request and starting its process:
+
+- **The spawn erased the startup gate it had just been given.** `spawn_session_
+  inner` calls `note_session` on its way to creating the PTY, and `note_session`
+  deleted the pane's startup record outright. That deletion was written for a
+  respawn, where a new incarnation must not inherit what the last one earned,
+  and it was correct about that and wrong about how to get it: a pane with no
+  record is read as a manual pane and admitted without any check at all. So it
+  ran on the first spawn too, between the claim that registered the pane and the
+  process existing, and every approved session was dispatchable from the instant
+  it was claimed. The record is now restarted rather than removed: `Starting`
+  again, unadmitted again, its clock reset, and still a pane a request created.
+  A test asserted the deletion, which is how it survived the first review; the
+  comment above that assertion described a restart.
+- **Session removal was not ordered against commitment.** The gate ordered
+  Stop, the project, the conductor and brain movement, but not the thing that
+  makes a pane stop being live. `claim_session_request` copied liveness,
+  released the engine's lock, and committed from that copy, so an explicit
+  close or an agent exit could complete in between and the claim would still
+  authorize a launch for a pane that was already gone. A first attempt at this
+  read liveness a second time just before committing, which narrows the window
+  and does not order anything; the review was explicit that it would not do.
+  The gate now lives on `SessionManager`, where both halves can reach it:
+  `Shared` borrows it through `gate()`, and both removal sites, explicit close
+  and observed exit, take it for write around the map removal. The lock order
+  is one line and documented on the field: lifecycle before sessions, before
+  requests, before every other state lock, never the reverse. A removal
+  therefore lands entirely before the claim's snapshot or entirely after it has
+  committed, and a commitment that won is not retroactively undone.
+
+  What that still cannot order is a process that simply dies, because nothing
+  holds a lock at the instant an OS reaps a child and the death is only noticed
+  the next time `liveness` reaches `try_wait`. Liveness is read once more for
+  that case, now inside the gate rather than after it, so the answer it acts on
+  is one no gated removal could have produced. The comment claiming the gate
+  excluded every such change has been corrected to say which ones it does.
+
+Still open: live acceptance. Nothing here has been run in the app. A
+request-created pane is reported `Starting` until its endpoint connects and
+refuses its first dispatch until then, with a 120-second deadline that records
+`ready_timeout` and deliberately kills nothing and starts no replacement, but
+whether an agent is genuinely ready to work is only knowable from an
+acknowledged first task, which needs a human at the keyboard.
+
 ## Guardrail: OpenCode sessions must stay on free OpenRouter models
 
 OpenRouter is configured with a real account, so an OpenCode pane can select a

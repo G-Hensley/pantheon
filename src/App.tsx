@@ -1,13 +1,22 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type DragEvent,
+} from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalPane } from "./components/TerminalPane";
+import { TerminalPane, type ExternalSession } from "./components/TerminalPane";
 import { SessionLauncher } from "./components/SessionLauncher";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ContextSidebar } from "./components/ContextSidebar";
 import { ConductorBar } from "./components/ConductorBar";
 import { DispatchDialog } from "./components/DispatchDialog";
 import { TaskDrawer } from "./components/TaskDrawer";
+import { SessionRequests } from "./components/SessionRequests";
 import { ToastContainer } from "./components/Toast";
 import {
   LayoutPanel,
@@ -22,11 +31,17 @@ import {
   haltConductor,
   setProject as setProjectDir,
   dispatchTask,
+  listSessionRequests,
+  reserveSessionId,
+  SESSION_TYPES,
   type SavedWorktree,
+  type SessionRequest,
   type SessionType,
-  type SessionWorktreeEvent,
 } from "./lib/ipc";
 import { useDispatchBudget } from "./lib/useDispatchBudget";
+import { useSessionRequests } from "./lib/useSessionRequests";
+import { useWorktreeEvents } from "./lib/useWorktreeEvents";
+import { useExitEvents } from "./lib/useExitEvents";
 import {
   FROZEN_PERSISTENCE_NOTICE,
   loadConductorId,
@@ -34,7 +49,6 @@ import {
   restoreConductor,
   saveConductorId,
   saveRoster,
-  seedCounter,
   shouldBindToProject,
   shouldFreezePersistence,
 } from "./lib/panes";
@@ -53,6 +67,17 @@ type Pane = {
   isolate: boolean;
   model?: string;
   worktree?: SavedWorktree;
+  // Set only for a pane installed by approving a session request: the
+  // channel the backend is already writing to, plus whatever it buffered
+  // before this pane existed. TerminalPane attaches to it instead of
+  // spawning. Never set for an ordinary human-launched or restored pane.
+  externalSession?: ExternalSession;
+  // Set once, at creation, when exitEvents.take found this session's own end
+  // already reported before this pane existed (see useExitEvents). Read only
+  // by TerminalPane's mount effect, never persisted — like `status`, this
+  // describes a specific process's run, not something a restored pane (a new
+  // process) should inherit.
+  alreadyExited?: boolean;
 };
 
 function App() {
@@ -87,6 +112,32 @@ function App() {
   // so one bad pane is a message rather than a silently missing agent.
   const [restoreProblems, setRestoreProblems] = useState<string[]>(() => roster.problems);
   const restoredIds = useRef(new Set(roster.panes.map((p) => p.id)));
+  // Every session id this window has taken ownership of a pane for, recorded
+  // at the moment that decision is made rather than when React commits it.
+  // This is what tells a `session-worktree` or `session-exited` listener
+  // whether to apply its event to a pane or retain it for a pane that does not
+  // exist yet, and it deliberately answers a different question than "is there
+  // a pane in `panes` right now":
+  //
+  //   - `installRequestPane` decides to install a pane and enqueues that
+  //     update; an event for the same session can arrive before React has
+  //     committed it. The committed array still has no such pane, but the
+  //     update that adds it is already queued ahead of the event's own update,
+  //     so applying is correct and retaining would strand the event on a pane
+  //     that is about to exist and will never call `take` again.
+  //   - Ids are added and never removed. An event for a pane the user has
+  //     since closed is then dropped rather than retained forever for a pane
+  //     that is not coming back, which is what we want: this window did own it.
+  //
+  // This retains one id per owned pane for this window's lifetime. It avoids
+  // retaining late event payloads, but is not a constant-space history.
+  //
+  // Seeded from the roster, whose panes are already in the initial `panes`
+  // state before the first render.
+  const ownedPaneIds = useRef(new Set(roster.panes.map((p) => p.id)));
+  // Stable for the life of the window, so the listener effects that depend on
+  // it register once and are never torn down and re-registered.
+  const isPaneOwned = useCallback((sessionId: string) => ownedPaneIds.current.has(sessionId), []);
   // The conductor pane recorded before this app was last closed, if any. Read
   // once alongside the roster: restoring the role only makes sense against
   // the exact set of panes that roster is about to spawn.
@@ -152,11 +203,26 @@ function App() {
   // to cover the current run; persisting it would grow an unbounded id list in
   // localStorage to re-answer a question this ref already answers.
   const appStartedAt = useRef(Date.now());
-  // Past the highest restored id: restored panes keep the ids they had, and a
-  // counter starting from zero would hand a new session an id that is already
-  // live, which the backend refuses.
-  const counter = useRef(seedCounter(roster.panes.map((p) => p.id)));
   const dragId = useRef<string | null>(null);
+  // The session-requests slice: last list snapshot, plus the ticketed
+  // initialize/approve/deny/reset calls. See useSessionRequests.ts.
+  const sessionRequests = useSessionRequests();
+  const [sessionRequestsOpen, setSessionRequestsOpen] = useState(false);
+  // Every request currently mid-approval, not just one: a single scalar here
+  // would have the second row's approve() call clobber the first row's still-
+  // in-flight "Approving…" state the moment a human opens a second request
+  // while the first has not resolved yet, even though each row's own approval
+  // is independently correct at the hook level (see useSessionRequests' own
+  // per-request reservation). A Set, not an array: membership is all this is
+  // ever queried for.
+  const [approvingRequestIds, setApprovingRequestIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [approveRequestError, setApproveRequestError] = useState<string | null>(null);
+  const [resetRequestsPending, setResetRequestsPending] = useState(false);
+  // False until initialize_sessions (called once below, with the exact
+  // restored roster ids) has resolved. Approve/deny/new-session all wait on
+  // this: admitting anything before the backend has seen the full restored
+  // set risks a fresh id colliding with one that is about to come back.
+  const allocatorReady = sessionRequests.list.allocator_ready;
 
   // Put each restored pane's agent back in the brain it belonged to. The panes
   // themselves are already in state (and spawning); this is the half of
@@ -183,6 +249,19 @@ function App() {
     });
     // Runs once, against the roster and saved conductor captured before the
     // first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The restore-id barrier: tell the backend allocator every pane id this
+  // window is about to restore, so it can never hand out (or admit a
+  // session-request approval into) one of them. Every roster id qualifies,
+  // whether or not its spawn goes on to succeed — this list is fixed before
+  // any of those spawns resolve, which already gives it the failed restores
+  // the barrier needs. Called once, even when the roster is empty, since
+  // approve/deny/reset/addSession all wait on allocator_ready flipping true.
+  useEffect(() => {
+    sessionRequests.initialize([...restoredIds.current]).catch(() => {});
+    // Runs once, against the roster captured before the first render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -218,19 +297,25 @@ function App() {
     );
   }, [conductor, panes, persistenceFrozen, scope]);
 
-  // The backend reports which worktree an isolated session actually got, once it
-  // is live. Recording it is what lets the next launch return the pane to that
-  // worktree instead of stranding it — an abandoned worktree can hold
+  // The backend reports which worktree an isolated session actually got, once
+  // it is live. Recording it is what lets the next launch return the pane to
+  // that worktree instead of stranding it — an abandoned worktree can hold
   // uncommitted agent work that nothing in the app would point at any more.
-  useEffect(() => {
-    const unlisten = listen<SessionWorktreeEvent>("session-worktree", (ev) => {
-      const { sessionId, ...worktree } = ev.payload;
-      setPanes((p) => p.map((x) => (x.id === sessionId ? { ...x, worktree } : x)));
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
+  // For a manual launch the event always concerns a session this window has
+  // already claimed (see addSession) and is applied directly; for a
+  // requested/approved session it routinely arrives before that claim (see
+  // useWorktreeEvents/PendingWorktrees), so `installRequestPane` and
+  // `addSession` both call `worktreeEvents.take` for their own session id
+  // before adding the pane.
+  const worktreeEvents = useWorktreeEvents(setPanes, isPaneOwned);
+
+  // A requested/approved session can exit before its own approval RPC ever
+  // resolves — TerminalPane's own session-exited listener does not register
+  // until it mounts, which for that flow is well after the process could
+  // already be gone. See useExitEvents/PendingExits for why this needs the
+  // same event-before-pane handling as the worktree case just above, rather
+  // than leaving a genuinely dead session looking like it is still running.
+  const exitEvents = useExitEvents(setPanes, isPaneOwned);
 
   // A pane that never started. Only reported for restored panes: a session the
   // user just launched by hand has their attention already, and the failure is
@@ -288,6 +373,33 @@ function App() {
     // identity (see useDispatchBudget's own useCallback), so listing them
     // here does not cause this effect to re-run on every render.
   }, [dispatchBudget.beginRead, dispatchBudget.applySnapshot]);
+
+  // Same pattern as conductor-state above, applied to the session-request
+  // queue: a poll plus the change event, both routed through the ticketed
+  // applySnapshot so a slow read from before a reset or the restore barrier
+  // can never land over what came after it.
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      const ticket = sessionRequests.beginRead();
+      try {
+        const snapshot = await listSessionRequests();
+        if (alive) sessionRequests.applySnapshot(snapshot, ticket);
+      } catch {
+        /* backend not ready */
+      }
+    };
+    refresh();
+    const unlisten = listen("session-requests-changed", refresh);
+    const poll = setInterval(refresh, 3000);
+    return () => {
+      alive = false;
+      clearInterval(poll);
+      unlisten.then((f) => f());
+    };
+    // sessionRequests.beginRead/.applySnapshot have a stable identity (see
+    // useSessionRequests' own useCallback).
+  }, [sessionRequests.beginRead, sessionRequests.applySnapshot]);
 
   async function toggleConductor(id: string) {
     const next = conductor === id ? null : id;
@@ -347,9 +459,30 @@ function App() {
   }, [panes]);
 const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
 
-  function addSession(type: SessionType, isolate = false, model?: string) {
-    const id = `sess-${++counter.current}`;
-    setPanes((p) => [...p, { id, type, status: "running", brain: "main", isolate, model }]);
+  // Manual launches mint their id from the same backend allocator a
+  // request-approved pane draws from (reserve_session_id), never a local
+  // counter, so the two sources can never hand out the same id. Refused
+  // outright before the restore barrier resolves — see allocatorReady.
+  async function addSession(type: SessionType, isolate = false, model?: string) {
+    if (!allocatorReady) return;
+    let id: string;
+    try {
+      id = await reserveSessionId();
+    } catch {
+      return;
+    }
+    // Claimed before anything is taken or enqueued, and in the same
+    // uninterrupted run of synchronous code as the `setPanes` below, so no
+    // event for this id can be seen while the claim is only half made.
+    ownedPaneIds.current.add(id);
+    // Always empty/false in practice for both of these: the id was minted a
+    // moment ago and nothing has been spawned under it yet, so neither event
+    // can have happened. Taking them here rather than assuming that keeps
+    // every pane-adding path going through the same recovery, not just the
+    // ones that actually need it.
+    const worktree = worktreeEvents.take(id);
+    const alreadyExited = exitEvents.take(id);
+    setPanes((p) => [...p, { id, type, status: "running", brain: "main", isolate, model, worktree, alreadyExited }]);
     setAgentBrain(id, "main").catch(() => {});
     setLauncherOpen(false);
   }
@@ -358,6 +491,127 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
     killSession(id).catch(() => {});
     setPanes((p) => p.filter((x) => x.id !== id));
     setFocusedPane((focused) => (focused === id ? null : focused));
+  }
+
+  // ---- Session requests (approve/deny/reset) ----
+  // Installs a pane from an authoritative SessionRequest — never from
+  // anything captured before an approval RPC, and never from the human's own
+  // edited-model input directly. A repeated or racing approval can settle on
+  // an accepted model, brain or kind different from what this particular
+  // call asked for (the backend may have normalized the edit, or this call
+  // may have lost a race to an earlier one that already claimed the
+  // request), and the pane must reflect what was actually committed. Refuses
+  // to install a second pane for a session id that already has one, so a
+  // retried or passively-reconciled approval can never duplicate a pane the
+  // first attempt (or a concurrent one) already installed.
+  // A `session-worktree` or `session-exited` event for this exact session
+  // may already have arrived and found no pane to land on: the backend can
+  // report either — a live isolated worktree, or the process already having
+  // ended — strictly before the approval RPC this pane is installed from
+  // ever resolves (see useWorktreeEvents and useExitEvents). Recovering both
+  // here, before the pane is built, is what keeps that ordering from
+  // silently stranding an isolated request's actual worktree, or installing
+  // an already-dead session as though it were still running.
+  function installRequestPane(request: SessionRequest, attachment: ExternalSession) {
+    const type = SESSION_TYPES.find((t) => t.id === request.kind);
+    const sessionId = request.session_id;
+    if (!type || !sessionId) {
+      setApproveRequestError(`Unknown session kind "${request.kind}" for request ${request.request_id}.`);
+      return;
+    }
+    // Claimed here, at the decision, not at the commit: the `setPanes` below
+    // is queued, and an event for this session arriving before React runs it
+    // belongs to the pane that update is about to produce. Idempotent, so a
+    // repeated or racing approval for the same session changes nothing.
+    ownedPaneIds.current.add(sessionId);
+    const worktree = worktreeEvents.take(sessionId);
+    const alreadyExited = exitEvents.take(sessionId);
+    setPanes((p) => {
+      if (p.some((pane) => pane.id === sessionId)) return p;
+      return [
+        ...p,
+        {
+          id: sessionId,
+          type,
+          status: "running",
+          brain: request.brain,
+          isolate: request.isolate,
+          model: request.model,
+          externalSession: attachment,
+          worktree,
+          alreadyExited,
+        },
+      ];
+    });
+    setAgentBrain(sessionId, request.brain).catch(() => {});
+  }
+
+  // Keep request mutations behind the restore barrier. In particular, reset's
+  // read-ticket barrier must not invalidate the initialization snapshot.
+  // Handler checks complement the disabled controls.
+  async function handleApproveRequest(requestId: string, editedModel: string | null) {
+    if (!allocatorReady) return;
+    setApprovingRequestIds((prev) => {
+      const next = new Set(prev);
+      next.add(requestId);
+      return next;
+    });
+    setApproveRequestError(null);
+    // No terminal exists yet to size this from — TerminalPane fits and
+    // resizes it for real the moment the pane mounts, same as it does for a
+    // manual launch's own initial guess.
+    const result = await sessionRequests.approve(requestId, editedModel, 24, 80);
+    setApprovingRequestIds((prev) => {
+      if (!prev.has(requestId)) return prev;
+      const next = new Set(prev);
+      next.delete(requestId);
+      return next;
+    });
+    if (!result.ok) {
+      setApproveRequestError(result.error);
+      return;
+    }
+    installRequestPane(result.request, { channel: result.channel, buffered: result.buffered });
+  }
+
+  // A previously uncertain approval (its RPC rejected, and neither its own
+  // fallback poll nor any poll since could yet prove Started or a terminal
+  // failure) that a later snapshot — this session's own regular poll, most
+  // likely — has now confirmed Started, with no further click required. The
+  // attachment's channel is the exact one the backend was already handed;
+  // installRequestPane's session-id dedup is what keeps this from racing a
+  // concurrent manual retry into two panes for the same session.
+  useEffect(() => {
+    if (sessionRequests.readyAttachments.length === 0) return;
+    for (const ready of sessionRequests.readyAttachments) {
+      installRequestPane(ready.request, { channel: ready.channel, buffered: ready.buffered });
+    }
+    sessionRequests.consumeReady(sessionRequests.readyAttachments.map((r) => r.request.request_id));
+    // installRequestPane closes over state setters only (setPanes/setAgentBrain
+    // are stable, setApproveRequestError's identity doesn't need to retrigger
+    // this); reacting to readyAttachments itself is the whole point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionRequests.readyAttachments]);
+
+  async function handleDenyRequest(requestId: string) {
+    if (!allocatorReady) return;
+    try {
+      await sessionRequests.deny(requestId);
+    } catch (err) {
+      setApproveRequestError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleResetRequests() {
+    if (!allocatorReady) return;
+    setResetRequestsPending(true);
+    try {
+      await sessionRequests.reset();
+    } catch (err) {
+      setApproveRequestError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResetRequestsPending(false);
+    }
   }
 
   useEffect(() => {
@@ -528,7 +782,22 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
         >
           Appearance
         </button>
-        <button className="primary" onClick={() => setLauncherOpen(true)}>
+        <button
+          className={"ghost" + (sessionRequestsOpen ? " on" : "")}
+          onClick={() => setSessionRequestsOpen(true)}
+          title="Session requests from agents, pending your approval"
+        >
+          Session requests
+          {sessionRequests.list.outstanding > 0 && (
+            <span className="badge">{sessionRequests.list.outstanding}</span>
+          )}
+        </button>
+        <button
+          className="primary"
+          onClick={() => setLauncherOpen(true)}
+          disabled={!allocatorReady}
+          title={allocatorReady ? undefined : "Restoring session state…"}
+        >
           + New session <kbd>Ctrl Shift K</kbd>
         </button>
       </header>
@@ -603,7 +872,12 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
                 Open live agents in panes, then drag them together — onto each
                 other or a brain in the sidebar — to share context.
               </div>
-              <button className="primary" onClick={() => setLauncherOpen(true)}>
+              <button
+                className="primary"
+                onClick={() => setLauncherOpen(true)}
+                disabled={!allocatorReady}
+                title={allocatorReady ? undefined : "Restoring session state…"}
+              >
                 + New session <kbd>Ctrl Shift K</kbd>
               </button>
             </div>
@@ -679,6 +953,9 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
                      onExit={markExited}
                      onIsolationChange={setPaneIsolation}
                      onSpawnError={noteSpawnFailure}
+                     externalSession={p.externalSession}
+                     startupState={sessionRequests.list.startups.find((s) => s.pane === p.id)?.state}
+                     alreadyExited={p.alreadyExited}
                    />
                 </section>
               );
@@ -735,6 +1012,21 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
           onFocusPane={(id) => {
             setFocusedPane(id);
             setTasksOpen(false);
+          }}
+        />
+      )}
+      {sessionRequestsOpen && (
+        <SessionRequests
+          list={sessionRequests.list}
+          onApprove={handleApproveRequest}
+          approvingIds={approvingRequestIds}
+          approveError={approveRequestError}
+          onDeny={handleDenyRequest}
+          onReset={handleResetRequests}
+          resetPending={resetRequestsPending}
+          onClose={() => {
+            setSessionRequestsOpen(false);
+            setApproveRequestError(null);
           }}
         />
       )}

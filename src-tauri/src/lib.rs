@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -500,6 +500,32 @@ pub struct SessionManager {
     /// Serialize ConPTY openpty+spawn: concurrent spawns can stall a PTY pipe on
     /// Windows, so only one session is created at a time.
     spawn_lock: Mutex<()>,
+    /// The one lifecycle gate, ordering every change to the world a session
+    /// request captured against the moment that request commits to a launch.
+    ///
+    /// It lives here rather than on `mcp::Shared` because both sides of that
+    /// ordering have to reach it and only one of them owns the other: `Shared`
+    /// holds an `Arc<SessionManager>`, never the reverse. `Shared::gate`
+    /// borrows this, so there is one boundary rather than two that agree by
+    /// convention. Writers are the world changes (`set_selected_project`,
+    /// `try_set_room`, `set_conductor`, `set_halted`, `note_session`) plus the
+    /// two observed session removals below; the reader is the claim, which
+    /// holds it across its coherent capture and its commit transition.
+    ///
+    /// Lock order, and the whole of it: `lifecycle` is taken before `sessions`,
+    /// before `requests`, and before every other state lock. Nothing takes it
+    /// while holding any of them. `admit_request_pane_dispatch` releasing
+    /// `request_panes` before touching the engine is the same rule seen from
+    /// the other end.
+    pub(crate) lifecycle: RwLock<()>,
+    /// Which panes a test says are running.
+    ///
+    /// Here rather than on `mcp::Shared` so that `kill` below removes from the
+    /// same table a claim reads, under the same gate, in the same order. A
+    /// table the tests could edit without passing through this removal would
+    /// prove the ordering of a code path that does not exist.
+    #[cfg(test)]
+    pub(crate) test_live_panes: Mutex<std::collections::HashSet<String>>,
 }
 
 fn report_worktree_cleanup(worktree: &worktree::Worktree) {
@@ -582,7 +608,23 @@ impl Drop for SpawnRollback {
 
 impl SessionManager {
     fn kill(&self, id: &str) {
-        let handle = self.sessions.lock().unwrap().remove(id);
+        // Removing the handle is what makes this pane stop counting as live, so
+        // it is a change to the world a pending request captured and it is
+        // ordered like every other one. A claim reads liveness and commits
+        // under the same gate, so an explicit close lands either entirely
+        // before that read or entirely after the request has committed, and
+        // never in between where the claim would authorize a launch for a pane
+        // the user had already closed.
+        //
+        // Scoped to the map removal alone. The kill, the headless cleanup and
+        // the worktree teardown below are slow and must not run under a gate
+        // every claim needs.
+        let handle = {
+            let _gate = self.lifecycle.write().unwrap();
+            #[cfg(test)]
+            self.test_live_panes.lock().unwrap().remove(id);
+            self.sessions.lock().unwrap().remove(id)
+        };
         let cleanup = self.kill_headless_for_pane(id);
         if let Some(mut h) = handle {
             let _ = h.child.kill();
@@ -736,12 +778,21 @@ impl SessionManager {
         self.run_headless_registered(id, brief, budget_usd, timeout, |_| {})
     }
 
-    pub(crate) fn headless_activity_age_ms(&self, id: &str) -> Option<u64> {
+    /// How long since this session last produced output, if it is live.
+    ///
+    /// Not headless-specific despite where it started: `last_output` is kept
+    /// for every session, and the startup admission check for a
+    /// request-created interactive pane needs exactly this number.
+    pub(crate) fn output_age_ms(&self, id: &str) -> Option<u64> {
         self.sessions
             .lock()
             .unwrap()
             .get(id)
             .map(|h| mono_ms().saturating_sub(h.last_output.load(Ordering::Acquire)))
+    }
+
+    pub(crate) fn headless_activity_age_ms(&self, id: &str) -> Option<u64> {
+        self.output_age_ms(id)
     }
 
     pub(crate) fn run_headless_registered(
@@ -1444,14 +1495,73 @@ struct SessionWorktree {
 /// Fails closed on isolation: if `isolate` was requested and no worktree could be
 /// created, this returns `SpawnErrorKind::IsolationUnavailable` and starts
 /// nothing, rather than silently running the session in the shared project dir.
+/// The Tauri entry point for a manual launch from the launcher.
+///
+/// Thin on purpose: the whole implementation lives in `spawn_session_inner` so
+/// an approved session request reaches exactly the same process setup, worktree
+/// isolation and rollback behavior rather than a second copy of it. See
+/// `approve_session_request`.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn spawn_session(
     app: AppHandle,
     state: State<'_, Arc<SessionManager>>,
     mcp: State<'_, McpInfo>,
     shared: State<'_, Arc<mcp::Shared>>,
     session_id: String,
-    channel: Channel<&[u8]>,
+    // `Vec<u8>` rather than `&[u8]`: `Channel<TSend>` holds `PhantomData<TSend>`,
+    // so a borrowed element type ties the channel to the command's input
+    // lifetime and it cannot then be moved into the background task an approved
+    // launch needs. Both serialize identically, so the wire format is unchanged.
+    channel: Channel<Vec<u8>>,
+    program: String,
+    args: Vec<String>,
+    rows: u16,
+    cols: u16,
+    cwd: Option<String>,
+    isolate: Option<bool>,
+    reuse_worktree: Option<worktree::Saved>,
+    model: Option<String>,
+    model_flag: Option<String>,
+) -> Result<(), SpawnError> {
+    spawn_session_inner(
+        app,
+        state.inner().clone(),
+        mcp.inner().clone(),
+        shared.inner().clone(),
+        session_id,
+        channel,
+        program,
+        args,
+        rows,
+        cols,
+        cwd,
+        isolate,
+        reuse_worktree,
+        model,
+        model_flag,
+        // A manual launch has nobody to tell: its caller *is* the frontend that
+        // asked for it, and it already knows.
+        None,
+    )
+    .await
+}
+
+/// The one launch implementation, shared by the manual and approved paths.
+///
+/// Returns when the session ends, not when it starts, which is what the manual
+/// path wants: the command's completion is the session's exit. An approved
+/// launch cannot use that as its success signal, because the request would sit
+/// in `Launching` for the agent's entire life and its pane would never be
+/// registered in time to be gated. `launched` is that earlier signal.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_session_inner(
+    app: AppHandle,
+    state: Arc<SessionManager>,
+    mcp: McpInfo,
+    shared: Arc<mcp::Shared>,
+    session_id: String,
+    channel: Channel<Vec<u8>>,
     program: String,
     args: Vec<String>,
     rows: u16,
@@ -1468,6 +1578,9 @@ async fn spawn_session(
     // Comes from the frontend's SessionType definition so there's a single
     // source of truth for which CLI uses which flag.
     model_flag: Option<String>,
+    // Fired once the child exists and its handle is inserted, before output
+    // forwarding begins. Everything after that point is the session's lifetime.
+    launched: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), SpawnError> {
     // Refuse a session id that is already live. Inserting over one would replace
     // the handle without killing the process or removing its worktree, orphaning
@@ -1522,7 +1635,7 @@ async fn spawn_session(
     // forgotten. Sessions sharing one endpoint would all authenticate as
     // "unknown", which silently breaks brain assignment and the conductor.
     let (mcp_args, mcp_env, endpoint) =
-        match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
+        match mcp::start_session_server(shared.clone(), session_id.clone()) {
             Ok(server) => {
                 let url = format!("http://127.0.0.1:{}/mcp", server.port);
                 let token = server.token.clone();
@@ -1630,6 +1743,15 @@ async fn spawn_session(
         let _ = app.emit("session-worktree", event);
     }
 
+    // The child is running and its handle is in the map: the launch has
+    // succeeded, whatever the session goes on to do. Reported here rather than
+    // by returning, because everything below is the session's whole life. A
+    // dropped sender means this function is about to return an error instead,
+    // and the receiver reads that as the failure it is.
+    if let Some(tx) = launched {
+        let _ = tx.send(());
+    }
+
     // Blocking reads on their own thread → async forward loop via mpsc.
     // Bound each session's pending output to roughly 512 KiB. Backpressure here
     // is preferable to six unbounded queues consuming memory when WebView2 is
@@ -1663,7 +1785,7 @@ async fn spawn_session(
                 Err(_) => break,
             }
         }
-        if channel.send(&bytes[..]).is_err() {
+        if channel.send(bytes).is_err() {
             break;
         }
     }
@@ -1673,15 +1795,299 @@ async fn spawn_session(
     // Worktree without removing it and leave the session's MCP listener serving,
     // stranding a directory, a branch, and a port for every session that wasn't
     // closed by hand.
-    let handle = state.sessions.lock().unwrap().remove(&session_id);
-    let cleanup = state.kill_headless_for_pane(&session_id);
-    if let Some(h) = handle {
-        release_after_headless(session_id.clone(), h, cleanup);
-    }
+    release_exited_session(&state, &session_id);
     // If an explicit kill removed the handle, it owns cleanup, possibly after
     // a headless child's termination grace. Do not remove its config early.
     let _ = app.emit("session-exited", &session_id);
     Ok(())
+}
+
+/// Tear down a session that ended on its own.
+///
+/// A named function rather than a tail of the forwarding loop because the
+/// ordering it performs has to be testable, and the loop needs a real PTY. An
+/// agent that quits or crashes stops being live here, which is a change to the
+/// world a pending request captured, so the removal takes the lifecycle gate
+/// exactly as `SessionManager::kill` does: a request captured before it must
+/// not commit a launch for the pane afterwards.
+///
+/// Gate scope is the map removal alone. The headless cleanup and the worktree
+/// teardown below it are slow and must not run under a gate every claim needs.
+fn release_exited_session(state: &SessionManager, session_id: &str) {
+    let handle = {
+        let _gate = state.lifecycle.write().unwrap();
+        #[cfg(test)]
+        state.test_live_panes.lock().unwrap().remove(session_id);
+        state.sessions.lock().unwrap().remove(session_id)
+    };
+    let cleanup = state.kill_headless_for_pane(session_id);
+    if let Some(h) = handle {
+        release_after_headless(session_id.to_string(), h, cleanup);
+    }
+}
+
+/// How a requested host is launched: program, fixed arguments, and the flag it
+/// takes a model with.
+///
+/// The frontend has its own copy of this in `SESSION_TYPES` (src/lib/ipc.ts)
+/// and passes it in for a manual launch. An approved request cannot work that
+/// way: the packet requires the backend to own the launch so the UI never
+/// re-resolves the host after approval, and a caller-supplied program would
+/// turn a bounded request for one of three agent CLIs into arbitrary process
+/// execution. So the three hosts are named here, and
+/// `requested_host_matches_frontend_definitions` pins this table against the
+/// frontend's so the two cannot drift apart silently.
+fn requested_host(kind: &str) -> Option<(&'static str, Vec<String>, &'static str)> {
+    match kind {
+        "claude" => Some(("claude", Vec::new(), "--model")),
+        "codex" => Some(("codex", Vec::new(), "-m")),
+        "opencode" => Some(("opencode", Vec::new(), "-m")),
+        _ => None,
+    }
+}
+
+/// Read the queue and its bounds for the request panel.
+#[tauri::command]
+fn list_session_requests(shared: State<'_, Arc<mcp::Shared>>) -> mcp::SessionRequestList {
+    shared.session_request_list()
+}
+
+/// Complete the restore barrier.
+///
+/// The frontend calls this once, at mount, with every pane id it put on screen,
+/// including ones whose spawn then failed. Until it returns, no launch of
+/// either kind may proceed, because a restored pane and a new launch could
+/// otherwise be handed the same `sess-N`.
+#[tauri::command]
+fn initialize_sessions(
+    shared: State<'_, Arc<mcp::Shared>>,
+    restored_ids: Vec<String>,
+) -> mcp::SessionRequestList {
+    shared.initialize_sessions(&restored_ids)
+}
+
+/// Reserve an id for a manual launch, from the same allocator the approved path
+/// uses so the two cannot collide.
+#[tauri::command]
+fn reserve_session_id(shared: State<'_, Arc<mcp::Shared>>) -> Result<String, String> {
+    shared.reserve_session_id()
+}
+
+/// Resolve a request without starting anything.
+#[tauri::command]
+fn deny_session_request(
+    shared: State<'_, Arc<mcp::Shared>>,
+    request_id: String,
+) -> Result<mcp::SessionRequest, String> {
+    shared.deny_session_request(&request_id)
+}
+
+/// Clear the run's request allowance, keeping pending and launching work.
+#[tauri::command]
+fn reset_session_requests(shared: State<'_, Arc<mcp::Shared>>) -> mcp::SessionRequestList {
+    shared.reset_session_requests()
+}
+
+/// Record an approved launch's outcome as soon as the child exists.
+///
+/// Split out from the command so this ordering can be tested without a PTY or
+/// an `AppHandle`, because the ordering is the whole fix. On success it records
+/// `Started` having awaited only the launch signal and never the forwarding
+/// that follows it. Awaiting the spawn helper instead, as this used to, meant
+/// waiting for the *session* to end: an approved agent stayed `Launching` for
+/// its entire life, its pane was registered only after its handle had already
+/// been removed, and three healthy agents held the outstanding cap forever.
+async fn settle_approved_launch(
+    shared: &Arc<mcp::Shared>,
+    request_id: &str,
+    launched: tokio::sync::oneshot::Receiver<()>,
+    failed: tokio::sync::oneshot::Receiver<String>,
+) {
+    match launched.await {
+        // The child is running. Everything still to come is its lifetime.
+        Ok(()) => shared.settle_session_launch(request_id, Ok(())),
+        // The sender was dropped, so the launch failed before insertion. Wait
+        // for the observed error rather than inventing one: `Failed` is only
+        // ever written from a failure that actually happened.
+        Err(_) => {
+            let detail = failed
+                .await
+                .unwrap_or_else(|_| "the launch ended without reporting a result".to_string());
+            shared.settle_session_launch(request_id, Err(detail));
+        }
+    }
+}
+
+/// Approve one request and perform its single launch.
+///
+/// The human's Approve action is the only thing that starts a session, and this
+/// is the only command that can start one from a request. The frontend creates
+/// the PTY output `Channel` and passes it in, exactly as it already does for
+/// `spawn_session`, so no second launch command or post-approval attach is
+/// needed.
+///
+/// Order matters here and is deliberate:
+///
+/// 1. A model the human edited is revalidated *before* commitment, outside any
+///    state lock, because a catalogue probe can be slow.
+/// 2. `claim_session_request` then makes the one atomic transition under the
+///    lifecycle gate, rechecking the captured project, conductor identity and
+///    epoch, brain, requester generation, liveness and Stop at that moment. A
+///    second Approve, or an Approve racing a Deny, reads back the settled
+///    record *without* the launch capability and cannot reach the spawn below.
+/// 3. Only the caller holding `launch_authorized` spawns, and it spawns with
+///    the parameters captured in the request rather than anything read now.
+/// 4. `Started` is recorded when the child exists, not when it exits. The
+///    forwarding of its output outlives this command, in a task of its own.
+///
+/// The returned record is authoritative: the UI installs pane state from it and
+/// never re-resolves the project, host or session id afterwards.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn approve_session_request(
+    app: AppHandle,
+    state: State<'_, Arc<SessionManager>>,
+    mcp_info: State<'_, McpInfo>,
+    shared: State<'_, Arc<mcp::Shared>>,
+    request_id: String,
+    edited_model: Option<String>,
+    // See `spawn_session`: `Vec<u8>` so the channel is not tied to this
+    // command's input lifetime and can move into the forwarding task.
+    channel: Channel<Vec<u8>>,
+    rows: u16,
+    cols: u16,
+) -> Result<mcp::SessionRequest, String> {
+    let shared = shared.inner().clone();
+    let shared_for_launch = shared.clone();
+    let state = state.inner().clone();
+    let mcp_info = mcp_info.inner().clone();
+    let pending = shared.session_request_list();
+    let Some(request) = pending
+        .requests
+        .iter()
+        .find(|r| r.request_id == request_id)
+        .cloned()
+    else {
+        return Err(format!("{request_id}: NotFoundOrExpired"));
+    };
+    let Some((program, args, model_flag)) = requested_host(&request.kind) else {
+        return Err(format!("unknown host '{}'", request.kind));
+    };
+
+    // A human edit has not been through admission's validation, so it is
+    // checked here, before commitment and outside every state lock.
+    if let Some(model) = edited_model.as_deref() {
+        if model.trim().is_empty() || model.len() > 256 || model.chars().any(|c| c.is_control()) {
+            return Err(
+                "the edited model is empty, oversized or contains control characters".to_string(),
+            );
+        }
+        if request.kind == "opencode" {
+            opencode_model_guard(Some(model))?;
+        }
+        if request.kind != "claude" {
+            match list_models(request.kind.clone()) {
+                Ok(models) if models.iter().any(|m| m == model) => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "{} does not list a model called '{model}'",
+                        request.kind
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "could not read {}'s model catalogue: {e}",
+                        request.kind
+                    ))
+                }
+            }
+        }
+    }
+
+    let claim = shared.claim_session_request(&request_id, edited_model.as_deref())?;
+    if !claim.launch_authorized {
+        // Denied, stale, or already claimed by another Approve. Nothing to do
+        // and, importantly, nothing started and nothing settled. A repeat
+        // Approve that reached the spawn helper used to collide with the first
+        // launch's reserved id, and that observed duplicate settled a request
+        // whose process was running perfectly well as `Failed`.
+        return Ok(claim.request);
+    }
+    let claimed = claim.request;
+    let Some(session_id) = claimed.session_id.clone() else {
+        return Err(format!(
+            "{request_id} was claimed without a reserved session id"
+        ));
+    };
+
+    // Two signals rather than one return value, because the helper returns when
+    // the *session* ends. `launched` fires once the child exists and its handle
+    // is inserted; `failed` carries the real error when it never got that far.
+    let (launched_tx, launched_rx) = tokio::sync::oneshot::channel::<()>();
+    let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<String>();
+
+    // Output forwarding and teardown outlive this command deliberately. The
+    // frontend already has the channel, and the session's exit is reported the
+    // way it always has been, by `session-exited`.
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = spawn_session_inner(
+            app,
+            state,
+            mcp_info,
+            shared_for_launch,
+            session_id,
+            channel,
+            program.to_string(),
+            args,
+            rows,
+            cols,
+            // The project captured when the request was made, never a selection
+            // read again now.
+            claimed.project.clone(),
+            Some(claimed.isolate),
+            None,
+            Some(claimed.model.clone()),
+            Some(model_flag.to_string()),
+            Some(launched_tx),
+        )
+        .await
+        {
+            let _ = failed_tx.send(format!("{e:?}"));
+        }
+    });
+
+    // Settling runs in a task of its own, and this command waits for it rather
+    // than doing it. The difference matters when the command's future is
+    // dropped, which a frontend disconnect or a window closing can do at any
+    // await: settling inline would leave a running session recorded as
+    // `Launching` for the rest of the run, holding a slot against the
+    // outstanding cap, which is the same shape as the defect this replaces.
+    //
+    // `Failed` is written only from an observed backend failure. A frontend RPC
+    // timeout never reaches that path, which is why the UI is told to poll the
+    // request rather than resubmit it. The launch failure is recorded on the
+    // request and reported through it, not raised as a command error: the
+    // request is the authoritative account of what happened.
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel::<()>();
+    let shared_for_settle = shared.clone();
+    let request_for_settle = request_id.clone();
+    tauri::async_runtime::spawn(async move {
+        settle_approved_launch(
+            &shared_for_settle,
+            &request_for_settle,
+            launched_rx,
+            failed_rx,
+        )
+        .await;
+        let _ = settled_tx.send(());
+    });
+    let _ = settled_rx.await;
+    shared
+        .session_request_list()
+        .requests
+        .into_iter()
+        .find(|r| r.request_id == request_id)
+        .ok_or_else(|| format!("{request_id}: NotFoundOrExpired"))
 }
 
 #[tauri::command]
@@ -1737,14 +2143,23 @@ fn default_context_dir() -> PathBuf {
 /// Called by the frontend on startup (from the remembered project) and on pick.
 #[tauri::command]
 fn set_project(shared: State<'_, Arc<mcp::Shared>>, path: Option<String>) {
-    let dir = match path {
+    // Both values, together, and never one derived from the other. The storage
+    // directory for `/repo` is `/repo/.pantheon/context`, or the migrated
+    // `.mosaic` equivalent, and with nothing selected it is a folder under the
+    // app's own data. Those layouts differ, so the project cannot be recovered
+    // from the storage path by stripping segments -- which is why capturing
+    // storage as the project launched approved agents into the journal folder.
+    match path {
         Some(p) if !p.is_empty() => {
             let root = PathBuf::from(p);
-            migrate_legacy_dir(root.join(".pantheon"), root.join(".mosaic")).join("context")
+            let storage =
+                migrate_legacy_dir(root.join(".pantheon"), root.join(".mosaic")).join("context");
+            shared.set_selected_project(Some(root), storage);
         }
-        _ => default_context_dir(),
-    };
-    shared.set_dir(dir);
+        // No project selected. The app data context directory is where the
+        // brain writes, not a project, and a request made now captures `None`.
+        _ => shared.set_selected_project(None, default_context_dir()),
+    }
 }
 
 #[tauri::command]
@@ -1929,7 +2344,13 @@ pub fn run() {
             project_is_repo,
             init_project_repo,
             list_models,
-            human_dispatch
+            human_dispatch,
+            list_session_requests,
+            initialize_sessions,
+            reserve_session_id,
+            approve_session_request,
+            deny_session_request,
+            reset_session_requests
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1959,11 +2380,11 @@ mod tests {
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
         list_models, migrate_legacy_dir, opencode_model_guard, parse_and_filter_codex_models,
-        parse_and_filter_models, ready_to_submit, resolve_isolation, run_with_timeout,
-        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, ActiveHeadless,
-        IsolationReason, SessionManager, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV,
-        SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS,
-        SUBMIT_QUIET_MS,
+        parse_and_filter_models, ready_to_submit, requested_host, resolve_isolation,
+        run_with_timeout, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
+        ActiveHeadless, IsolationReason, SessionManager, SpawnErrorKind, SpawnRollback,
+        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
     use std::process::Command;
@@ -3069,6 +3490,76 @@ mod tests {
             "took {:?}, should have returned around the 200ms deadline, \
              not waited out the backgrounded sleep",
             started.elapsed()
+        );
+    }
+
+    /// The backend's launch table must say the same thing as the frontend's.
+    ///
+    /// Duplication the backend cannot avoid: an approved request has to be
+    /// launched without trusting a caller-supplied program, so the three hosts
+    /// are named in Rust, while a manual launch still comes from the
+    /// frontend's `SESSION_TYPES`. Two tables that disagree would launch the
+    /// same requested host two different ways depending on how it was started,
+    /// and nothing else in either build would notice. `include_str!` is what
+    /// makes this a compile-time dependency: move or rename that file and this
+    /// stops building rather than silently passing.
+    #[test]
+    fn requested_host_matches_frontend_definitions() {
+        const IPC_TS: &str = include_str!("../../src/lib/ipc.ts");
+
+        fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+            let start = line.find(&format!("{name}: \""))? + name.len() + 3;
+            let rest = &line[start..];
+            Some(&rest[..rest.find('"')?])
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        for line in IPC_TS.lines() {
+            let Some(id) = field(line, "id") else {
+                continue;
+            };
+            let Some(program) = field(line, "program") else {
+                continue;
+            };
+            match requested_host(id) {
+                Some((expected_program, expected_args, expected_flag)) => {
+                    assert_eq!(
+                        program, expected_program,
+                        "{id}: frontend launches '{program}', backend launches '{expected_program}'"
+                    );
+                    assert_eq!(
+                        field(line, "modelFlag"),
+                        Some(expected_flag),
+                        "{id}: the two disagree about how a model is passed"
+                    );
+                    assert!(
+                        line.contains("args: []"),
+                        "{id}: the frontend passes fixed arguments the backend does not"
+                    );
+                    assert!(
+                        expected_args.is_empty(),
+                        "{id}: the backend passes fixed arguments the frontend does not"
+                    );
+                    seen.push(id.to_string());
+                }
+                None => assert!(
+                    !crate::mcp::REQUESTABLE_KINDS.contains(&id),
+                    "{id} is requestable but has no backend launch definition"
+                ),
+            }
+        }
+
+        // Both directions: every requestable kind was actually found in the
+        // frontend file, so a parse that silently matched nothing still fails.
+        for kind in crate::mcp::REQUESTABLE_KINDS {
+            assert!(
+                seen.iter().any(|id| id == kind),
+                "{kind} is requestable but absent from SESSION_TYPES"
+            );
+        }
+        assert!(
+            requested_host("shell").is_none(),
+            "a plain shell is not a requestable agent host"
         );
     }
 }
