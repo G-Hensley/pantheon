@@ -28,15 +28,18 @@ import {
 } from "./lib/ipc";
 import { useDispatchBudget } from "./lib/useDispatchBudget";
 import {
+  FROZEN_PERSISTENCE_NOTICE,
   loadConductorId,
   loadRoster,
   restoreConductor,
   saveConductorId,
   saveRoster,
   seedCounter,
+  shouldBindToProject,
+  shouldFreezePersistence,
 } from "./lib/panes";
 import { brainColorMap } from "./lib/brains";
-import { readStored, writeStored } from "./lib/storage";
+import { projectScope, scopeIsUnused, readStored, writeStored } from "./lib/storage";
 import "./App.css";
 
 // PaneStatus type removed as it's unused after Pane type cleanup
@@ -53,9 +56,27 @@ type Pane = {
 };
 
 function App() {
+  // The project this window opened with. Read once: it is both the initial
+  // selection and the scope every roster read and write is keyed by, and the
+  // two must agree even after the selection changes underneath them.
+  const startupProject = useRef<string | null>(
+    (() => {
+      try {
+        return readStored("project");
+      } catch {
+        return null;
+      }
+    })(),
+  ).current;
+  // The project this window persists to, and the scope derived from it. State
+  // rather than a constant because of the one binding case in
+  // `shouldBindToProject`: a window that opened with nothing may adopt the
+  // first project picked. Every other project change freezes instead.
+  const [boundProject, setBoundProject] = useState<string | null>(startupProject);
+  const [scope, setScope] = useState(() => projectScope(startupProject));
   // The panes that were open when the app was last closed. Read once, before the
   // first render, so the CLIs come back with the window instead of after it.
-  const [roster] = useState(loadRoster);
+  const [roster] = useState(() => loadRoster(scope));
   // A restored pane is spawned fresh, so it starts "running" whatever it was
   // doing last time; the spawn corrects it if the CLI never comes up.
   const [panes, setPanes] = useState<Pane[]>(() =>
@@ -69,7 +90,7 @@ function App() {
   // The conductor pane recorded before this app was last closed, if any. Read
   // once alongside the roster: restoring the role only makes sense against
   // the exact set of panes that roster is about to spawn.
-  const savedConductorId = useRef(loadConductorId()).current;
+  const savedConductorId = useRef(loadConductorId(scope)).current;
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [layoutOpen, setLayoutOpen] = useState(false);
@@ -102,13 +123,10 @@ function App() {
   });
   const [selectedBrain, setSelectedBrain] = useState("main");
   // The git repo sessions run in. Isolated sessions get worktrees of it.
-  const [project, setProject] = useState<string | null>(() => {
-    try {
-      return readStored("project");
-    } catch {
-      return null;
-    }
-  });
+  const [project, setProject] = useState<string | null>(startupProject);
+  // Set once the selected project has changed, which stops this window writing
+  // a roster that would belong to neither project. See shouldFreezePersistence.
+  const [persistenceFrozen, setPersistenceFrozen] = useState(false);
   // Which pane (if any) is the conductor. Owned by the app, never self-claimed.
   const [conductor, setConductorName] = useState<string | null>(null);
   const [conductorTasks, setConductorTasks] = useState<import("./lib/ipc").ConductorTask[]>([]);
@@ -160,7 +178,7 @@ function App() {
   // spawn is caught separately, in `noteSpawnFailure` below, once that
   // failure is actually known.
   useEffect(() => {
-    restoreConductor(savedConductorId, roster.panes.map((p) => p.id)).then((notice) => {
+    restoreConductor(scope, savedConductorId, roster.panes.map((p) => p.id)).then((notice) => {
       if (notice) setRestoreProblems((problems) => [...problems, notice]);
     });
     // Runs once, against the roster and saved conductor captured before the
@@ -173,7 +191,9 @@ function App() {
   // restored pane is a new process, so its state is whatever the new spawn
   // reports.
   useEffect(() => {
+    if (persistenceFrozen) return;
     saveRoster(
+      scope,
       panes.map((p) => ({
         id: p.id,
         typeId: p.type.id,
@@ -183,18 +203,20 @@ function App() {
         worktree: p.worktree,
       })),
     );
-  }, [panes]);
+  }, [panes, persistenceFrozen, scope]);
 
   // Persist the conductor id alongside the roster, so a relaunch can restore
   // the role. Keyed on both conductor and panes: a promote or demote changes
   // the id itself, and a pane closing can take the conductor's own pane with
   // it, in which case it must not be left pointing at a pane that is gone.
   useEffect(() => {
+    if (persistenceFrozen) return;
     saveConductorId(
+      scope,
       conductor,
       panes.map((p) => p.id),
     );
-  }, [conductor, panes]);
+  }, [conductor, panes, persistenceFrozen, scope]);
 
   // The backend reports which worktree an isolated session actually got, once it
   // is live. Recording it is what lets the next launch return the pane to that
@@ -288,6 +310,24 @@ function App() {
       });
       if (typeof dir === "string") {
         setProject(dir);
+        // An empty window that opened with no project may bind to the first
+        // project picked and go on persisting there. Anything else freezes.
+        // Both are batched with setProject, so the persist effects below act on
+        // the new scope, or stop, on the same render the project arrives on.
+        if (
+          shouldBindToProject(
+            boundProject,
+            persistenceFrozen,
+            panes.length > 0,
+            conductor !== null,
+            scopeIsUnused(projectScope(dir)),
+          )
+        ) {
+          setBoundProject(dir);
+          setScope(projectScope(dir));
+        } else {
+          setPersistenceFrozen((frozen) => shouldFreezePersistence(boundProject, dir, frozen));
+        }
         try {
           writeStored("project", dir);
         } catch {
@@ -493,13 +533,19 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
         </button>
       </header>
 
-      {restoreProblems.length > 0 && (
+      {(restoreProblems.length > 0 || persistenceFrozen) && (
         <div className="restore-problem" role="status">
-          <span>{restoreProblems.join(" · ")}</span>
+          <span>
+            {[...restoreProblems, ...(persistenceFrozen ? [FROZEN_PERSISTENCE_NOTICE] : [])].join(
+              " · ",
+            )}
+          </span>
           <div className="spacer" />
-          <button className="ghost" onClick={() => setRestoreProblems([])}>
-            Dismiss
-          </button>
+          {restoreProblems.length > 0 && (
+            <button className="ghost" onClick={() => setRestoreProblems([])}>
+              Dismiss
+            </button>
+          )}
         </div>
       )}
 
