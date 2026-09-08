@@ -137,6 +137,39 @@ runs dependency, secret, and static-analysis scanners on pull requests.
   unrelated files or another session's untracked or uncommitted work pulled
   in.
 
+## Filing a work item
+
+The `Work item` issue form (`.github/ISSUE_TEMPLATE/work-item.yml`) asks for seven short
+sections: What, Why, Scope, `### Done when`, Validation, Dependencies and decisions, and
+Links, all required. The form is copied verbatim from Lexicon's
+[`integration-library/github-tracking/`](https://github.com/G-Hensley/lexicon/tree/main/integration-library/github-tracking)
+(`README.md`, [`body-contract.md`](https://github.com/G-Hensley/lexicon/blob/main/integration-library/github-tracking/body-contract.md)),
+which is the source of the contract and stays authoritative for it. Start from the
+[Markdown scaffold](https://github.com/G-Hensley/lexicon/blob/d2b422aaade79b7544d26dff2d4e7e36451980eb/integration-library/github-tracking/templates/work-item-body.md)
+and use its companion
+[authoring checker](https://github.com/G-Hensley/lexicon/blob/d2b422aaade79b7544d26dff2d4e7e36451980eb/integration-library/github-tracking/work_item_check.py).
+These links pin the adopted version. Use a Lexicon checkout containing that revision or a
+later version of the same contract; the integration folder links to maintained sources.
+
+Filing through the browser uses the form directly. Filing through `gh issue create --body-file`
+(or `gh issue edit --body-file`) has to reproduce the same seven headings by hand, using
+`integration-library/github-tracking/templates/work-item-body.md` in a Lexicon checkout as the
+scaffold. Before running `gh issue create` or `gh issue edit`, validate the body structurally:
+
+```bash
+LEXICON_CHECKOUT=/path/to/lexicon
+python "$LEXICON_CHECKOUT/integration-library/github-tracking/work_item_check.py" \
+  --body-file /tmp/issue-body.md
+```
+
+That check confirms the seven headings are present and not left as placeholder text; it cannot
+judge whether the content is adequate, which is what review is still for.
+
+This form carries no `Priority` or `Status` field, and adopting it changes nothing about which
+tracker is authoritative: this repository's `.tasks/` tracker stays the source of truth until
+an explicit cutover is decided, and no Project stage or priority mirror belongs in the issue
+body.
+
 ## Code style
 
 - Rust: no repo-wide `rustfmt.toml` or `clippy.toml` yet; match the style of
