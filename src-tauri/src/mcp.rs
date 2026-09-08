@@ -830,12 +830,459 @@ impl Notifier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conductor-requested sessions (task jz8nsh)
+//
+// A conductor can ask for a session; only the human starts one. The request is
+// admitted, bounded and held here, and the launch happens later, from the UI,
+// through one backend command that owns validation, ID reservation and spawning.
+//
+// The whole design problem is the gap between admitting a request and launching
+// it. The human takes seconds or minutes to decide, and in that window the
+// project can change, Stop can land, the conductor can move to another pane,
+// and the requesting pane can die or be respawned. Anything captured at request
+// time can therefore be stale at approval time, so every request carries the
+// identity of the world it was made in and that identity is rechecked at the
+// moment of commitment. A request whose world moved is `Stale`, never launched
+// against the new one.
+//
+// Lock discipline, because this has to interleave with the delivery machinery
+// above. The two epochs are atomics and the generation map is a leaf mutex, so
+// the commitment path never needs a second lock while holding `requests`, and
+// there is no order to get wrong. `requests` and `allocator` are held only
+// across short state changes and never across a spawn, a catalogue probe or an
+// event emission.
+
+/// Concurrent `Pending` plus `Launching` requests. Small on purpose: this is a
+/// queue of things a human has to read and decide on, not a work buffer.
+pub const MAX_OUTSTANDING_REQUESTS: usize = 3;
+
+/// Total requests admitted per app run, until a human reset. Bounds the whole
+/// feature for the lifetime of the process the way `MAX_DISPATCHES` does.
+pub const MAX_ADMITTED_REQUESTS: u32 = 10;
+
+/// Terminal records kept for reading back. Evicting the oldest terminal record
+/// loses the ability to say what became of it, which is why
+/// `session_request_status` answers `NotFoundOrExpired` rather than claiming an
+/// unknown ID was never issued: distinguishing the two would need a tombstone
+/// per ID for the life of the process.
+pub const MAX_TERMINAL_REQUESTS: usize = 64;
+
+const MAX_REASON_BYTES: usize = 512;
+const MAX_MODEL_BYTES: usize = 256;
+
+/// The hosts a request may name. Deliberately literal rather than derived from
+/// a catalogue: these are the three agent CLIs the app already knows how to
+/// wire, and a request cannot introduce a fourth.
+pub const REQUESTABLE_KINDS: [&str; 3] = ["claude", "codex", "opencode"];
+
+/// Where a request is in its life.
+///
+/// `Pending -> Launching -> Started | Failed`, or `Pending -> Denied | Stale`.
+/// `Launching` already carries the reserved session id, so a crash between
+/// reservation and spawn cannot hand that id to anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestState {
+    Pending,
+    Launching,
+    Started,
+    Failed,
+    Denied,
+    Stale,
+}
+
+impl RequestState {
+    /// Whether this state can still change. Only non-terminal records count
+    /// against the outstanding cap, and only terminal records may be evicted.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Pending | Self::Launching)
+    }
+}
+
+/// One admitted request, with the identity of the world it was made in.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionRequest {
+    pub request_id: String,
+    pub kind: String,
+    pub model: String,
+    /// False when the model could not be checked against a catalogue and is
+    /// going through on the human's judgement instead. The UI must show it as
+    /// unverified; nothing here claims it exists.
+    pub model_verified: bool,
+    pub reason: String,
+    pub isolate: bool,
+    /// The canonical project directory captured at request time, not whatever
+    /// is selected when the human clicks Approve.
+    pub project: Option<String>,
+    pub brain: String,
+    pub requester: String,
+    pub state: RequestState,
+    pub session_id: Option<String>,
+    pub detail: Option<String>,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    /// Captured identity, rechecked at commitment. Not shown to the UI: it
+    /// answers "is this still the same world", which is a backend question.
+    #[serde(skip)]
+    pub project_epoch: u64,
+    #[serde(skip)]
+    pub conductor_epoch: u64,
+    #[serde(skip)]
+    pub requester_generation: u64,
+    /// How many times the requester's brain had been assigned when the request
+    /// was made. Compared at commitment so a conductor that moves out of
+    /// `main` cannot still have its request launched, including the
+    /// away-and-back case that leaves `brain` reading `main` again.
+    #[serde(skip)]
+    pub requester_room_generation: u64,
+}
+
+/// The outcome of trying to claim a request, and whether this caller may act.
+///
+/// Two callers can reach a claim for the same request: a second Approve, or an
+/// Approve racing a Deny. Both are answered with the authoritative record, and
+/// exactly one is given `launch_authorized`.
+#[derive(Clone, Debug)]
+pub struct RequestClaim {
+    pub request: SessionRequest,
+    /// True only for the caller whose call moved the record from `Pending` to
+    /// `Launching`. Only that caller may invoke the spawn helper, and only that
+    /// caller may settle the result. Every other caller has started nothing, so
+    /// it has nothing to report and must not overwrite what the winner records.
+    pub launch_authorized: bool,
+}
+
+/// Everything the human UI needs to render the queue and its bounds.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionRequestList {
+    pub requests: Vec<SessionRequest>,
+    /// Startup state for panes these requests created, so the UI can show
+    /// `Starting`, `Connected` or `ready_timeout` without a second round trip.
+    pub startups: Vec<StartupRecord>,
+    pub outstanding: usize,
+    pub admitted: u32,
+    pub outstanding_limit: usize,
+    pub admitted_limit: u32,
+    /// False until the frontend has completed the restore barrier. No launch,
+    /// manual or requested, may proceed before that.
+    pub allocator_ready: bool,
+}
+
+/// The admitted requests, their opaque ID source, and the run's admission count.
+#[derive(Default)]
+struct RequestStore {
+    requests: Vec<SessionRequest>,
+    /// Monotonic for the life of the process, and deliberately not reset by a
+    /// human allowance reset: a request ID must never name two different
+    /// requests, or a status poll answers about the wrong one.
+    next_id: u64,
+    admitted: u32,
+}
+
+/// Session id reservation, shared by manual and requested launches.
+///
+/// Starts uninitialized. The frontend restores its panes first and registers
+/// every id it put on screen, including ones whose spawn failed, and only then
+/// may anything launch. Without that barrier a restored pane and a new launch
+/// can be handed the same `sess-N`, which the engine refuses, and the new pane
+/// never starts.
+struct Allocator {
+    ready: bool,
+    /// The next number to issue. Only ever raised.
+    next: u64,
+}
+
+impl Default for Allocator {
+    /// Closed, and pointing at `sess-1`. Zero is not a session id, so the
+    /// derived default would hand out `sess-0` on a first run with nothing to
+    /// restore.
+    fn default() -> Self {
+        Self {
+            ready: false,
+            next: 1,
+        }
+    }
+}
+
+impl Allocator {
+    /// Raise the floor past every id already on screen and open the gate.
+    ///
+    /// Idempotent and never lowering: a second call with a shorter list cannot
+    /// walk the floor back down onto ids already issued.
+    fn initialize(&mut self, ids: &[String]) {
+        let highest = ids.iter().filter_map(|id| parse_session_number(id)).max();
+        if let Some(highest) = highest {
+            self.next = self.next.max(highest.saturating_add(1));
+        }
+        self.ready = true;
+    }
+
+    /// Reserve the next id, or say why not.
+    ///
+    /// A reserved id is never handed out again, whatever becomes of the launch
+    /// that took it: a failed spawn does not return its number to the pool,
+    /// because a later pane wearing a dead pane's id is exactly the confusion
+    /// the reservation exists to prevent.
+    fn reserve(&mut self) -> Result<String, String> {
+        if !self.ready {
+            return Err(
+                "sessions are still being restored; try again once restore finishes".to_string(),
+            );
+        }
+        // `next` is the id to hand out, not the last one handed out. Reading it
+        // before incrementing is what makes the first id after restoring
+        // sess-1 and sess-2 be sess-3 rather than skipping to sess-4.
+        let n = self.next;
+        // Checked before handing `n` out, so `u64::MAX` itself is never
+        // issued. That loses exactly one number out of 2^64, and the
+        // alternative is a second piece of state tracking exhaustion for a
+        // case no run can reach. Refusing early is the safer half of the
+        // trade: it cannot hand the same number out twice.
+        self.next = n
+            .checked_add(1)
+            .ok_or_else(|| "session id space is exhausted for this app run".to_string())?;
+        Ok(format!("sess-{n}"))
+    }
+}
+
+/// Whether a requested model can be shown to the human as catalogue-proven.
+///
+/// Returns `Ok(true)` when the host's own catalogue lists it, `Ok(false)` when
+/// there is no catalogue to check it against, and an error when the catalogue
+/// was readable and does not contain it. The middle case is the Claude one:
+/// there is no model list to query, so a bounded custom string may proceed as
+/// a visibly **unverified** selection for the human to judge. It is never
+/// reported as verified, because nothing here proved it exists.
+fn verify_requested_model(kind: &str, model: &str) -> Result<bool, String> {
+    match kind {
+        "claude" => Ok(false),
+        "codex" | "opencode" => match crate::list_models(kind.to_string()) {
+            Ok(models) if models.iter().any(|m| m == model) => Ok(true),
+            Ok(models) if models.is_empty() => Err(format!(
+                "{kind}'s model catalogue came back empty, so '{model}' cannot be checked; \
+                 validation is unavailable rather than negative"
+            )),
+            Ok(_) => Err(format!("{kind} does not list a model called '{model}'")),
+            Err(e) => Err(format!("could not read {kind}'s model catalogue: {e}")),
+        },
+        _ => Err(format!("unknown host '{kind}'")),
+    }
+}
+
+/// The number in a `sess-N` id, if it is one.
+fn parse_session_number(id: &str) -> Option<u64> {
+    id.strip_prefix("sess-")?.parse().ok()
+}
+
+/// How long a request-created pane may go without connecting before the app
+/// records `ready_timeout`.
+///
+/// Recording it kills nothing and starts no replacement. A process that has
+/// not spoken yet is not a process known to be dead, and the honest thing to
+/// report is that it has not connected, not that it failed.
+pub const REQUEST_PANE_READY_TIMEOUT_MS: u64 = 120_000;
+
+/// Startup label for a pane a session request created.
+///
+/// None of these is a claim about model readiness. `Connected` means the pane
+/// reached its MCP endpoint, which is the strongest thing the app can actually
+/// observe; whether the agent inside is ready to take work is only known from
+/// an acknowledged first task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupState {
+    Starting,
+    Connected,
+    ReadyTimeout,
+}
+
+/// What the app knows about one request-created pane's startup.
+#[derive(Clone, Debug, Serialize)]
+pub struct StartupRecord {
+    pub pane: String,
+    pub state: StartupState,
+    /// Whether this pane has already accepted a dispatch. After the first one
+    /// the pane behaves like any manual pane, so the extra check stops
+    /// applying: it is a startup gate, not a permanent restriction.
+    pub admitted: bool,
+    pub launched_ms: u64,
+    pub connected_ms: Option<u64>,
+}
+
+/// The label for a pane, from what has been observed about it.
+///
+/// Kept pure and derived rather than stored, so a pane that connects late
+/// still reads as `Connected` after a `ready_timeout` was reported. The
+/// timeout is an observation about a moment, not a verdict the pane is stuck
+/// with.
+fn startup_label(connected_ms: Option<u64>, launched_ms: u64, now_ms: u64) -> StartupState {
+    if connected_ms.is_some() {
+        return StartupState::Connected;
+    }
+    if now_ms.saturating_sub(launched_ms) >= REQUEST_PANE_READY_TIMEOUT_MS {
+        StartupState::ReadyTimeout
+    } else {
+        StartupState::Starting
+    }
+}
+
+/// Whether a request-created pane may take its first dispatch yet.
+///
+/// Two separate reasons to refuse, kept distinct because they need different
+/// things from the user: an unconnected pane may simply need more time, while
+/// a pane still producing output would lose the bytes typed into it. Reusing
+/// `HEADLESS_QUIET_MS` here is deliberate, and it is a heuristic: a quiet
+/// terminal is evidence the CLI finished booting, not proof the model will
+/// answer.
+fn startup_admission(
+    pane: &str,
+    state: StartupState,
+    already_admitted: bool,
+    output_age_ms: Option<u64>,
+) -> Result<(), String> {
+    if already_admitted {
+        return Ok(());
+    }
+    match state {
+        StartupState::Starting => Err(format!(
+            "pane {pane} was started from a session request and has not connected to its endpoint yet. Wait for it, then dispatch again."
+        )),
+        StartupState::ReadyTimeout => Err(format!(
+            "pane {pane} has not connected within {}s of being started from a session request. Nothing was killed and no replacement was started, so it may still connect; dispatch again if it does.",
+            REQUEST_PANE_READY_TIMEOUT_MS / 1000
+        )),
+        StartupState::Connected => {
+            let quiet = crate::headless::HEADLESS_QUIET_MS;
+            match output_age_ms {
+                Some(age) if age >= quiet => Ok(()),
+                _ => Err(format!(
+                    "pane {pane} connected but is still producing output. Wait for {}s of quiet before its first dispatch.",
+                    quiet / 1000
+                )),
+            }
+        }
+    }
+}
+
+/// Why a request cannot be committed, or `None` when the world it was made in
+/// is still the world it would launch into.
+///
+/// Pure, so every branch is checkable without a PTY, a spawned process or a
+/// running app. That matters more here than anywhere else in this feature:
+/// these are exactly the conditions that are awkward to reproduce by hand and
+/// easy to get silently wrong, and a launch into the wrong project is not
+/// something the user can see until after it has happened.
+#[allow(clippy::too_many_arguments)]
+fn request_staleness(
+    request: &SessionRequest,
+    halted: bool,
+    project_epoch: u64,
+    conductor_epoch: u64,
+    current_conductor: Option<&str>,
+    requester_room: &str,
+    requester_room_generation: u64,
+    requester_generation: u64,
+    requester_live: bool,
+) -> Option<String> {
+    if halted {
+        return Some("Stop was pressed before this request was approved".to_string());
+    }
+    if request.project_epoch != project_epoch {
+        return Some("the project changed after this request was made".to_string());
+    }
+    if request.conductor_epoch != conductor_epoch {
+        return Some("the conductor changed after this request was made".to_string());
+    }
+    // Epoch equality cannot establish this. The epoch says the role has not
+    // moved since capture; it says nothing about whether the pane that
+    // captured it held the role at the time. A demotion during the catalogue
+    // probe, before admission stamped the epoch, produces a request with a
+    // perfectly current epoch and a requester who is not the conductor.
+    if current_conductor != Some(request.requester.as_str()) {
+        return Some(format!(
+            "pane {} is no longer the conductor",
+            request.requester
+        ));
+    }
+    if requester_room != request.brain {
+        return Some(format!(
+            "pane {} was in brain '{}' when this request was made and is now in '{requester_room}'",
+            request.requester, request.brain
+        ));
+    }
+    // And the away-and-back case, which the name comparison above reads as
+    // unchanged. Status already refuses such a request; without this, approval
+    // would still launch one the requester can no longer even read.
+    if request.requester_room_generation != requester_room_generation {
+        return Some(format!(
+            "pane {} was moved between brains after this request was made",
+            request.requester
+        ));
+    }
+    if request.requester_generation != requester_generation {
+        return Some(format!(
+            "pane {} was respawned after this request was made",
+            request.requester
+        ));
+    }
+    if !requester_live {
+        return Some(requester_gone_detail(&request.requester));
+    }
+    None
+}
+
+/// The one staleness reason above that the lifecycle gate does not hold still.
+///
+/// Named here because it is decided twice, before and after commitment, and two
+/// copies of the sentence would eventually stop being the same sentence.
+fn requester_gone_detail(requester: &str) -> String {
+    format!("pane {requester} is no longer running")
+}
+
+/// Reject a field that is empty, oversized, or carries control characters.
+///
+/// Never truncates. A silently shortened model name would launch a different
+/// agent than the one the human read and approved.
+fn check_request_field(label: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if value.len() > max {
+        return Err(format!(
+            "{label} is {} bytes, over the {max}-byte limit; shorten it rather than relying on truncation",
+            value.len()
+        ));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{label} contains control characters"));
+    }
+    Ok(())
+}
+
 /// The shared store: one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
     app: Notifier,
     /// Where entries are mirrored as markdown. Follows the picked project, so it
     /// changes at runtime rather than being fixed at startup.
     dir: Mutex<PathBuf>,
+    /// The canonical project directory the human picked, or `None` when no
+    /// project has been chosen.
+    ///
+    /// Distinct from `dir`, and the distinction is load-bearing. `dir` is
+    /// where this project's journal is written: for `/repo` that is
+    /// `/repo/.pantheon/context`, and with no project at all it is a folder
+    /// under the app's own data directory. Capturing `dir` as a session
+    /// request's project launched approved agents into the journal folder
+    /// instead of the repository, and turned "no project selected" into a
+    /// request carrying the app data path as though it were a project.
+    ///
+    /// Not recoverable from `dir` by stripping segments: legacy `.mosaic` and
+    /// default app-data storage have different layouts, so the number of
+    /// segments to strip is not knowable from the path. Both are therefore
+    /// stored, and `set_selected_project` moves them together under the
+    /// lifecycle gate so a request can never capture one without the other.
+    project: Mutex<Option<PathBuf>>,
     /// Distinguish a brain first loaded after restart from an in-app round trip.
     loaded_dirs: Mutex<HashSet<PathBuf>>,
     /// A worker's registration and source journal must not move mid-write.
@@ -889,6 +1336,37 @@ pub struct Shared {
     pane_delivery: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     headless_running: Mutex<HashMap<String, String>>,
     headless_reported: Mutex<HashSet<String>>,
+    /// Conductor-requested sessions awaiting or past a human decision.
+    /// Held only across short state changes, never across a spawn.
+    requests: Mutex<RequestStore>,
+    /// Startup state for panes a session request created, keyed by pane id. A
+    /// leaf: nothing is taken while it is held.
+    request_panes: Mutex<HashMap<String, StartupRecord>>,
+    /// Session id reservation for every launch path, manual or requested.
+    allocator: Mutex<Allocator>,
+    /// pane -> how many times its brain assignment has been set.
+    ///
+    /// Per-pane rather than one global epoch on purpose: `set_room` runs on
+    /// every spawn, so a global counter would stale every pending request
+    /// whenever any unrelated pane started. Comparing the brain *name* at
+    /// commitment is not enough on its own either, because a conductor that
+    /// moves out of `main` and back arrives at the same string through two
+    /// context changes.
+    pane_room_generation: Mutex<HashMap<String, u64>>,
+    /// Bumped by `set_dir` on every change, including an A-to-B-to-A return,
+    /// so "the project is the same string again" is not mistaken for "the
+    /// project never moved". An atomic rather than a mutex so the commitment
+    /// path can recheck it while holding `requests` with no lock order to get
+    /// wrong.
+    project_epoch: std::sync::atomic::AtomicU64,
+    /// Bumped by `set_conductor`. A request made by a pane that is no longer
+    /// the conductor is stale, whoever holds the role now.
+    conductor_epoch: std::sync::atomic::AtomicU64,
+    /// pane -> how many times it has connected. `note_session` bumps it, so a
+    /// respawned pane wearing the same id is a different generation and cannot
+    /// inherit a request the previous incarnation made. Leaf lock: nothing is
+    /// acquired while it is held.
+    pane_generation: Mutex<HashMap<String, u64>>,
     /// A test-only pause point, absent from every non-test build (the field
     /// does not exist at all outside `#[cfg(test)]`, so this costs nothing
     /// in production). `hit_test_seam` calls the hook, if one is set, at a
@@ -903,6 +1381,10 @@ pub struct Shared {
     /// entrance, or a sleep assumed long enough for another thread to reach
     /// a lock, both let the unfixed code pass by accident when the OS
     /// schedules the two threads sequentially instead of concurrently.
+    /// Test-only stand-in for pane liveness, so the commitment path can be
+    /// exercised without a real PTY. Absent from non-test builds entirely, the
+    /// same way `test_seam` is.
+    #[cfg(test)]
     #[cfg(test)]
     test_seam: Mutex<Option<TestSeam>>,
 }
@@ -1147,7 +1629,49 @@ impl Shared {
     /// dir does not read back the previous project's CLI once the new one
     /// loads. See `merge_live_identity` for the rule itself and why it is a
     /// pure helper rather than inline here.
+    /// Move storage with no project selected.
+    ///
+    /// Test-only since `set_project` began passing both values through
+    /// `set_selected_project`. Production has no caller that knows a storage
+    /// directory without also knowing whether a project was picked, and adding
+    /// one back is how the two drifted apart in the first place.
+    #[cfg(test)]
     pub fn set_dir(&self, dir: PathBuf) {
+        // Storage moved with no project selected. The app's own data directory
+        // is where the brain writes before a project is picked; it is not a
+        // project and must not be reported as one.
+        self.set_selected_project(None, dir);
+    }
+
+    /// Move the selected project and its journal storage together.
+    ///
+    /// The two are separate values and the gate is what makes them one change.
+    /// Admission captures the project and the epoch that dates it, so a switch
+    /// landing between those two reads is exactly the tear this closes: a
+    /// request holding project A with B's epoch passes every later staleness
+    /// check and launches an agent into the wrong directory.
+    ///
+    /// Only the two captured values are under the gate. Loading the new
+    /// project's journal, sweeping panes and emitting are all slower and all
+    /// stay outside it.
+    pub fn set_selected_project(&self, project: Option<PathBuf>, storage: PathBuf) {
+        {
+            let _gate = self.gate().write().unwrap();
+            *self.project.lock().unwrap() = project.map(|p| fs::canonicalize(&p).unwrap_or(p));
+            // Unconditional, and deliberately not compared against the current
+            // project: a switch away and back leaves the same path but a
+            // different world, and anything captured before it is stale.
+            self.bump_project_epoch();
+        }
+        self.load_project_storage(storage);
+    }
+
+    /// The canonical project directory, or `None` when none is selected.
+    pub fn selected_project(&self) -> Option<PathBuf> {
+        self.project.lock().unwrap().clone()
+    }
+
+    fn load_project_storage(&self, dir: PathBuf) {
         let dir = fs::canonicalize(&dir).unwrap_or(dir);
         let store_gate = self.store_gate.write().unwrap();
         let mut brain = load_brain(&dir);
@@ -1207,12 +1731,36 @@ impl Shared {
     /// so re-homing a running agent takes effect on its next tool call.
     fn try_set_room(&self, name: &str, room: &str) -> Result<(), String> {
         validate_path_component("room", room)?;
-        self.name_to_room
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), room.to_string());
+        {
+            // Under the gate, and counted per pane. A request captures the
+            // requester's brain *and* how many times it had been assigned, so
+            // a conductor that leaves `main` cannot have its pending request
+            // approved afterwards, including when it comes back and the brain
+            // name alone reads unchanged.
+            let _gate = self.gate().write().unwrap();
+            *self
+                .pane_room_generation
+                .lock()
+                .unwrap()
+                .entry(name.to_string())
+                .or_insert(0) += 1;
+            self.name_to_room
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), room.to_string());
+        }
         self.app.emit("context-changed");
         Ok(())
+    }
+
+    /// How many times this pane's brain has been assigned.
+    fn room_generation_of(&self, pane: &str) -> u64 {
+        self.pane_room_generation
+            .lock()
+            .unwrap()
+            .get(pane)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn set_room(&self, name: &str, room: &str) {
@@ -1266,6 +1814,15 @@ impl Shared {
     /// `connected` instead: whatever readiness the last incarnation of this
     /// pane earned is stale the moment a fresh one is about to start.
     pub fn note_session(&self, name: &str, kind: &str, model: &str) {
+        // A respawn of the same pane id is a new generation, so a request the
+        // previous incarnation made cannot be approved into this one. Under the
+        // gate with the other world changes, so the whole set is ordered the
+        // same way against capture and commitment rather than most of it being.
+        // Scoped: everything below is journalling and must not hold the gate.
+        {
+            let _gate = self.gate().write().unwrap();
+            self.bump_pane_generation(name);
+        }
         let to_persist = {
             let mut s = self.sessions.lock().unwrap();
             match s.iter_mut().find(|a| a.name == name) {
@@ -1304,6 +1861,14 @@ impl Shared {
         // `mark_connected` is what actually notices the pane is back and
         // drains it, once its MCP endpoint hears from it again.
         self.connected.lock().unwrap().remove(name);
+        // Restart, not forget. `spawn_session_inner` calls this on the way to
+        // creating the PTY, so it runs for the first spawn of a pane the claim
+        // has just registered, not only for a respawn. Deleting the record
+        // there left `admit_request_pane_dispatch` reading a pane a request
+        // created as a manual one, which is admitted unchecked: the startup
+        // gate was erased between the claim that installed it and the process
+        // it was installed for.
+        self.restart_request_pane(name);
     }
 
     // ---- conductor ----
@@ -1419,7 +1984,14 @@ impl Shared {
     /// sends both together, so the agent learns its role and its task at once.
     /// Dispatch still submits, because there no human is at the keyboard.
     pub fn set_conductor(&self, name: Option<String>) {
-        *self.conductor.lock().unwrap() = name.clone();
+        {
+            // Identity and epoch move together, so admission cannot read one
+            // conductor and stamp the other's epoch. The briefing write below
+            // is a PTY write and stays outside the gate.
+            let _gate = self.gate().write().unwrap();
+            self.bump_conductor_epoch();
+            *self.conductor.lock().unwrap() = name.clone();
+        }
         self.app.emit("conductor-changed");
 
         let Some(target) = name else { return };
@@ -1585,45 +2157,62 @@ impl Shared {
     /// type while halted).
     pub fn set_halted(&self, v: bool) {
         {
-            // Exclusive: a delivery path holding `delivery` as a reader is
-            // between its own eligibility check and its `submit_to` call, and
-            // must not have this land in between. Taking this here, not
-            // `tasks`, is what keeps that guarantee without ever holding
-            // `tasks` across a PTY write. Scoped so the guard is dropped
-            // before the resume sweep below, which takes its own read lock.
-            let _delivery = self.delivery.write().unwrap();
-            *self.halted.lock().unwrap() = v;
-            if v {
-                let now = Self::now_ms();
-                self.mutate_and_journal(|tasks| {
-                    let mut changed = Vec::new();
-                    for t in tasks.iter_mut() {
-                        // A queued task is exactly as stopped by Stop as a
-                        // pending one: neither has been typed anywhere yet.
-                        if t.status == "pending"
-                            || t.status == STATUS_QUEUED
-                            || (t.mode == "headless"
-                                && matches!(t.status.as_str(), "overdue" | "blocked"))
-                        {
-                            t.status = "cancelled".to_string();
-                            t.done_ms = Some(now);
-                            changed.push(t.clone());
+            // Outside `delivery`, so there is one global order: lifecycle
+            // first, then the state locks. Stop is not a hot path, and holding
+            // the gate across it is the point: nothing may reach commitment
+            // while Stop is landing.
+            let _gate = self.gate().write().unwrap();
+            {
+                // Exclusive: a delivery path holding `delivery` as a reader is
+                // between its own eligibility check and its `submit_to` call, and
+                // must not have this land in between. Taking this here, not
+                // `tasks`, is what keeps that guarantee without ever holding
+                // `tasks` across a PTY write. Scoped so the guard is dropped
+                // before the resume sweep below, which takes its own read lock.
+                let _delivery = self.delivery.write().unwrap();
+                *self.halted.lock().unwrap() = v;
+                if v {
+                    let now = Self::now_ms();
+                    self.mutate_and_journal(|tasks| {
+                        let mut changed = Vec::new();
+                        for t in tasks.iter_mut() {
+                            // A queued task is exactly as stopped by Stop as a
+                            // pending one: neither has been typed anywhere yet.
+                            if t.status == "pending"
+                                || t.status == STATUS_QUEUED
+                                || (t.mode == "headless"
+                                    && matches!(t.status.as_str(), "overdue" | "blocked"))
+                            {
+                                t.status = "cancelled".to_string();
+                                t.done_ms = Some(now);
+                                changed.push(t.clone());
+                            }
                         }
+                        ((), changed)
+                    });
+                    let panes: HashSet<String> = self
+                        .headless_running
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect();
+                    for pane in panes {
+                        let _ = self.engine.kill_headless_for_pane(&pane);
                     }
-                    ((), changed)
-                });
-                let panes: HashSet<String> = self
-                    .headless_running
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .cloned()
-                    .collect();
-                for pane in panes {
-                    let _ = self.engine.kill_headless_for_pane(&pane);
+                } else {
+                    *self.dispatches.lock().unwrap() = 0;
                 }
-            } else {
-                *self.dispatches.lock().unwrap() = 0;
+            }
+            if v {
+                // Stop has to be *recorded* on the queue, not merely consulted
+                // by it. Refusing a claim while `halted` is true left every
+                // pending request launchable again the moment Resume flipped
+                // the flag back, so a Stop the human pressed specifically to
+                // prevent a session could be undone by resuming for an
+                // unrelated reason. A request that was pending when Stop
+                // landed was made in a world that no longer exists.
+                self.invalidate_pending_requests_for_stop();
             }
         }
         self.app.emit("conductor-changed");
@@ -1631,6 +2220,34 @@ impl Shared {
             for id in self.live_ids() {
                 self.drain_pane(&id);
             }
+        }
+    }
+
+    /// Settle every still-pending request as stale, because Stop was pressed.
+    ///
+    /// Launching records are left alone: a process for one has already been
+    /// authorized and may already exist, and rewriting that to `Stale` would
+    /// claim nothing was started when something was. Stop kills running work
+    /// through its own path.
+    fn invalidate_pending_requests_for_stop(&self) {
+        let mut changed = false;
+        {
+            let mut store = self.requests.lock().unwrap();
+            let now = Self::now_ms();
+            for request in store.requests.iter_mut() {
+                if request.state == RequestState::Pending {
+                    request.state = RequestState::Stale;
+                    request.detail = Some(
+                        "Stop was pressed while this request was awaiting a decision".to_string(),
+                    );
+                    request.updated_ms = now;
+                    changed = true;
+                }
+            }
+            Self::evict_terminal_requests(&mut store);
+        }
+        if changed {
+            self.app.emit("session-requests-changed");
         }
     }
 
@@ -1656,6 +2273,797 @@ impl Shared {
         };
         self.app.emit("conductor-changed");
         budget
+    }
+
+    // --- conductor-requested sessions (jz8nsh) --------------------------------
+    //
+    // Lock order, established here and depended on by every method below:
+    // `requests` may take `allocator`, `halted` and `pane_generation` while
+    // held, because each of those is a leaf that acquires nothing. None of
+    // them ever takes `requests`. Neither `requests` nor `allocator` is held
+    // across a spawn, a catalogue probe or an event emission.
+    //
+    // `request_panes` is a leaf on the same terms, but it is deliberately
+    // never entered from under `requests` at all: `session_request_list` reads
+    // it first and `settle_session_launch` writes it after dropping the store.
+    // One fewer edge in the order is one fewer thing a later change can break.
+
+    /// Note that the project moved. Called by `set_dir` unconditionally, so a
+    /// change away and back still invalidates anything captured before it.
+    fn bump_project_epoch(&self) {
+        self.project_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn current_project_epoch(&self) -> u64 {
+        self.project_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Note that the conductor role moved.
+    fn bump_conductor_epoch(&self) {
+        self.conductor_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn current_conductor_epoch(&self) -> u64 {
+        self.conductor_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Note that a pane connected. A respawn of the same id is a new
+    /// generation, so a request the previous incarnation made cannot be
+    /// approved into the new one.
+    fn bump_pane_generation(&self, pane: &str) {
+        *self
+            .pane_generation
+            .lock()
+            .unwrap()
+            .entry(pane.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn generation_of(&self, pane: &str) -> u64 {
+        self.pane_generation
+            .lock()
+            .unwrap()
+            .get(pane)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Drop the oldest terminal records once there are more than the cap.
+    /// Pending and launching records are never evicted, however old.
+    fn evict_terminal_requests(store: &mut RequestStore) {
+        let terminal = store
+            .requests
+            .iter()
+            .filter(|r| r.state.is_terminal())
+            .count();
+        if terminal <= MAX_TERMINAL_REQUESTS {
+            return;
+        }
+        let mut to_drop = terminal - MAX_TERMINAL_REQUESTS;
+        store.requests.retain(|r| {
+            if to_drop > 0 && r.state.is_terminal() {
+                to_drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Admit a bounded request from the conductor, or say why not.
+    ///
+    /// Validation runs before anything is charged, so a malformed request does
+    /// not consume the run's allowance. The cap check and the charge happen
+    /// under one lock, so two concurrent requests cannot both pass a check for
+    /// the last slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_session_request(
+        &self,
+        requester: &str,
+        kind: &str,
+        model: &str,
+        reason: &str,
+        isolate: bool,
+        model_verified: bool,
+    ) -> Result<SessionRequest, String> {
+        if !REQUESTABLE_KINDS.contains(&kind) {
+            return Err(format!(
+                "unknown host '{kind}'; this increment supports {}",
+                REQUESTABLE_KINDS.join(", ")
+            ));
+        }
+        check_request_field("model", model, MAX_MODEL_BYTES)?;
+        check_request_field("reason", reason, MAX_REASON_BYTES)?;
+        // The existing paid-OpenRouter rejection applies at admission as well
+        // as at launch. It is a rejection rule, not a model allowlist.
+        if kind == "opencode" {
+            crate::opencode_model_guard(Some(model))?;
+        }
+        // Everything this request captures is read under one gate, together
+        // with the rechecks that the requester may still make it. The tool
+        // layer proves conductor authority *before* a catalogue probe that can
+        // take seconds; a demotion during that probe used to leave admission
+        // stamping the new conductor's epoch onto the old conductor's request,
+        // and approval then found every epoch matching and launched it.
+        //
+        // Taken before `requests`, and `name_to_room`, `conductor`,
+        // `pane_generation` and `pane_room_generation` are all leaves that
+        // nothing acquires `requests` from under, so this order is the only
+        // one in play.
+        let _gate = self.gate().read().unwrap();
+
+        let brain = self.room_for(requester);
+        if brain != "main" {
+            return Err(format!(
+                "this increment supports the 'main' brain only; pane {requester} is in '{brain}'"
+            ));
+        }
+        if self.conductor.lock().unwrap().as_deref() != Some(requester) {
+            return Err(format!(
+                "only the conductor may request a session; pane {requester} does not hold the role"
+            ));
+        }
+        if self.is_halted() {
+            return Err("dispatch is halted by the user (Stop). Do not retry.".to_string());
+        }
+        if !self.live_request_panes().iter().any(|p| p == requester) {
+            return Err(format!(
+                "pane {requester} is not running, so it cannot make a request"
+            ));
+        }
+
+        // The project the human picked, not the directory its journal lives
+        // in, and `None` stays `None`. See `Shared::project`.
+        let project = self
+            .selected_project()
+            .map(|p| p.to_string_lossy().to_string());
+        // Between the project and the epoch that dates it: the exact window a
+        // switch used to slip through, leaving a request holding A's path with
+        // B's epoch.
+        self.hit_test_seam("request-capture");
+        let now = Self::now_ms();
+        let mut store = self.requests.lock().unwrap();
+        let outstanding = store
+            .requests
+            .iter()
+            .filter(|r| !r.state.is_terminal())
+            .count();
+        if outstanding >= MAX_OUTSTANDING_REQUESTS {
+            return Err(format!(
+                "{outstanding} session requests are already awaiting a human decision (limit {MAX_OUTSTANDING_REQUESTS}). Wait for one to be approved or denied."
+            ));
+        }
+        if store.admitted >= MAX_ADMITTED_REQUESTS {
+            return Err(format!(
+                "this app run has already admitted {MAX_ADMITTED_REQUESTS} session requests. A human can reset the allowance."
+            ));
+        }
+        store.next_id += 1;
+        store.admitted += 1;
+        let request = SessionRequest {
+            request_id: format!("sreq-{}", store.next_id),
+            kind: kind.to_string(),
+            model: model.to_string(),
+            model_verified,
+            reason: reason.to_string(),
+            isolate,
+            project,
+            brain,
+            requester: requester.to_string(),
+            state: RequestState::Pending,
+            session_id: None,
+            detail: None,
+            created_ms: now,
+            updated_ms: now,
+            project_epoch: self.current_project_epoch(),
+            conductor_epoch: self.current_conductor_epoch(),
+            requester_generation: self.generation_of(requester),
+            requester_room_generation: self.room_generation_of(requester),
+        };
+        store.requests.push(request.clone());
+        drop(store);
+        drop(_gate);
+        self.app.emit("session-requests-changed");
+        Ok(request)
+    }
+
+    /// Read one request back for its own requester.
+    ///
+    /// Reading grants no authority: it cannot launch, deny or reset anything.
+    /// An ID that was never issued and one evicted from the bounded history are
+    /// answered the same way, because telling them apart would need a permanent
+    /// record of every ID ever issued.
+    pub fn session_request_status(
+        &self,
+        request_id: &str,
+        requester: &str,
+    ) -> Result<SessionRequest, String> {
+        let store = self.requests.lock().unwrap();
+        let Some(request) = store.requests.iter().find(|r| r.request_id == request_id) else {
+            return Err(format!("{request_id}: NotFoundOrExpired"));
+        };
+        if request.requester != requester {
+            return Err(format!(
+                "{request_id} belongs to another pane; a request is readable only by the pane that made it"
+            ));
+        }
+        let brain = self.room_for(requester);
+        if brain != request.brain {
+            return Err(format!(
+                "{request_id} was made from brain '{}', and pane {requester} is now in '{brain}'",
+                request.brain
+            ));
+        }
+        if self.generation_of(requester) != request.requester_generation {
+            return Err(format!(
+                "{request_id} was made by an earlier incarnation of pane {requester}"
+            ));
+        }
+        Ok(request.clone())
+    }
+
+    /// Everything the human UI renders.
+    pub fn session_request_list(&self) -> SessionRequestList {
+        // Read before `requests` is taken, so this needs no claim about
+        // whether `request_panes` may be entered from under it.
+        let startups = self.request_pane_startups();
+        let store = self.requests.lock().unwrap();
+        let outstanding = store
+            .requests
+            .iter()
+            .filter(|r| !r.state.is_terminal())
+            .count();
+        SessionRequestList {
+            requests: store.requests.clone(),
+            startups,
+            outstanding,
+            admitted: store.admitted,
+            outstanding_limit: MAX_OUTSTANDING_REQUESTS,
+            admitted_limit: MAX_ADMITTED_REQUESTS,
+            allocator_ready: self.allocator.lock().unwrap().ready,
+        }
+    }
+
+    /// Resolve a pending request without starting anything.
+    pub fn deny_session_request(&self, request_id: &str) -> Result<SessionRequest, String> {
+        let mut store = self.requests.lock().unwrap();
+        let Some(request) = store
+            .requests
+            .iter_mut()
+            .find(|r| r.request_id == request_id)
+        else {
+            return Err(format!("{request_id}: NotFoundOrExpired"));
+        };
+        // Repeated or racing decisions read back the settled state rather than
+        // changing it. Denying something already launching would claim a
+        // process was never started when it was.
+        if request.state != RequestState::Pending {
+            return Ok(request.clone());
+        }
+        request.state = RequestState::Denied;
+        request.updated_ms = Self::now_ms();
+        let settled = request.clone();
+        Self::evict_terminal_requests(&mut store);
+        drop(store);
+        self.app.emit("session-requests-changed");
+        Ok(settled)
+    }
+
+    /// Claim a pending request for launch, or refuse and settle it.
+    ///
+    /// This is the one atomic transition, and `RequestClaim::launch_authorized`
+    /// is what makes it one. Returning only the record was not enough: a repeat
+    /// Approve read back `Launching` and the command could not tell that from
+    /// having just won the claim, so it called the spawn helper a second time
+    /// for the same reserved id. The duplicate check inside the helper then
+    /// refused, and that observed failure settled a request whose first process
+    /// was running as `Failed`. Exactly one caller now gets the capability, and
+    /// only that caller may spawn or settle.
+    ///
+    /// The captured world is rechecked here, under the lifecycle gate, because
+    /// everything about it can have moved since the request was admitted, and
+    /// because a check that is not ordered against those moves can be overtaken
+    /// by one between passing and committing.
+    pub fn claim_session_request(
+        &self,
+        request_id: &str,
+        edited_model: Option<&str>,
+    ) -> Result<RequestClaim, String> {
+        let (claim, changed) = {
+            // Held across the recheck and the commit transition together, so a
+            // project switch, a conductor change, a brain move or Stop either
+            // lands entirely before this claim reads the world or entirely
+            // after it has committed. Nothing slow happens under it.
+            //
+            // Those are the world changes that take the gate. Pane death does
+            // not and cannot, so `live` below is the one captured input this
+            // hold does not freeze; it is decided again after the commit. See
+            // `abandon_claim_if_requester_is_gone`.
+            let _gate = self.gate().read().unwrap();
+
+            // Read before `requests`, as before: liveness reaches the engine.
+            let live = self.live_request_panes();
+            let halted = self.is_halted();
+            let current_project = self.current_project_epoch();
+            let current_conductor = self.current_conductor_epoch();
+            let conductor = self.conductor.lock().unwrap().clone();
+
+            let mut store = self.requests.lock().unwrap();
+            let Some(index) = store
+                .requests
+                .iter()
+                .position(|r| r.request_id == request_id)
+            else {
+                return Err(format!("{request_id}: NotFoundOrExpired"));
+            };
+            if store.requests[index].state != RequestState::Pending {
+                // Already claimed, denied or settled. Hand back the truth, and
+                // no authority: this caller starts nothing and settles nothing.
+                return Ok(RequestClaim {
+                    request: store.requests[index].clone(),
+                    launch_authorized: false,
+                });
+            }
+
+            // Recheck the captured world. Each of these settles the request as
+            // `Stale` rather than launching into a world it was not made for.
+            // `name_to_room`, `pane_generation` and `pane_room_generation` are
+            // leaves, so reading them from under `requests` introduces no new
+            // order.
+            let request = &store.requests[index];
+            let requester = request.requester.clone();
+            let stale = request_staleness(
+                request,
+                halted,
+                current_project,
+                current_conductor,
+                conductor.as_deref(),
+                &self.room_for(&requester),
+                self.room_generation_of(&requester),
+                self.generation_of(&requester),
+                live.contains(&requester),
+            );
+            let outcome = if let Some(detail) = stale {
+                let request = &mut store.requests[index];
+                request.state = RequestState::Stale;
+                request.detail = Some(detail);
+                request.updated_ms = Self::now_ms();
+                let settled = request.clone();
+                Self::evict_terminal_requests(&mut store);
+                (
+                    RequestClaim {
+                        request: settled,
+                        launch_authorized: false,
+                    },
+                    true,
+                )
+            } else {
+                // Validation has passed and nothing is committed yet. A world
+                // change landing here is what the gate exists to exclude.
+                self.hit_test_seam("request-claim-validated");
+                // `allocator` is a leaf, so taking it here cannot deadlock
+                // against anything that might want `requests`.
+                let session_id = self.allocator.lock().unwrap().reserve()?;
+                let request = &mut store.requests[index];
+                if let Some(model) = edited_model {
+                    request.model = model.to_string();
+                }
+                request.state = RequestState::Launching;
+                request.session_id = Some(session_id);
+                request.updated_ms = Self::now_ms();
+                let committed = request.clone();
+                // After the final liveness snapshot and after the transition,
+                // and still before any authority has left this function. A
+                // removal attempted from here is attempting it while the gate
+                // is held for read, which is the interleaving the ordering has
+                // to decide rather than the one it can avoid.
+                self.hit_test_seam("request-claim-committed");
+                (
+                    RequestClaim {
+                        request: committed,
+                        launch_authorized: true,
+                    },
+                    true,
+                )
+            };
+
+            // `requests` goes before the recheck below, which reads the engine:
+            // the engine is taken before `requests` and never under it.
+            drop(store);
+            self.withdraw_if_requester_vanished(outcome)
+        };
+
+        // Startup tracking begins at the claim, not at a successful spawn.
+        // The pane id is reserved here and nothing else can be handed it, so
+        // this is the earliest moment the record can exist -- and it has to
+        // exist before the process does, because a CLI can reach its endpoint
+        // and take a dispatch while the spawn call that started it has not
+        // returned. A pane with no record is treated as a manual pane, which
+        // skipped the first-dispatch gate and the connection accounting the
+        // packet requires. Outside `requests`, which `request_panes` must
+        // never be taken from under.
+        if claim.launch_authorized {
+            if let Some(pane) = claim.request.session_id.as_deref() {
+                self.register_request_pane(pane);
+            }
+        }
+        if changed {
+            self.app.emit("session-requests-changed");
+        }
+        Ok(claim)
+    }
+
+    /// Withdraw a claim whose requester vanished without the gate noticing.
+    ///
+    /// The gate orders every *observed* removal against this claim: an explicit
+    /// close and an agent exit both take it for write, so neither can complete
+    /// between the liveness snapshot and the commit while this holds it for
+    /// read. Those cases never reach here.
+    ///
+    /// What the gate cannot order is a process that simply died. Nothing takes
+    /// a lock at the instant an OS reaps a child; the death is noticed lazily,
+    /// the next time `liveness` reaches `try_wait`. So liveness is read once
+    /// more, and because this still runs under the gate, the answer it acts on
+    /// is one a gated removal could not have produced. A commitment that won
+    /// the race is never retroactively invalidated by a close or an exit; only
+    /// a death that was already true and merely unnoticed can withdraw it.
+    ///
+    /// Called with `requests` released and the gate held. Reads the engine and
+    /// then retakes `requests`, which is the one order this file allows.
+    ///
+    /// Returns the outcome untouched when it carried no authority, or when the
+    /// requester is still running. Otherwise the request settles `Stale` with
+    /// the same sentence the first check would have written, and the caller
+    /// gets no authority: it starts nothing and settles nothing.
+    ///
+    /// `Launching` existed briefly in the store. Nothing else could observe it
+    /// as claimable, because only a `Pending` request can be claimed and this
+    /// one had already left that state, and the caller's single
+    /// `session-requests-changed` emit covers both transitions as one.
+    ///
+    /// The reserved id is not handed back to the allocator. Ids are never
+    /// reused by design, so this skips a number, exactly as a request denied
+    /// after reservation would.
+    fn withdraw_if_requester_vanished(
+        &self,
+        outcome: (RequestClaim, bool),
+    ) -> (RequestClaim, bool) {
+        let (claim, changed) = outcome;
+        if !claim.launch_authorized {
+            return (claim, changed);
+        }
+        // `engine` before `requests`, never the other way.
+        if self.live_request_panes().contains(&claim.request.requester) {
+            return (claim, changed);
+        }
+
+        let mut store = self.requests.lock().unwrap();
+        let Some(request) = store
+            .requests
+            .iter_mut()
+            .find(|r| r.request_id == claim.request.request_id)
+        else {
+            // Evicted under us. No authority either way, and nothing to settle.
+            return (
+                RequestClaim {
+                    request: claim.request,
+                    launch_authorized: false,
+                },
+                changed,
+            );
+        };
+        if request.state != RequestState::Launching {
+            return (
+                RequestClaim {
+                    request: request.clone(),
+                    launch_authorized: false,
+                },
+                changed,
+            );
+        }
+        request.state = RequestState::Stale;
+        request.detail = Some(requester_gone_detail(&request.requester));
+        // A request that never launched must not name a pane, or the UI would
+        // offer a session id nothing was ever started under.
+        request.session_id = None;
+        request.updated_ms = Self::now_ms();
+        let settled = request.clone();
+        Self::evict_terminal_requests(&mut store);
+        (
+            RequestClaim {
+                request: settled,
+                launch_authorized: false,
+            },
+            true,
+        )
+    }
+
+    /// Record what a launch actually did.
+    ///
+    /// `Failed` is only ever written from an observed backend failure. A
+    /// frontend RPC timeout is not a failure and must not come through here.
+    pub fn settle_session_launch(&self, request_id: &str, outcome: Result<(), String>) {
+        let mut failed_pane: Option<String> = None;
+        let mut store = self.requests.lock().unwrap();
+        if let Some(request) = store
+            .requests
+            .iter_mut()
+            .find(|r| r.request_id == request_id)
+        {
+            if request.state == RequestState::Launching {
+                match outcome {
+                    Ok(()) => {
+                        // The startup record was written at the claim, so
+                        // there is nothing to register here. This now runs
+                        // while the child is still alive rather than after it
+                        // has exited; see `approve_session_request`.
+                        request.state = RequestState::Started;
+                    }
+                    Err(detail) => {
+                        request.state = RequestState::Failed;
+                        request.detail = Some(detail);
+                        // No process exists for this pane and none ever will,
+                        // so the startup record the claim wrote has to go.
+                        // Deferred until the loop ends because `request_panes`
+                        // must not be taken while `requests` is held.
+                        failed_pane = request.session_id.clone();
+                    }
+                }
+                request.updated_ms = Self::now_ms();
+            }
+        }
+        Self::evict_terminal_requests(&mut store);
+        drop(store);
+        if let Some(pane) = failed_pane {
+            self.forget_request_pane(&pane);
+        }
+        self.app.emit("session-requests-changed");
+    }
+
+    /// Human allowance reset. Clears the admitted count and terminal history so
+    /// requesting can continue, while leaving pending and launching work alone:
+    /// a reset is a change of allowance, not a cancellation.
+    pub fn reset_session_requests(&self) -> SessionRequestList {
+        {
+            let mut store = self.requests.lock().unwrap();
+            store.requests.retain(|r| !r.state.is_terminal());
+            store.admitted = 0;
+            // `next_id` deliberately keeps counting: a reset must not let a new
+            // request reuse an ID a poller still holds.
+        }
+        self.app.emit("session-requests-changed");
+        self.session_request_list()
+    }
+
+    /// Complete the restore barrier: raise the id floor past every pane the
+    /// frontend put on screen, then allow launches.
+    pub fn initialize_sessions(&self, restored_ids: &[String]) -> SessionRequestList {
+        self.allocator.lock().unwrap().initialize(restored_ids);
+        self.app.emit("session-requests-changed");
+        self.session_request_list()
+    }
+
+    /// Which panes count as running, for the commitment check.
+    #[cfg(not(test))]
+    fn live_request_panes(&self) -> Vec<String> {
+        self.live_ids()
+    }
+
+    /// Test builds answer from an explicit set rather than a real process table.
+    ///
+    /// The set belongs to the engine, so `SessionManager::kill` and the
+    /// observed-exit path remove from it under the lifecycle gate exactly as
+    /// they remove a real handle. A test that closes a pane therefore travels
+    /// the production removal path and is ordered against commitment by the
+    /// production lock, rather than by a table only tests can reach.
+    #[cfg(test)]
+    fn live_request_panes(&self) -> Vec<String> {
+        self.engine
+            .test_live_panes
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Mark a pane live for the commitment check. Test builds only.
+    #[cfg(test)]
+    pub fn mark_request_pane_live(&self, pane: &str) {
+        self.engine
+            .test_live_panes
+            .lock()
+            .unwrap()
+            .insert(pane.to_string());
+    }
+
+    /// Drop a pane from the commitment check WITHOUT the gate. Test builds only.
+    ///
+    /// Deliberately ungated, and not the same thing as closing a pane. This
+    /// stands for the death nothing can order: a process that exits on its own
+    /// is noticed lazily, the next time `liveness` reaches `try_wait`, and no
+    /// lock was held at the moment it happened. `SessionManager::kill` is the
+    /// orderable half and takes the gate; use the engine directly to exercise
+    /// it. Calling this from inside a claim's seam is also the only form that
+    /// works there: the claim holds the gate for read on that thread, so a
+    /// gated removal on the same thread would deadlock rather than race.
+    #[cfg(test)]
+    pub fn mark_request_pane_dead(&self, pane: &str) {
+        self.engine.test_live_panes.lock().unwrap().remove(pane);
+    }
+
+    /// Start tracking a pane that a session request created.
+    ///
+    /// Called from the winning claim, as soon as the id is reserved, rather
+    /// than after a successful spawn. Registering later left a real window in
+    /// which the child was running and connected while `admit_request_pane_
+    /// dispatch` still saw no record and waved it through as a manual pane.
+    /// `launched_ms` therefore dates from the claim, which bounds the whole
+    /// launch rather than only the part after it returned.
+    pub fn register_request_pane(&self, pane: &str) {
+        let now = Self::now_ms();
+        // A CLI can reach its endpoint before the spawn call that started it
+        // has returned, so `mark_connected` may already have fired for this
+        // pane with no record to write to. Seeding from `connected` is what
+        // stops that pane reading `Starting` forever. Taken before
+        // `request_panes` and never the other way around.
+        let already_connected = self.is_connected(pane);
+        self.request_panes.lock().unwrap().insert(
+            pane.to_string(),
+            StartupRecord {
+                pane: pane.to_string(),
+                state: StartupState::Starting,
+                admitted: false,
+                launched_ms: now,
+                connected_ms: already_connected.then_some(now),
+            },
+        );
+    }
+
+    /// Note that a request-created pane reached its endpoint. A no-op for a
+    /// manual pane, which this increment leaves alone.
+    fn note_request_pane_connected(&self, pane: &str) {
+        let now = Self::now_ms();
+        if let Some(record) = self.request_panes.lock().unwrap().get_mut(pane) {
+            // Only the first connection sets the clock. A later reconnection
+            // of the same incarnation should not restart the startup story.
+            if record.connected_ms.is_none() {
+                record.connected_ms = Some(now);
+            }
+        }
+    }
+
+    /// Forget a request-created pane's startup state.
+    ///
+    /// Called on respawn for the same reason `connected` is cleared there: the
+    /// pane wearing this id is a different process, and it has not connected
+    /// or taken a dispatch, whatever the last one did.
+    fn forget_request_pane(&self, pane: &str) {
+        self.request_panes.lock().unwrap().remove(pane);
+    }
+
+    /// Begin a request-created pane's startup story again, keeping the gate.
+    ///
+    /// The reasoning `forget_request_pane` states is right and the deletion was
+    /// the wrong way to act on it: a new incarnation has not connected and has
+    /// not taken a dispatch, whatever the last one did, and that is a reset of
+    /// the record rather than its removal. Removing it also removes the pane
+    /// from the set `admit_request_pane_dispatch` checks at all, so the first
+    /// dispatch is waved through as a manual pane's would be. A pane no request
+    /// created still has no record here and is still left alone.
+    ///
+    /// `launched_ms` restarts too, so for a requested pane the deadline dates
+    /// from this call rather than from the claim that registered it. That is
+    /// the span between the claim and the spawn helper reaching this line,
+    /// before the PTY exists and before anything slow, so it still bounds the
+    /// whole launch in the sense `register_request_pane` means. Keeping the old
+    /// value instead would hand a respawn its predecessor's clock, which can
+    /// read as timed out the moment it starts.
+    fn restart_request_pane(&self, pane: &str) {
+        let now = Self::now_ms();
+        // `connected` before `request_panes`, the order `register_request_pane`
+        // documents, and seeded the same way: a CLI that reached its endpoint
+        // between the caller clearing `connected` and this line is connected,
+        // and reading it here is what keeps that pane off the timeout path.
+        let already_connected = self.is_connected(pane);
+        if let Some(record) = self.request_panes.lock().unwrap().get_mut(pane) {
+            record.state = StartupState::Starting;
+            record.admitted = false;
+            record.launched_ms = now;
+            record.connected_ms = already_connected.then_some(now);
+        }
+    }
+
+    /// The current startup record for a pane, label included, or `None` for a
+    /// pane no request created.
+    pub fn request_pane_startup(&self, pane: &str) -> Option<StartupRecord> {
+        let now = Self::now_ms();
+        let mut panes = self.request_panes.lock().unwrap();
+        let record = panes.get_mut(pane)?;
+        record.state = startup_label(record.connected_ms, record.launched_ms, now);
+        Some(record.clone())
+    }
+
+    /// Every request-created pane's startup record, for the human UI.
+    pub fn request_pane_startups(&self) -> Vec<StartupRecord> {
+        let now = Self::now_ms();
+        let mut panes = self.request_panes.lock().unwrap();
+        let mut out: Vec<StartupRecord> = panes
+            .values_mut()
+            .map(|record| {
+                record.state = startup_label(record.connected_ms, record.launched_ms, now);
+                record.clone()
+            })
+            .collect();
+        out.sort_by(|a, b| a.pane.cmp(&b.pane));
+        out
+    }
+
+    /// The first-dispatch admission check for request-created panes.
+    ///
+    /// A pane no request created is admitted unchanged: manual panes keep
+    /// their existing behavior in this increment.
+    fn admit_request_pane_dispatch(&self, pane: &str) -> Result<(), String> {
+        let Some(record) = self.request_pane_startup(pane) else {
+            return Ok(());
+        };
+        startup_admission(
+            pane,
+            record.state,
+            record.admitted,
+            self.engine.output_age_ms(pane),
+        )
+    }
+
+    /// Record that a request-created pane has taken a dispatch, so the startup
+    /// check stops applying to it.
+    fn mark_request_pane_admitted(&self, pane: &str) {
+        if let Some(record) = self.request_panes.lock().unwrap().get_mut(pane) {
+            record.admitted = true;
+        }
+    }
+
+    /// The one lifecycle gate the packet requires, ordered before every state
+    /// lock below it.
+    ///
+    /// Owned by `SessionManager` rather than by this type, because ordering a
+    /// request's commitment against a session's disappearance needs both sides
+    /// to take the same lock, and only one of them can hold the other: this
+    /// type holds an `Arc<SessionManager>`, never the reverse. Borrowing it
+    /// here is what makes it one boundary rather than two that agree by
+    /// convention.
+    ///
+    /// Taken for **write** by each mutation that changes the world a request
+    /// was made in (project, conductor, brain assignment, pane generation,
+    /// Stop) and by the two observed session removals, explicit close and
+    /// agent exit. Taken for **read** across a request's coherent capture at
+    /// admission and its short commitment transition at claim. Nothing slow
+    /// runs under it: catalogue validation, spawning and event emission all
+    /// stay outside.
+    ///
+    /// Independently atomic epochs are not this property, which is the defect
+    /// this replaces. A claim could read `halted == false` and matching
+    /// epochs, then Stop or a project switch could complete, and the claim
+    /// would still reserve an id and write `Launching`: the change won the
+    /// race and a process was authorized anyway. Admission had the mirror
+    /// problem, copying project A, letting a complete switch to B land, and
+    /// then capturing B's epoch, producing a request whose path and epoch
+    /// disagree and which approval would happily accept.
+    ///
+    /// A read guard rather than a mutex for the request paths because two
+    /// concurrent claims exclude each other through `requests` already; what
+    /// they must not interleave with is a world change, and that is a writer.
+    fn gate(&self) -> &RwLock<()> {
+        &self.engine.lifecycle
+    }
+
+    /// Reserve an id for a manual launch, through the same allocator the
+    /// approved path uses, so the two cannot collide.
+    pub fn reserve_session_id(&self) -> Result<String, String> {
+        self.allocator.lock().unwrap().reserve()
     }
 
     /// Consume one unit of dispatch budget; false when exhausted.
@@ -1956,6 +3364,10 @@ impl Shared {
             target_is_live,
             if headless { "" } else { &injection },
         )?;
+        // Startup admission for panes a session request created, after the
+        // identity and liveness rules and still before the budget, so a pane
+        // that is merely too early costs nothing and records no task.
+        self.admit_request_pane_dispatch(target)?;
         let budget_usd = if headless {
             let launch = self
                 .engine
@@ -2065,7 +3477,12 @@ impl Shared {
         };
         drop(pane_gate);
         drop(delivery_gate);
-        if !delivered {
+        if delivered {
+            // The startup gate is a gate on the *first* dispatch, and only a
+            // delivered one counts. A refused or undelivered attempt leaves
+            // the pane where it was, still waiting to prove itself.
+            self.mark_request_pane_admitted(target);
+        } else {
             self.mark_delivery_failed(&id);
         }
         Ok(DispatchOutcome {
@@ -2379,6 +3796,17 @@ impl Shared {
         // `test_seam`.
         self.hit_test_seam("drain_pane");
 
+        // A queued brief reaching a request-created pane is that pane's first
+        // dispatch just as much as an immediate one is. `drain_pane` already
+        // refuses an unconnected pane above, so reaching here means the pane
+        // connected; the queue is what waited out its startup.
+        if let Err(refusal) = self.admit_request_pane_dispatch(pane) {
+            // Not a failed delivery: nothing was written, and the next
+            // trigger will try again. Same treatment as the unconnected case.
+            let _ = refusal;
+            return;
+        }
+
         let is_dispatch = task.status == STATUS_QUEUED;
         if is_dispatch && task.mode == "headless" {
             // Promotion reserves the queue head as pending. The worker retries
@@ -2428,6 +3856,9 @@ impl Shared {
             // drain of this pane retries it; nothing else changes.
             ((), vec![t.clone()])
         });
+        if delivered && is_dispatch {
+            self.mark_request_pane_admitted(pane);
+        }
         drop(pane_gate);
         drop(delivery_gate);
         self.app.emit("conductor-changed");
@@ -2449,6 +3880,7 @@ impl Shared {
     /// engine handle exist and is not evidence of anything reachable.
     pub fn mark_connected(&self, pane: &str) {
         self.connected.lock().unwrap().insert(pane.to_string());
+        self.note_request_pane_connected(pane);
         self.drain_pane(pane);
     }
 }
@@ -3757,6 +5189,28 @@ pub struct SearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct RequestSessionArgs {
+    /// Which agent CLI to run: "claude", "codex" or "opencode".
+    pub kind: String,
+    /// The model to run it with. Checked against the host's catalogue where
+    /// one is available; for Claude a custom string may go through to the
+    /// human as an explicitly unverified selection.
+    pub model: String,
+    /// Why this session is needed, for the human deciding. Up to 512 bytes.
+    pub reason: String,
+    /// Give the session its own git worktree rather than the shared project
+    /// directory.
+    #[serde(default)]
+    pub isolate: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionRequestStatusArgs {
+    /// The request id returned by request_session.
+    pub request_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DispatchArgs {
     /// Run a separate Claude print-mode child after 30 seconds of pane quiet.
     #[serde(default)]
@@ -3951,6 +5405,78 @@ impl BrainHandler {
         self.shared
             .add("fact", &self.author(), &p.category, &p.fact);
         "Fact recorded to the shared brain.".to_string()
+    }
+
+    #[tool(
+        description = "Ask the human to open a new agent session (claude, codex or opencode) with a named model. Conductor only. This does NOT start anything: it queues a request the human must approve in the Pantheon window, and returns an opaque request id. Poll session_request_status for the outcome. Approval, denial and the allowance reset are human actions with no tool equivalent. At most 3 requests may await a decision at once, and 10 may be admitted per app run."
+    )]
+    fn request_session(&self, Parameters(p): Parameters<RequestSessionArgs>) -> String {
+        if let Err(e) = self.require_conductor() {
+            return e;
+        }
+        // Catalogue checks run outside the request lock, before admission, so
+        // a slow probe cannot hold up a decision on another request.
+        let verified = match verify_requested_model(&p.kind, &p.model) {
+            Ok(verified) => verified,
+            Err(e) => return format!("Refused: {e}"),
+        };
+        match self.shared.admit_session_request(
+            &self.author(),
+            &p.kind,
+            &p.model,
+            &p.reason,
+            p.isolate,
+            verified,
+        ) {
+            Ok(request) => {
+                let unverified = if request.model_verified {
+                    ""
+                } else {
+                    " The model could not be checked against a catalogue and will be shown to the human as an unverified custom selection."
+                };
+                format!(
+                    "Requested a {} session on model '{}' as {}. The human must approve it in the Pantheon window; nothing has started.{unverified} Poll session_request_status with request_id \"{}\".",
+                    request.kind, request.model, request.request_id, request.request_id
+                )
+            }
+            Err(e) => format!("Refused: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Read the outcome of a session request you made: pending, launching, started, failed, denied or stale. Readable only by the pane that made it. This grants no authority: it cannot approve, deny, cancel or reset anything. An id that was never issued and one that has aged out of the bounded history both answer NotFoundOrExpired."
+    )]
+    fn session_request_status(
+        &self,
+        Parameters(p): Parameters<SessionRequestStatusArgs>,
+    ) -> String {
+        match self
+            .shared
+            .session_request_status(&p.request_id, &self.author())
+        {
+            Ok(r) => {
+                let session = r
+                    .session_id
+                    .as_deref()
+                    .map(|id| format!(" session={id}"))
+                    .unwrap_or_default();
+                let detail = r
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                let verified = if r.model_verified {
+                    ""
+                } else {
+                    " [model unverified]"
+                };
+                format!(
+                    "{}: {:?}{session}{detail} kind={} model={}{verified}",
+                    r.request_id, r.state, r.kind, r.model
+                )
+            }
+            Err(e) => e,
+        }
     }
 
     #[tool(description = "Broadcast a short message or blocker to all agents.")]
@@ -4786,6 +6312,10 @@ pub fn start(
         loaded_dirs: Mutex::new(HashSet::from([dir.clone()])),
         store_gate: RwLock::new(()),
         dir: Mutex::new(dir),
+        // No project is selected until the frontend calls `set_project`. The
+        // startup storage directory is not a project and must not be reported
+        // as one.
+        project: Mutex::new(None),
         entries: Mutex::new(brain.entries),
         sessions: Mutex::new(brain.sessions),
         name_to_room: Mutex::new(HashMap::new()),
@@ -4797,8 +6327,16 @@ pub fn start(
         dispatches: Mutex::new(0),
         delivery: RwLock::new(()),
         pane_delivery: Mutex::new(HashMap::new()),
+        requests: Mutex::new(RequestStore::default()),
+        request_panes: Mutex::new(HashMap::new()),
+        allocator: Mutex::new(Allocator::default()),
+        project_epoch: std::sync::atomic::AtomicU64::new(0),
+        conductor_epoch: std::sync::atomic::AtomicU64::new(0),
+        pane_generation: Mutex::new(HashMap::new()),
+        pane_room_generation: Mutex::new(HashMap::new()),
         headless_running: Mutex::new(HashMap::new()),
         headless_reported: Mutex::new(HashSet::new()),
+        #[cfg(test)]
         #[cfg(test)]
         test_seam: Mutex::new(None),
     });
@@ -4851,6 +6389,12 @@ mod tests {
         TaskAccessError, MAX_QUESTIONS_PER_TASK, QUEUE_CAP, RECENT_FINISHED, REVIEW_WAIVED,
         STATUS_ABANDONED, STATUS_BLOCKED, STATUS_QUEUED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
         WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
+    };
+    use super::{
+        check_request_field, request_staleness, startup_admission, startup_label, RequestState,
+        SessionRequest, StartupState, MAX_ADMITTED_REQUESTS, MAX_MODEL_BYTES,
+        MAX_OUTSTANDING_REQUESTS, MAX_REASON_BYTES, MAX_TERMINAL_REQUESTS,
+        REQUEST_PANE_READY_TIMEOUT_MS,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5848,6 +7392,11 @@ mod tests {
             loaded_dirs: Mutex::new(HashSet::from([dir.path().canonicalize().unwrap()])),
             store_gate: RwLock::new(()),
             dir: Mutex::new(dir.path().canonicalize().unwrap()),
+            // Storage, not a project. A fixture that used its temp directory
+            // as both hid exactly the confusion this field exists to end, so
+            // a test that wants a selected project calls
+            // `set_selected_project` and says so.
+            project: Mutex::new(None),
             entries: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
             name_to_room: Mutex::new(HashMap::new()),
@@ -5859,6 +7408,13 @@ mod tests {
             dispatches: Mutex::new(0),
             delivery: RwLock::new(()),
             pane_delivery: Mutex::new(HashMap::new()),
+            requests: Mutex::new(super::RequestStore::default()),
+            request_panes: Mutex::new(HashMap::new()),
+            allocator: Mutex::new(super::Allocator::default()),
+            project_epoch: std::sync::atomic::AtomicU64::new(0),
+            conductor_epoch: std::sync::atomic::AtomicU64::new(0),
+            pane_generation: Mutex::new(HashMap::new()),
+            pane_room_generation: Mutex::new(HashMap::new()),
             headless_running: Mutex::new(HashMap::new()),
             headless_reported: Mutex::new(HashSet::new()),
             test_seam: Mutex::new(None),
@@ -9981,6 +11537,1803 @@ mod tests {
         assert!(
             std::fs::read_to_string(dir.path().join("brain.jsonl")).is_err(),
             "nothing was journaled either: refusal wrote no file at all"
+        );
+    }
+
+    // --- conductor-requested sessions (jz8nsh) --------------------------------
+    //
+    // The whole point of the pure helpers above is that these conditions are
+    // reachable from a test. A stale approval, an exhausted id space and a
+    // pane that never connects are all things a human would have to stage by
+    // hand in a running app, one at a time, and could easily believe they had
+    // staged when they had not.
+
+    /// A request in whatever state the test needs, without going through
+    /// admission. Only for the pure eviction and staleness checks, which are
+    /// about the record and not about how it was made.
+    fn fake_request(id: &str, state: RequestState) -> SessionRequest {
+        SessionRequest {
+            request_id: id.to_string(),
+            kind: "claude".to_string(),
+            model: "opus".to_string(),
+            model_verified: false,
+            reason: "because".to_string(),
+            isolate: false,
+            project: Some("/p".to_string()),
+            brain: "main".to_string(),
+            requester: "sess-1".to_string(),
+            state,
+            session_id: None,
+            detail: None,
+            created_ms: 0,
+            updated_ms: 0,
+            project_epoch: 0,
+            conductor_epoch: 0,
+            requester_generation: 0,
+            requester_room_generation: 0,
+        }
+    }
+
+    /// An initialized fixture with a live requester, which is what almost every
+    /// request test needs before it can get to the thing it is checking.
+    fn shared_with_requester() -> (Arc<Shared>, tempfile::TempDir) {
+        let (shared, dir) = shared_for_test();
+        shared.initialize_sessions(&[]);
+        shared.mark_request_pane_live("sess-1");
+        (shared, dir)
+    }
+
+    fn admit(shared: &Shared) -> SessionRequest {
+        shared
+            .admit_session_request("sess-1", "claude", "opus", "need a hand", false, false)
+            .expect("admitted")
+    }
+
+    #[test]
+    fn nothing_can_be_launched_until_restore_finishes() {
+        // The restore barrier. Without it the first request of a run could be
+        // handed an id the frontend is about to restore onto an existing pane.
+        let mut allocator = super::Allocator::default();
+        let err = allocator.reserve().unwrap_err();
+        assert!(err.contains("still being restored"), "{err}");
+
+        allocator.initialize(&[]);
+        assert_eq!(allocator.reserve().unwrap(), "sess-1");
+    }
+
+    #[test]
+    fn restoring_raises_the_floor_past_every_pane_already_on_screen() {
+        let mut allocator = super::Allocator::default();
+        allocator.initialize(&["sess-1".to_string(), "sess-2".to_string()]);
+
+        // sess-3, not sess-4. An off-by-one here is invisible in normal use
+        // (nothing collides, a number is just skipped) and immediately
+        // confusing to a user who is told sess-4 started when sess-3 never
+        // existed.
+        assert_eq!(allocator.reserve().unwrap(), "sess-3");
+        assert_eq!(allocator.reserve().unwrap(), "sess-4");
+    }
+
+    #[test]
+    fn a_second_restore_with_a_shorter_list_cannot_walk_the_floor_back_down() {
+        let mut allocator = super::Allocator::default();
+        allocator.initialize(&["sess-1".to_string(), "sess-9".to_string()]);
+        assert_eq!(allocator.reserve().unwrap(), "sess-10");
+
+        // A later restore reporting fewer panes must not reopen sess-2. The
+        // pane holding sess-10 is already on screen.
+        allocator.initialize(&["sess-1".to_string()]);
+        assert_eq!(allocator.reserve().unwrap(), "sess-11");
+    }
+
+    #[test]
+    fn a_restored_id_that_is_not_a_session_number_is_ignored_not_fatal() {
+        let mut allocator = super::Allocator::default();
+        // A failed restore can leave the frontend reporting names that are not
+        // `sess-N` at all. Those tell us nothing about the floor; they must not
+        // lower it and must not stop the gate opening.
+        allocator.initialize(&[
+            "conductor".to_string(),
+            "sess-".to_string(),
+            "sess-two".to_string(),
+            "sess-4".to_string(),
+        ]);
+        assert_eq!(allocator.reserve().unwrap(), "sess-5");
+    }
+
+    #[test]
+    fn a_failed_launch_never_returns_its_id_to_the_pool() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claimed = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(claimed.state, RequestState::Launching);
+        let burned = claimed.session_id.clone().expect("reserved an id");
+
+        shared.settle_session_launch(&request.request_id, Err("spawn failed".to_string()));
+        let settled = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(settled.state, RequestState::Failed);
+
+        // The next id is the one after the burned one. A pane wearing a dead
+        // pane's number is the confusion the reservation exists to prevent.
+        let next = shared.reserve_session_id().unwrap();
+        assert_ne!(next, burned);
+        assert_eq!(next, "sess-2");
+        assert_eq!(burned, "sess-1");
+    }
+
+    #[test]
+    fn the_id_space_reports_exhaustion_instead_of_reusing_a_number() {
+        let mut allocator = super::Allocator::default();
+        allocator.initialize(&[format!("sess-{}", u64::MAX - 2)]);
+
+        // The highest number the allocator will ever issue is `u64::MAX - 1`;
+        // see `reserve` for why the very top one is given up deliberately.
+        assert_eq!(
+            allocator.reserve().unwrap(),
+            format!("sess-{}", u64::MAX - 1)
+        );
+
+        let err = allocator.reserve().unwrap_err();
+        assert!(err.contains("exhausted"), "{err}");
+        // And it stays refused rather than wrapping back onto a live pane.
+        assert!(allocator.reserve().is_err());
+    }
+
+    #[test]
+    fn a_fresh_world_is_not_stale() {
+        let request = fake_request("sreq-1", RequestState::Pending);
+        assert_eq!(
+            request_staleness(&request, false, 0, 0, Some("sess-1"), "main", 0, 0, true),
+            None
+        );
+    }
+
+    #[test]
+    fn staleness_reports_stop_ahead_of_every_other_reason() {
+        // Ordering matters because more than one of these is usually true at
+        // once, and Stop is the one the user just did on purpose. Telling them
+        // the project changed when they pressed Stop would be answering a
+        // question they did not ask.
+        let request = fake_request("sreq-1", RequestState::Pending);
+        let reason =
+            request_staleness(&request, true, 7, 7, Some("sess-1"), "main", 7, 7, false).unwrap();
+        assert!(reason.contains("Stop was pressed"), "{reason}");
+    }
+
+    #[test]
+    fn each_kind_of_context_change_is_named_separately() {
+        let request = fake_request("sreq-1", RequestState::Pending);
+
+        let reason =
+            request_staleness(&request, false, 1, 0, Some("sess-1"), "main", 0, 0, true).unwrap();
+        assert!(reason.contains("project changed"), "{reason}");
+
+        let reason =
+            request_staleness(&request, false, 0, 1, Some("sess-1"), "main", 0, 0, true).unwrap();
+        assert!(reason.contains("conductor changed"), "{reason}");
+
+        let reason =
+            request_staleness(&request, false, 0, 0, Some("sess-1"), "main", 0, 1, true).unwrap();
+        assert!(reason.contains("respawned"), "{reason}");
+
+        let reason =
+            request_staleness(&request, false, 0, 0, Some("sess-1"), "main", 0, 0, false).unwrap();
+        assert!(reason.contains("no longer running"), "{reason}");
+    }
+
+    #[test]
+    fn a_switch_away_and_back_is_a_different_world() {
+        let (shared, dir) = shared_with_requester();
+        let request = admit(&shared);
+        let original = dir.path().canonicalize().unwrap();
+
+        let other = tempfile::tempdir().expect("tempdir");
+        shared.set_dir(other.path().canonicalize().unwrap());
+        shared.set_dir(original.clone());
+        assert_eq!(*shared.dir.lock().unwrap(), original);
+
+        // The path is identical again, so a path comparison would say nothing
+        // changed. Everything else did: the roster was reloaded from another
+        // project's journal on the way through.
+        let settled = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(settled.state, RequestState::Stale);
+        assert!(
+            settled
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("project changed"),
+            "{settled:?}"
+        );
+        assert!(
+            settled.session_id.is_none(),
+            "a stale request reserved no id"
+        );
+    }
+
+    #[test]
+    fn a_respawned_requester_is_stale_even_though_its_id_is_still_live() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        // Same id, different process. Reusing `sess-1` is normal, which is why
+        // liveness alone cannot answer this.
+        shared.note_session("sess-1", "claude", "opus");
+        shared.mark_request_pane_live("sess-1");
+
+        let settled = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(settled.state, RequestState::Stale);
+        assert!(
+            settled.detail.as_deref().unwrap().contains("respawned"),
+            "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_requester_settles_the_request_rather_than_launching_for_nobody() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.mark_request_pane_dead("sess-1");
+
+        let settled = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(settled.state, RequestState::Stale);
+        assert!(
+            settled
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("no longer running"),
+            "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_between_the_request_and_the_approval_launches_nothing() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.set_halted(true);
+
+        let settled = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(settled.state, RequestState::Stale);
+        assert!(settled.session_id.is_none(), "Stop must reserve no id");
+        // And the id space is untouched, so the pane the user starts by hand
+        // after a Stop gets the number they expect.
+        assert_eq!(shared.reserve_session_id().unwrap(), "sess-1");
+    }
+
+    #[test]
+    fn stop_also_refuses_a_new_request_outright() {
+        let (shared, _dir) = shared_with_requester();
+        shared.set_halted(true);
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "need a hand", false, false)
+            .unwrap_err();
+        assert!(err.contains("halted"), "{err}");
+        assert_eq!(shared.session_request_list().admitted, 0, "charged nothing");
+    }
+
+    #[test]
+    fn a_conductor_change_after_the_request_settles_it_as_stale() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.set_conductor(Some("sess-2".to_string()));
+
+        let settled = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(settled.state, RequestState::Stale);
+        assert!(
+            settled
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("conductor changed"),
+            "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn approving_the_same_request_twice_launches_once() {
+        // The property the whole design rests on. Two clicks, a click racing a
+        // keyboard shortcut, or two windows: only one may reach a spawn.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        let first = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(first.state, RequestState::Launching);
+        let second = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+
+        assert_eq!(second.state, RequestState::Launching);
+        assert_eq!(
+            second.session_id, first.session_id,
+            "the second caller reads back the first caller's id"
+        );
+        // One id consumed, not two: the second claim never reached the
+        // allocator, so the caller cannot spawn a second process.
+        assert_eq!(shared.reserve_session_id().unwrap(), "sess-2");
+    }
+
+    #[test]
+    fn denying_a_request_that_is_already_launching_reads_back_the_truth() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        // Denial after commitment would claim nothing was started when
+        // something was. The record wins over the click.
+        let denied = shared.deny_session_request(&request.request_id).unwrap();
+        assert_eq!(denied.state, RequestState::Launching);
+    }
+
+    #[test]
+    fn a_denied_request_cannot_then_be_approved() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        let denied = shared.deny_session_request(&request.request_id).unwrap();
+        assert_eq!(denied.state, RequestState::Denied);
+
+        let claimed = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        assert_eq!(claimed.state, RequestState::Denied);
+        assert!(claimed.session_id.is_none(), "denial reserved no id");
+        assert_eq!(shared.reserve_session_id().unwrap(), "sess-1");
+    }
+
+    #[test]
+    fn denying_twice_is_harmless() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let first = shared.deny_session_request(&request.request_id).unwrap();
+        let second = shared.deny_session_request(&request.request_id).unwrap();
+        assert_eq!(first.state, RequestState::Denied);
+        assert_eq!(
+            second.updated_ms, first.updated_ms,
+            "the second changed nothing"
+        );
+    }
+
+    #[test]
+    fn an_observed_launch_failure_is_recorded_as_failed_with_its_reason() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        shared.settle_session_launch(&request.request_id, Err("no such program".to_string()));
+        let settled = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(settled.state, RequestState::Failed);
+        assert_eq!(settled.detail.as_deref(), Some("no such program"));
+    }
+
+    #[test]
+    fn a_late_settle_cannot_reopen_a_request_that_already_finished() {
+        // The RPC-timeout shape: the caller gave up and the outcome arrives
+        // afterwards, or arrives twice. `Launching` is the only state a settle
+        // may move, so a request settled as `Stale` by a Stop cannot later be
+        // reported as `Started` by a call that was already in flight.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        shared.settle_session_launch(&request.request_id, Ok(()));
+
+        shared.settle_session_launch(&request.request_id, Err("late failure".to_string()));
+        let settled = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(settled.state, RequestState::Started);
+        assert!(
+            settled.detail.is_none(),
+            "no failure was recorded over a success"
+        );
+    }
+
+    #[test]
+    fn settling_an_unknown_request_is_a_no_op_rather_than_a_panic() {
+        let (shared, _dir) = shared_with_requester();
+        shared.settle_session_launch("sreq-nope", Ok(()));
+        assert!(shared.session_request_list().requests.is_empty());
+    }
+
+    #[test]
+    fn three_requests_may_await_a_decision_and_a_fourth_may_not() {
+        let (shared, _dir) = shared_with_requester();
+        for _ in 0..MAX_OUTSTANDING_REQUESTS {
+            admit(&shared);
+        }
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "one more", false, false)
+            .unwrap_err();
+        assert!(err.contains("awaiting a human decision"), "{err}");
+
+        // Resolving one frees exactly one slot: the cap counts what is waiting,
+        // not what has ever been asked.
+        let first = shared.session_request_list().requests[0].request_id.clone();
+        shared.deny_session_request(&first).unwrap();
+        admit(&shared);
+    }
+
+    #[test]
+    fn a_launching_request_still_counts_against_the_outstanding_cap() {
+        // Launching is not resolved. A pane that is mid-spawn is exactly the
+        // situation where a conductor should not be queueing two more.
+        let (shared, _dir) = shared_with_requester();
+        let first = admit(&shared);
+        admit(&shared);
+        admit(&shared);
+        shared
+            .claim_session_request(&first.request_id, None)
+            .unwrap();
+
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "one more", false, false)
+            .unwrap_err();
+        assert!(err.contains("awaiting a human decision"), "{err}");
+    }
+
+    #[test]
+    fn the_run_total_is_not_refunded_by_a_denial() {
+        let (shared, _dir) = shared_with_requester();
+        for _ in 0..MAX_ADMITTED_REQUESTS {
+            let request = admit(&shared);
+            shared.deny_session_request(&request.request_id).unwrap();
+        }
+        let list = shared.session_request_list();
+        assert_eq!(list.admitted, MAX_ADMITTED_REQUESTS);
+        assert_eq!(list.outstanding, 0, "nothing is waiting, and yet");
+
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "one more", false, false)
+            .unwrap_err();
+        assert!(err.contains("already admitted"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_request_is_refused_before_anything_is_charged() {
+        let (shared, _dir) = shared_with_requester();
+
+        let long_model = "x".repeat(MAX_MODEL_BYTES + 1);
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            ("bash", "opus", "reason", "unknown host"),
+            ("claude", "", "reason", "model is required"),
+            ("claude", "opus", "  ", "reason is required"),
+            ("claude", "opus", "line\nbreak", "control characters"),
+            ("claude", &long_model, "reason", "over the"),
+        ];
+        for (kind, model, reason, expected) in cases {
+            let err = shared
+                .admit_session_request("sess-1", kind, model, reason, false, false)
+                .unwrap_err();
+            assert!(err.contains(expected), "{kind}/{model}: {err}");
+        }
+
+        let list = shared.session_request_list();
+        assert_eq!(list.admitted, 0, "validation ran before the charge");
+        assert!(list.requests.is_empty(), "and recorded nothing");
+    }
+
+    #[test]
+    fn an_oversized_field_is_refused_rather_than_truncated() {
+        // Truncating a reason would hand the user a decision to make about a
+        // request whose text they cannot see the end of.
+        let err = check_request_field(
+            "reason",
+            &"x".repeat(MAX_REASON_BYTES + 1),
+            MAX_REASON_BYTES,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("shorten it rather than relying on truncation"),
+            "{err}"
+        );
+        assert!(
+            check_request_field("reason", &"x".repeat(MAX_REASON_BYTES), MAX_REASON_BYTES).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_paid_openrouter_refusal_applies_at_admission_too() {
+        // The existing guard is a rejection rule, not a model allowlist, and a
+        // request is a launch path like any other.
+        let (shared, _dir) = shared_with_requester();
+        let err = shared
+            .admit_session_request(
+                "sess-1",
+                "opencode",
+                "openrouter/gpt-4o",
+                "reason",
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("paid OpenRouter"), "{err}");
+        assert_eq!(shared.session_request_list().admitted, 0);
+
+        shared
+            .admit_session_request(
+                "sess-1",
+                "opencode",
+                "openrouter/free",
+                "reason",
+                false,
+                false,
+            )
+            .expect("a free id is admitted");
+    }
+
+    #[test]
+    fn a_request_from_another_brain_is_refused() {
+        let (shared, _dir) = shared_with_requester();
+        shared.set_room("sess-1", "side");
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "reason", false, false)
+            .unwrap_err();
+        assert!(err.contains("'main' brain only"), "{err}");
+    }
+
+    #[test]
+    fn only_the_pane_that_made_a_request_can_read_it() {
+        // Reading grants no authority, but it does leak what another agent is
+        // doing, and a pane reading someone else's id would poll forever on a
+        // request it cannot affect.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        let err = shared
+            .session_request_status(&request.request_id, "sess-2")
+            .unwrap_err();
+        assert!(err.contains("belongs to another pane"), "{err}");
+        shared
+            .session_request_status(&request.request_id, "sess-1")
+            .expect("its own");
+    }
+
+    #[test]
+    fn a_request_is_unreadable_from_a_brain_it_was_not_made_in() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.set_room("sess-1", "side");
+
+        let err = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap_err();
+        assert!(err.contains("was made from brain 'main'"), "{err}");
+    }
+
+    #[test]
+    fn a_respawned_pane_cannot_read_its_predecessors_request() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.note_session("sess-1", "claude", "opus");
+
+        let err = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap_err();
+        assert!(err.contains("earlier incarnation"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_id_and_an_evicted_one_read_the_same() {
+        // Telling them apart would need a permanent record of every id ever
+        // issued. Saying `NotFoundOrExpired` to both is the honest shape.
+        let (shared, _dir) = shared_with_requester();
+        let err = shared
+            .session_request_status("sreq-999", "sess-1")
+            .unwrap_err();
+        assert!(err.contains("NotFoundOrExpired"), "{err}");
+        let err = shared.deny_session_request("sreq-999").unwrap_err();
+        assert!(err.contains("NotFoundOrExpired"), "{err}");
+        let err = shared.claim_session_request("sreq-999", None).unwrap_err();
+        assert!(err.contains("NotFoundOrExpired"), "{err}");
+    }
+
+    #[test]
+    fn the_history_stays_bounded_and_evicts_only_terminal_records() {
+        let mut store = super::RequestStore::default();
+        store
+            .requests
+            .push(fake_request("keep-pending", RequestState::Pending));
+        store
+            .requests
+            .push(fake_request("keep-launching", RequestState::Launching));
+        for n in 0..MAX_TERMINAL_REQUESTS + 5 {
+            store
+                .requests
+                .push(fake_request(&format!("done-{n}"), RequestState::Started));
+        }
+
+        Shared::evict_terminal_requests(&mut store);
+
+        let terminal = store
+            .requests
+            .iter()
+            .filter(|r| r.state.is_terminal())
+            .count();
+        assert_eq!(terminal, MAX_TERMINAL_REQUESTS);
+        assert!(
+            store
+                .requests
+                .iter()
+                .any(|r| r.request_id == "keep-pending"),
+            "a pending request is never evicted"
+        );
+        assert!(
+            store
+                .requests
+                .iter()
+                .any(|r| r.request_id == "keep-launching"),
+            "nor a launching one"
+        );
+        // The oldest terminal records go first, so the newest history survives.
+        assert!(!store.requests.iter().any(|r| r.request_id == "done-0"));
+        assert!(store
+            .requests
+            .iter()
+            .any(|r| r.request_id == format!("done-{}", MAX_TERMINAL_REQUESTS + 4)));
+    }
+
+    #[test]
+    fn a_reset_clears_the_allowance_but_preserves_undecided_work() {
+        let (shared, _dir) = shared_with_requester();
+        let pending = admit(&shared);
+        let launching = admit(&shared);
+        let denied = admit(&shared);
+        shared
+            .claim_session_request(&launching.request_id, None)
+            .unwrap();
+        shared.deny_session_request(&denied.request_id).unwrap();
+
+        let list = shared.reset_session_requests();
+
+        assert_eq!(list.admitted, 0, "the allowance is what a reset resets");
+        assert_eq!(list.outstanding, 2, "a reset is not a cancellation");
+        let ids: Vec<&str> = list
+            .requests
+            .iter()
+            .map(|r| r.request_id.as_str())
+            .collect();
+        assert!(ids.contains(&pending.request_id.as_str()));
+        assert!(ids.contains(&launching.request_id.as_str()));
+        assert!(
+            !ids.contains(&denied.request_id.as_str()),
+            "terminal history is cleared with the allowance"
+        );
+    }
+
+    #[test]
+    fn a_reset_cannot_let_a_new_request_reuse_an_id_a_poller_still_holds() {
+        let (shared, _dir) = shared_with_requester();
+        let first = admit(&shared);
+        shared.deny_session_request(&first.request_id).unwrap();
+        shared.reset_session_requests();
+
+        let second = admit(&shared);
+        assert_ne!(
+            second.request_id, first.request_id,
+            "an agent polling the old id must not be answered about a new request"
+        );
+    }
+
+    #[test]
+    fn an_edited_model_is_what_gets_recorded_on_the_launch() {
+        // The human can change the model in the approval dialog. Whatever they
+        // approve is what the record has to say afterwards, or the history
+        // describes a launch that did not happen.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        assert_eq!(request.model, "opus");
+
+        let claimed = shared
+            .claim_session_request(&request.request_id, Some("sonnet"))
+            .unwrap()
+            .request;
+        assert_eq!(claimed.model, "sonnet");
+        assert!(
+            !claimed.model_verified,
+            "an edit does not inherit verification"
+        );
+        assert_eq!(
+            shared
+                .session_request_status(&request.request_id, "sess-1")
+                .unwrap()
+                .model,
+            "sonnet"
+        );
+    }
+
+    #[test]
+    fn a_verified_model_says_so_and_an_unverified_one_does_not() {
+        // The flag exists because only some hosts have a catalogue to check
+        // against, and reporting a Claude model as verified would be a claim
+        // nothing backs.
+        let (shared, _dir) = shared_with_requester();
+        let unverified = admit(&shared);
+        assert!(!unverified.model_verified);
+
+        let verified = shared
+            .admit_session_request("sess-1", "codex", "gpt-5", "reason", false, true)
+            .unwrap();
+        assert!(verified.model_verified);
+    }
+
+    #[test]
+    fn what_the_ui_reads_matches_what_the_store_holds() {
+        let (shared, _dir) = shared_with_requester();
+        let list = shared.session_request_list();
+        assert_eq!(list.outstanding_limit, MAX_OUTSTANDING_REQUESTS);
+        assert_eq!(list.admitted_limit, MAX_ADMITTED_REQUESTS);
+        assert!(list.allocator_ready, "the fixture finished restoring");
+
+        let (closed, _dir2) = shared_for_test();
+        assert!(
+            !closed.session_request_list().allocator_ready,
+            "before restore the UI must be able to say so"
+        );
+    }
+
+    #[test]
+    fn the_captured_project_is_the_selected_one_not_its_journal_directory() {
+        // The defect this replaces: admission copied `Shared::dir`, which for a
+        // project `/repo` is `/repo/.pantheon/context`. An approved agent was
+        // then launched with the journal folder as its working directory, and
+        // could fail outright when that folder did not exist yet.
+        let (shared, storage) = shared_with_requester();
+        let project = tempfile::tempdir().expect("project dir");
+        let project_path = project.path().canonicalize().unwrap();
+        shared.set_selected_project(Some(project_path.clone()), storage.path().join("context"));
+        shared.set_conductor(Some("sess-1".to_string()));
+
+        let request = admit(&shared);
+        assert_eq!(
+            request.project.as_deref(),
+            Some(project_path.to_string_lossy().as_ref()),
+            "the request captures the project the human picked"
+        );
+        assert_ne!(
+            request.project,
+            shared
+                .dir
+                .lock()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+                .into(),
+            "and not the directory its journal is written to"
+        );
+    }
+
+    #[test]
+    fn with_no_project_selected_a_request_captures_none() {
+        // Not the app data context path dressed up as a project. A request
+        // carrying that would launch an agent into the application's own
+        // storage.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        assert_eq!(request.project, None);
+    }
+
+    // --- startup admission ----------------------------------------------------
+
+    #[test]
+    fn a_pane_that_has_not_connected_is_refused_its_first_dispatch() {
+        let now = 1_000_000;
+        let state = startup_label(None, now, now);
+        assert_eq!(state, StartupState::Starting);
+
+        let err = startup_admission("sess-2", state, false, None).unwrap_err();
+        assert!(err.contains("has not connected"), "{err}");
+    }
+
+    #[test]
+    fn a_connected_but_noisy_pane_is_refused_for_a_different_reason() {
+        // Two refusals, kept apart because they need different things from the
+        // user: one is a wait, the other is a wait for something else.
+        let state = startup_label(Some(5), 0, 10);
+        assert_eq!(state, StartupState::Connected);
+
+        let err = startup_admission("sess-2", state, false, Some(0)).unwrap_err();
+        assert!(err.contains("still producing output"), "{err}");
+        let err = startup_admission("sess-2", state, false, None).unwrap_err();
+        assert!(err.contains("still producing output"), "{err}");
+
+        startup_admission(
+            "sess-2",
+            state,
+            false,
+            Some(crate::headless::HEADLESS_QUIET_MS),
+        )
+        .expect("quiet for long enough");
+    }
+
+    #[test]
+    fn a_ready_timeout_never_claims_the_pane_is_dead() {
+        let state = startup_label(None, 0, REQUEST_PANE_READY_TIMEOUT_MS);
+        assert_eq!(state, StartupState::ReadyTimeout);
+
+        let err = startup_admission("sess-2", state, false, None).unwrap_err();
+        assert!(err.contains("Nothing was killed"), "{err}");
+        assert!(err.contains("no replacement was started"), "{err}");
+        assert!(err.contains("may still connect"), "{err}");
+        assert!(!err.contains("failed"), "a timeout is not a failure: {err}");
+    }
+
+    #[test]
+    fn the_deadline_is_a_deadline_and_not_a_rounding() {
+        assert_eq!(
+            startup_label(None, 0, REQUEST_PANE_READY_TIMEOUT_MS - 1),
+            StartupState::Starting
+        );
+        assert_eq!(
+            startup_label(None, 0, REQUEST_PANE_READY_TIMEOUT_MS),
+            StartupState::ReadyTimeout
+        );
+    }
+
+    #[test]
+    fn a_pane_that_connects_late_stops_reading_as_timed_out() {
+        // The label is derived, not stored, so a recorded timeout does not
+        // become a verdict the pane can never escape.
+        let late = REQUEST_PANE_READY_TIMEOUT_MS * 3;
+        assert_eq!(startup_label(Some(late), 0, late), StartupState::Connected);
+    }
+
+    #[test]
+    fn an_already_admitted_pane_is_not_gated_again() {
+        // A startup gate, not a permanent restriction. Once a pane has taken a
+        // dispatch it behaves like any manual pane, including going quiet
+        // mid-task without becoming undispatchable.
+        for state in [
+            StartupState::Starting,
+            StartupState::Connected,
+            StartupState::ReadyTimeout,
+        ] {
+            startup_admission("sess-2", state, true, None)
+                .unwrap_or_else(|e| panic!("{state:?} should be admitted once past startup: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_manual_pane_keeps_its_existing_behaviour() {
+        // Nothing registered it, so the extra check does not apply to it at
+        // all. This increment deliberately leaves manual panes alone.
+        let (shared, _dir) = shared_with_requester();
+        shared
+            .admit_request_pane_dispatch("sess-9")
+            .expect("not a request pane");
+    }
+
+    #[test]
+    fn a_started_launch_registers_the_pane_and_gates_it() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claimed = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        let pane = claimed.session_id.clone().unwrap();
+        shared.settle_session_launch(&request.request_id, Ok(()));
+
+        let record = shared.request_pane_startup(&pane).expect("registered");
+        assert_eq!(record.state, StartupState::Starting);
+        assert!(!record.admitted);
+
+        let err = shared.admit_request_pane_dispatch(&pane).unwrap_err();
+        assert!(err.contains("has not connected"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_launch_registers_no_pane_to_wait_for() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claimed = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request;
+        let pane = claimed.session_id.clone().unwrap();
+        shared.settle_session_launch(&request.request_id, Err("boom".to_string()));
+
+        assert!(
+            shared.request_pane_startup(&pane).is_none(),
+            "there is no pane, so there is nothing to be Starting"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_connected_before_its_launch_settled_is_not_stuck_starting() {
+        // A CLI can reach the endpoint before the spawn call returns. Without
+        // seeding from `connected`, that pane would read `Starting` until it
+        // timed out, and refuse every dispatch in the meantime.
+        let (shared, _dir) = shared_with_requester();
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .insert("sess-2".to_string());
+
+        shared.register_request_pane("sess-2");
+        let record = shared.request_pane_startup("sess-2").expect("registered");
+        assert_eq!(record.state, StartupState::Connected);
+    }
+
+    #[test]
+    fn a_respawn_restarts_a_request_panes_startup_state_without_dropping_it() {
+        // Same id, different process. Whatever the last incarnation earned,
+        // this one has not connected and has not taken a dispatch.
+        //
+        // This test previously asserted the record was gone, which is a
+        // different claim and the wrong one: a pane with no record is read as
+        // a manual pane and admitted without the startup check. Losing the
+        // history and losing the gate are not the same thing, and only the
+        // first is wanted here.
+        let (shared, _dir) = shared_with_requester();
+        shared.register_request_pane("sess-2");
+        shared.mark_request_pane_admitted("sess-2");
+        assert!(shared.request_pane_startup("sess-2").unwrap().admitted);
+
+        shared.note_session("sess-2", "claude", "opus");
+        let record = shared
+            .request_pane_startup("sess-2")
+            .expect("the pane is still one a request created");
+        assert!(!record.admitted, "the new process has taken no dispatch");
+        assert_eq!(record.state, StartupState::Starting);
+        assert_eq!(record.connected_ms, None);
+        assert!(
+            shared.admit_request_pane_dispatch("sess-2").is_err(),
+            "and it is still gated until it connects"
+        );
+    }
+
+    #[test]
+    fn the_spawn_that_follows_a_claim_does_not_erase_the_startup_gate() {
+        // The regression. `spawn_session_inner` calls `note_session` on its way
+        // to creating the PTY, so this runs on the FIRST spawn of a requested
+        // pane, between the claim that registered it and the process existing.
+        // While that call deleted the record, every approved session was
+        // dispatchable the instant it was claimed, before it had connected.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        let pane = claim.request.session_id.clone().expect("claimed an id");
+        assert!(shared.request_pane_startup(&pane).is_some());
+
+        // Exactly what the production spawn helper does next.
+        shared.note_session(&pane, "claude", "opus");
+
+        assert!(
+            shared.request_pane_startup(&pane).is_some(),
+            "the pane a request created is still one a request created"
+        );
+        assert!(
+            shared.admit_request_pane_dispatch(&pane).is_err(),
+            "a newly requested pane stays blocked until it connects"
+        );
+    }
+
+    #[test]
+    fn a_requester_that_dies_between_validation_and_commitment_is_not_launched() {
+        // Astra's probe, kept as written. The seam fires after the staleness
+        // check has passed and before anything is committed, and the hook does
+        // the same non-gated liveness removal a pane's death does.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let weak = Arc::downgrade(&shared);
+        shared.set_test_seam(move |hit| {
+            if hit == "request-claim-validated" {
+                weak.upgrade().unwrap().mark_request_pane_dead("sess-1");
+            }
+        });
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(!claim.launch_authorized, "requester died before commitment");
+
+        // And the settled shape, which the probe did not reach. Without the
+        // rest of this the request could come back unauthorized while still
+        // sitting in the store as `Launching`, waiting out a launch that will
+        // never be reported either way.
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert_eq!(
+            claim.request.detail.as_deref(),
+            Some("pane sess-1 is no longer running")
+        );
+        assert_eq!(
+            claim.request.session_id, None,
+            "a request that never launched must not name a pane"
+        );
+        assert!(
+            shared.request_pane_startups().is_empty(),
+            "and no pane was registered for it"
+        );
+    }
+
+    /// Drive a claim to the named seam, run `during` on another thread while the
+    /// claim is parked there, and return the claim.
+    ///
+    /// The other thread is the point. A removal takes the gate for write, and
+    /// the claim is holding it for read on this thread, so calling one inline
+    /// from a seam hook would deadlock rather than race. Two threads is the
+    /// only shape in which the ordering is a question at all.
+    fn claim_while(
+        shared: &Arc<Shared>,
+        request_id: &str,
+        seam: &'static str,
+        during: impl FnOnce() + Send + 'static,
+    ) -> Result<super::RequestClaim, String> {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            reached_rx.recv().expect("seam was never reached");
+            during();
+        });
+        let reached = Mutex::new(Some(reached_tx));
+        shared.set_test_seam(move |hit| {
+            if hit == seam {
+                if let Some(tx) = reached.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                }
+                // Long enough for the other thread to be waiting on the gate.
+                // The assertions do not depend on it: the claim holds the gate
+                // for read throughout, so a gated removal cannot complete here
+                // however the two threads are scheduled. This only makes the
+                // interleaving the realistic one.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let claim = shared.claim_session_request(request_id, None);
+        other.join().expect("the racing thread panicked");
+        claim
+    }
+
+    #[test]
+    fn a_close_racing_a_commit_is_ordered_after_it() {
+        // Commitment wins. The user closes the requester's pane while the claim
+        // is between its liveness snapshot and returning authority. The close
+        // takes the lifecycle gate for write and the claim holds it for read,
+        // so the close lands after, and the already-made decision stands rather
+        // than being retroactively invalidated.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let engine = shared.engine.clone();
+
+        let claim = claim_while(&shared, &request.request_id, "request-claim-committed", {
+            let engine = engine.clone();
+            move || engine.kill("sess-1")
+        })
+        .unwrap();
+
+        assert!(claim.launch_authorized, "the commit was already decided");
+        assert_eq!(claim.request.state, RequestState::Launching);
+        // And the close did happen, once the gate was free.
+        assert!(!shared.live_request_panes().contains(&"sess-1".to_string()));
+    }
+
+    #[test]
+    fn a_close_that_completes_first_stops_the_commit() {
+        // Removal wins. The same close, finished before the claim starts, and
+        // now the claim cannot commit from a snapshot that predates it.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        shared.engine.kill("sess-1");
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        assert!(!claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert_eq!(
+            claim.request.detail.as_deref(),
+            Some("pane sess-1 is no longer running")
+        );
+        assert_eq!(claim.request.session_id, None);
+        assert!(shared.request_pane_startups().is_empty());
+    }
+
+    #[test]
+    fn an_agent_exit_racing_a_commit_is_ordered_after_it() {
+        // The same two orders for the half a user never triggers: the agent
+        // quit or crashed and the forwarding loop is tearing its session down.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let engine = shared.engine.clone();
+
+        let claim = claim_while(&shared, &request.request_id, "request-claim-committed", {
+            let engine = engine.clone();
+            move || crate::release_exited_session(&engine, "sess-1")
+        })
+        .unwrap();
+
+        assert!(claim.launch_authorized, "the commit was already decided");
+        assert!(!shared.live_request_panes().contains(&"sess-1".to_string()));
+    }
+
+    #[test]
+    fn an_agent_exit_that_completes_first_stops_the_commit() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        crate::release_exited_session(&shared.engine, "sess-1");
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        assert!(!claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert_eq!(
+            claim.request.detail.as_deref(),
+            Some("pane sess-1 is no longer running")
+        );
+    }
+
+    #[test]
+    fn a_close_at_the_earlier_seam_is_also_ordered_after_the_commit() {
+        // The same guarantee one seam earlier, before reservation rather than
+        // after it. Astra's probe fires at this seam with the ungated helper,
+        // which stands for a death nothing can order; this is the orderable
+        // half at the same point, and it must reach the opposite answer.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let engine = shared.engine.clone();
+
+        let claim = claim_while(&shared, &request.request_id, "request-claim-validated", {
+            let engine = engine.clone();
+            move || engine.kill("sess-1")
+        })
+        .unwrap();
+
+        assert!(
+            claim.launch_authorized,
+            "a close cannot complete inside the gated section"
+        );
+        assert!(!shared.live_request_panes().contains(&"sess-1".to_string()));
+    }
+
+    #[test]
+    fn the_liveness_recheck_does_not_withdraw_a_claim_whose_requester_is_alive() {
+        // The recheck runs on every authorized claim, so its false-positive
+        // behaviour matters as much as its true positives: a claim it withdrew
+        // by accident would be an approval the user made and never got.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        assert!(claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Launching);
+        let pane = claim.request.session_id.expect("claimed an id");
+        assert!(
+            shared.request_pane_startup(&pane).is_some(),
+            "startup tracking still begins at the claim"
+        );
+    }
+
+    #[test]
+    fn a_manual_pane_is_untouched_by_the_restart() {
+        // The other half: `note_session` is the ordinary path for every manual
+        // pane too, and none of them has a record. The restart must not invent
+        // one, or manual panes would acquire a startup gate this increment
+        // deliberately does not give them.
+        let (shared, _dir) = shared_with_requester();
+        shared.note_session("sess-9", "claude", "opus");
+        assert!(shared.request_pane_startup("sess-9").is_none());
+        assert!(shared.admit_request_pane_dispatch("sess-9").is_ok());
+    }
+
+    #[test]
+    fn a_pane_that_reconnected_during_the_restart_is_not_sent_back_to_starting() {
+        // `note_session` clears `connected` and then restarts the record. A
+        // CLI that reaches its endpoint in between is connected, and the
+        // restart reads `connected` rather than assuming its own clear still
+        // holds, so that pane is not left waiting out a timeout it already
+        // beat.
+        let (shared, _dir) = shared_with_requester();
+        shared.register_request_pane("sess-2");
+        shared.note_session("sess-2", "claude", "opus");
+        assert_eq!(
+            shared.request_pane_startup("sess-2").unwrap().state,
+            StartupState::Starting
+        );
+
+        shared.mark_connected("sess-2");
+        shared.restart_request_pane("sess-2");
+        assert_eq!(
+            shared.request_pane_startup("sess-2").unwrap().state,
+            StartupState::Connected
+        );
+    }
+
+    #[test]
+    fn two_concurrent_requests_cannot_both_take_the_last_free_slot() {
+        // The cap check and the charge are under one lock for this reason. Two
+        // agents asking at the same moment is not exotic: a conductor fanning
+        // work out is the normal case, and a run that admits four requests
+        // when its limit is three has no limit.
+        let (shared, _dir) = shared_with_requester();
+        for _ in 0..MAX_OUTSTANDING_REQUESTS - 1 {
+            admit(&shared);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    shared.admit_session_request("sess-1", "claude", "opus", "race", false, false)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(admitted, 1, "exactly one of the two took the slot");
+        let list = shared.session_request_list();
+        assert_eq!(list.outstanding, MAX_OUTSTANDING_REQUESTS);
+        assert_eq!(
+            list.admitted, MAX_OUTSTANDING_REQUESTS as u32,
+            "the refused one was charged nothing"
+        );
+    }
+
+    #[test]
+    fn two_concurrent_approvals_reserve_exactly_one_id() {
+        // The same property at the other end: two windows, or a click racing a
+        // keyboard shortcut, must not produce two panes for one request.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                let id = request.request_id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    shared.claim_session_request(&id, None)
+                })
+            })
+            .collect();
+        let claims: Vec<super::RequestClaim> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("both callers get an answer"))
+            .collect();
+
+        assert_eq!(
+            claims[0].request.session_id, claims[1].request.session_id,
+            "the loser reads back the winner's id rather than getting its own"
+        );
+        assert_eq!(claims[0].request.state, RequestState::Launching);
+        // The id is not the property that matters, and asserting only it is how
+        // this test used to pass while both callers went on to spawn. Exactly
+        // one caller may invoke the launch, and exactly one may settle it.
+        assert_eq!(
+            claims.iter().filter(|c| c.launch_authorized).count(),
+            1,
+            "exactly one caller is authorized to launch and to settle"
+        );
+        // One id consumed whichever way the two threads interleaved.
+        assert_eq!(shared.reserve_session_id().unwrap(), "sess-2");
+    }
+
+    #[test]
+    fn the_ui_list_reports_every_request_panes_startup_state() {
+        let (shared, _dir) = shared_with_requester();
+        shared.register_request_pane("sess-3");
+        shared.register_request_pane("sess-2");
+
+        let startups = shared.session_request_list().startups;
+        let panes: Vec<&str> = startups.iter().map(|s| s.pane.as_str()).collect();
+        assert_eq!(
+            panes,
+            vec!["sess-2", "sess-3"],
+            "sorted, so the UI does not jump"
+        );
+        assert!(startups.iter().all(|s| s.state == StartupState::Starting));
+    }
+
+    // --- the launch lifecycle -------------------------------------------------
+
+    #[test]
+    fn a_claim_registers_its_pane_before_any_process_exists() {
+        // Registration used to wait for a successful spawn, which left a real
+        // window: a CLI can reach its MCP endpoint before the spawn call that
+        // started it has returned. A pane with no startup record is treated as
+        // a manual pane, so that window skipped the first-dispatch gate and the
+        // connection accounting entirely.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        let pane = claim.request.session_id.clone().expect("reserved an id");
+
+        let record = shared
+            .request_pane_startup(&pane)
+            .expect("the pane is tracked from the claim, before anything is spawned");
+        assert_eq!(record.state, StartupState::Starting);
+        assert!(!record.admitted);
+    }
+
+    #[test]
+    fn a_just_claimed_pane_must_connect_before_its_first_dispatch() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let pane = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request
+            .session_id
+            .expect("reserved an id");
+
+        let err = shared
+            .admit_request_pane_dispatch(&pane)
+            .expect_err("a pane that has not connected cannot be dispatched to");
+        assert!(err.contains(&pane), "{err}");
+    }
+
+    #[test]
+    fn a_started_request_is_recorded_while_its_pane_is_still_starting() {
+        // `Started` means the child exists, not that it has finished. The
+        // command used to await the whole of the spawn helper, which returns
+        // when the *session* ends, so a healthy agent sat in `Launching` for
+        // its entire life and three of them held the outstanding cap forever.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let pane = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request
+            .session_id
+            .expect("reserved an id");
+
+        shared.settle_session_launch(&request.request_id, Ok(()));
+
+        let settled = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(settled.state, RequestState::Started);
+        assert_eq!(
+            shared.request_pane_startup(&pane).map(|r| r.state),
+            Some(StartupState::Starting),
+            "started, and still waiting for the agent to connect"
+        );
+        assert_eq!(
+            shared.session_request_list().outstanding,
+            0,
+            "a started request no longer holds a slot"
+        );
+    }
+
+    #[test]
+    fn a_failed_launch_forgets_the_pane_the_claim_registered() {
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        let pane = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap()
+            .request
+            .session_id
+            .expect("reserved an id");
+        assert!(shared.request_pane_startup(&pane).is_some());
+
+        shared.settle_session_launch(&request.request_id, Err("no such program".to_string()));
+        assert!(
+            shared.request_pane_startup(&pane).is_none(),
+            "no process exists for this pane and none ever will"
+        );
+    }
+
+    #[test]
+    fn a_repeat_approval_gets_no_authority_and_cannot_overwrite_a_live_launch() {
+        // The sequential half of the duplicate-approval defect. The first claim
+        // wins; the second used to read back `Launching` and, because the
+        // command could not tell that from having just won, went on to call the
+        // spawn helper for the same reserved id. The helper's duplicate check
+        // refused, and that observed failure settled a request whose first
+        // process was running perfectly well as `Failed`.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        let first = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(first.launch_authorized);
+        let pane = first.request.session_id.clone().unwrap();
+
+        let second = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(
+            !second.launch_authorized,
+            "a repeat approval starts nothing, so it may settle nothing"
+        );
+        assert_eq!(second.request.state, RequestState::Launching);
+        assert_eq!(second.request.session_id.as_deref(), Some(pane.as_str()));
+
+        // The winner's launch then succeeds, and the record says so. Nothing
+        // the loser did could have turned this into `Failed`.
+        shared.settle_session_launch(&request.request_id, Ok(()));
+        assert_eq!(
+            shared
+                .session_request_status(&request.request_id, "sess-1")
+                .unwrap()
+                .state,
+            RequestState::Started
+        );
+    }
+
+    // --- the lifecycle gate ---------------------------------------------------
+
+    #[test]
+    fn stop_settles_pending_requests_so_resume_cannot_revive_them() {
+        // Consulting `halted` at commitment refuses an approval only while Stop
+        // is in force. A request that was pending when the human pressed Stop
+        // was made in a world that no longer exists, and resuming for an
+        // unrelated reason must not make it launchable again.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+
+        shared.set_halted(true);
+        let stopped = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(stopped.state, RequestState::Stale);
+        assert!(
+            stopped
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Stop was pressed"),
+            "{stopped:?}"
+        );
+
+        shared.set_halted(false);
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(!claim.launch_authorized, "Resume must not resurrect it");
+        assert_eq!(claim.request.state, RequestState::Stale);
+    }
+
+    #[test]
+    fn a_launching_request_survives_stop_because_its_process_may_already_exist() {
+        // The other half of the rule. Rewriting a claimed record would claim
+        // nothing was started when something was; Stop kills running work
+        // through its own path.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        shared.set_halted(true);
+        assert_eq!(
+            shared
+                .session_request_status(&request.request_id, "sess-1")
+                .unwrap()
+                .state,
+            RequestState::Launching
+        );
+    }
+
+    /// Run `body` with the claim paused at `label`, and report whether a
+    /// world-changing call on another thread was able to complete meanwhile.
+    ///
+    /// The sleep is deliberate and only ever runs in the direction that makes
+    /// an ungated build *fail*: without the gate the mutation completes and the
+    /// flag is set. The mutating thread signals before it calls, so a thread
+    /// that was simply never scheduled cannot be mistaken for one that blocked.
+    fn mutation_lands_while_paused_at(
+        label: &'static str,
+        pause: impl FnOnce(Arc<Shared>) + Send + 'static,
+        mutate: impl FnOnce(Arc<Shared>) + Send + 'static,
+        shared: Arc<Shared>,
+    ) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        shared.set_test_seam(move |hit| {
+            if hit == label {
+                paused_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+
+        let paused_thread = {
+            let shared = shared.clone();
+            std::thread::spawn(move || pause(shared))
+        };
+        paused_rx.recv().expect("the paused path reached the seam");
+
+        let landed = Arc::new(AtomicBool::new(false));
+        let (going_tx, going_rx) = std::sync::mpsc::channel();
+        let mutating_thread = {
+            let shared = shared.clone();
+            let landed = landed.clone();
+            std::thread::spawn(move || {
+                going_tx.send(()).unwrap();
+                mutate(shared);
+                landed.store(true, Ordering::SeqCst);
+            })
+        };
+        going_rx.recv().expect("the mutating thread is running");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let observed = landed.load(Ordering::SeqCst);
+
+        release_tx.send(()).unwrap();
+        paused_thread.join().unwrap();
+        mutating_thread.join().unwrap();
+        observed
+    }
+
+    #[test]
+    fn a_project_switch_cannot_land_between_validation_and_commitment() {
+        // Independently atomic epochs let a claim read `halted == false` and
+        // matching epochs, then have Stop or a switch complete, and still
+        // reserve an id and write `Launching`. The change won the race and a
+        // process was authorized anyway.
+        let (shared, storage) = shared_with_requester();
+        let request = admit(&shared);
+        let id = request.request_id.clone();
+        let elsewhere = storage.path().join("elsewhere");
+
+        let landed = mutation_lands_while_paused_at(
+            "request-claim-validated",
+            move |shared| {
+                let claim = shared.claim_session_request(&id, None).unwrap();
+                assert!(
+                    claim.launch_authorized,
+                    "the claim commits into the world it validated"
+                );
+            },
+            move |shared| shared.set_selected_project(Some(elsewhere.clone()), elsewhere),
+            shared,
+        );
+        assert!(
+            !landed,
+            "a project switch completed between validation and commitment"
+        );
+    }
+
+    #[test]
+    fn a_capture_cannot_take_one_projects_path_and_anothers_epoch() {
+        // Admission read the project before taking the request lock and stamped
+        // the epochs after, so a complete switch in between produced a request
+        // holding A's path with B's epoch. Approval then found every epoch
+        // matching and launched an agent into the wrong directory.
+        let (shared, storage) = shared_with_requester();
+        let first = tempfile::tempdir().expect("first project");
+        let first_path = first.path().canonicalize().unwrap();
+        shared.set_selected_project(Some(first_path.clone()), storage.path().join("one"));
+        let second = storage.path().join("two");
+
+        let landed = mutation_lands_while_paused_at(
+            "request-capture",
+            |shared| {
+                admit(&shared);
+            },
+            move |shared| shared.set_selected_project(Some(second.clone()), second),
+            shared.clone(),
+        );
+        assert!(
+            !landed,
+            "a project switch completed between the project read and its epoch"
+        );
+
+        // Path and epoch agree, so the switch that followed makes this stale
+        // rather than launchable. A torn capture would pass this claim.
+        let request = shared.session_request_list().requests.pop().unwrap();
+        assert_eq!(
+            request.project.as_deref(),
+            Some(first_path.to_string_lossy().as_ref())
+        );
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(!claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert!(
+            claim
+                .request
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("project changed"),
+            "{:?}",
+            claim.request.detail
+        );
+    }
+
+    /// A current-thread runtime, because these two exercise an async ordering
+    /// and the suite is otherwise synchronous.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn an_approved_launch_records_started_without_waiting_for_the_session_to_end() {
+        // The heart of the first defect. `spawn_session_inner` returns when the
+        // *session* ends, so awaiting it meant `Started` was written after the
+        // child had exited and its handle had already been removed.
+        //
+        // `failed` here is never sent and never dropped: it stands for a
+        // session that is still running with its output still being forwarded.
+        // If `settle_approved_launch` awaited it, this test would hang.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        assert!(
+            shared
+                .claim_session_request(&request.request_id, None)
+                .unwrap()
+                .launch_authorized
+        );
+
+        let (launched_tx, launched_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_failed_tx, failed_rx) = tokio::sync::oneshot::channel::<String>();
+        launched_tx.send(()).expect("the child exists");
+
+        block_on(crate::settle_approved_launch(
+            &shared,
+            &request.request_id,
+            launched_rx,
+            failed_rx,
+        ));
+
+        assert_eq!(
+            shared
+                .session_request_status(&request.request_id, "sess-1")
+                .unwrap()
+                .state,
+            RequestState::Started,
+            "started while the session and its output stream are still alive"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_never_started_is_settled_with_the_error_it_reported() {
+        // The other branch: the sender is dropped because the spawn returned an
+        // error before insertion, and the observed error follows. `Failed` is
+        // never invented, so this waits for the real one rather than racing it.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+
+        let (launched_tx, launched_rx) = tokio::sync::oneshot::channel::<()>();
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<String>();
+        drop(launched_tx);
+        failed_tx.send("no such program".to_string()).unwrap();
+
+        block_on(crate::settle_approved_launch(
+            &shared,
+            &request.request_id,
+            launched_rx,
+            failed_rx,
+        ));
+
+        let settled = shared
+            .session_request_status(&request.request_id, "sess-1")
+            .unwrap();
+        assert_eq!(settled.state, RequestState::Failed);
+        assert_eq!(settled.detail.as_deref(), Some("no such program"));
+    }
+
+    // --- requester authority --------------------------------------------------
+
+    #[test]
+    fn a_demotion_before_admission_is_refused_even_with_a_current_epoch() {
+        // The tool layer proves conductor authority before a catalogue probe
+        // that can take seconds. A demotion during that probe left admission
+        // stamping the *new* conductor's epoch onto the old conductor's
+        // request, and every later epoch check then matched.
+        let (shared, _dir) = shared_with_requester();
+        shared.set_conductor(Some("sess-2".to_string()));
+
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "need a hand", false, false)
+            .expect_err("a demoted pane cannot admit a request");
+        assert!(err.contains("does not hold the role"), "{err}");
+    }
+
+    #[test]
+    fn a_dead_requester_cannot_admit_a_request() {
+        let (shared, _dir) = shared_with_requester();
+        shared.mark_request_pane_dead("sess-1");
+        let err = shared
+            .admit_session_request("sess-1", "claude", "opus", "need a hand", false, false)
+            .expect_err("a pane that is not running cannot request a session");
+        assert!(err.contains("is not running"), "{err}");
+    }
+
+    #[test]
+    fn a_requester_that_left_main_cannot_have_its_request_approved() {
+        // Status already refuses such a request. Approval did not, so the human
+        // could lose all visibility of a request that remained launchable.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.set_room("sess-1", "side");
+
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(!claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert!(
+            claim.request.detail.as_deref().unwrap().contains("'side'"),
+            "{:?}",
+            claim.request.detail
+        );
+    }
+
+    #[test]
+    fn a_requester_that_left_main_and_came_back_cannot_either() {
+        // The brain name reads `main` again, so comparing names alone sees no
+        // change. Two context changes happened, which is exactly the reasoning
+        // the project epoch already applies to an A-to-B-to-A return.
+        let (shared, _dir) = shared_with_requester();
+        let request = admit(&shared);
+        shared.set_room("sess-1", "side");
+        shared.set_room("sess-1", "main");
+        assert_eq!(shared.room_for("sess-1"), "main");
+
+        let claim = shared
+            .claim_session_request(&request.request_id, None)
+            .unwrap();
+        assert!(!claim.launch_authorized);
+        assert_eq!(claim.request.state, RequestState::Stale);
+        assert!(
+            claim
+                .request
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("moved between brains"),
+            "{:?}",
+            claim.request.detail
         );
     }
 }

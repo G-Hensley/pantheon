@@ -217,3 +217,100 @@ export const resetDispatchBudget = (): Promise<DispatchBudget> =>
 // ---- Dispatch (human-initiated) ----
 export const dispatchTask = (target: string, task: string): Promise<{ task_id: string }> =>
   invoke("human_dispatch", { target, task });
+
+// ---- Session requests ----
+// An agent asks the backend for a new session (kind/model/reason/isolation);
+// a human approves or denies it here. Mirrors `SessionRequest` and
+// `SessionRequestState` in src-tauri/src/mcp.rs — frozen contract, do not
+// diverge without a matching backend change from whoever owns src-tauri.
+export type SessionRequestState = "pending" | "launching" | "started" | "failed" | "denied" | "stale";
+
+export type SessionRequest = {
+  request_id: string;
+  kind: "claude" | "codex" | "opencode";
+  model: string;
+  // False for a model the free-model guard could not verify against the
+  // CLI's own catalog — the launcher's model field still shows it, but
+  // flagged, rather than silently trusting an unrecognized string.
+  model_verified: boolean;
+  reason: string;
+  isolate: boolean;
+  project: string | null;
+  brain: string;
+  requester: string;
+  state: SessionRequestState;
+  // Only set once a session has actually been created for this request
+  // (state has reached at least "launching"); the id an approved pane must
+  // reuse rather than mint its own.
+  session_id: string | null;
+  detail: string | null;
+  created_ms: number;
+  updated_ms: number;
+};
+
+// Whether a request-created pane has reached its endpoint, from the
+// backend's own observation of that pane, not from anything the frontend
+// infers off the channel. Mirrors `StartupState` in src-tauri/src/mcp.rs.
+export type StartupState = "starting" | "connected" | "ready_timeout";
+
+// What the backend knows about one request-created pane's startup, so the UI
+// can render Starting/Connected/ready_timeout without guessing at it from
+// output timing. Mirrors `StartupRecord` in src-tauri/src/mcp.rs.
+export type StartupRecord = {
+  pane: string;
+  state: StartupState;
+  admitted: boolean;
+  launched_ms: number;
+  connected_ms: number | null;
+};
+
+export type SessionRequestList = {
+  requests: SessionRequest[];
+  // Startup state for panes these requests created — keyed by pane id
+  // (`SessionRequest.session_id`), not request id. See StartupRecord.
+  startups: StartupRecord[];
+  outstanding: number;
+  admitted: number;
+  outstanding_limit: number;
+  admitted_limit: number;
+  // False until initialize_sessions has completed its restore-id barrier;
+  // approve/deny/reset are refused before that (see App.tsx's allocatorReady
+  // gate), so a stale roster id can never collide with a freshly-approved one.
+  allocator_ready: boolean;
+};
+
+export const listSessionRequests = (): Promise<SessionRequestList> => invoke("list_session_requests");
+
+// editedModel is null to accept the request's own model as-is, or a string to
+// override it (always allowed, since the requester's own free-model guard
+// already ran server-side; this is a human's last word, not a second guard).
+// channel must already have `onmessage` assigned before this call, exactly as
+// spawnSession requires — see TerminalPane's attach-to-request mode.
+export const approveSessionRequest = (
+  requestId: string,
+  editedModel: string | null,
+  channel: Channel<Bytes>,
+  rows: number,
+  cols: number,
+): Promise<SessionRequest> =>
+  invoke("approve_session_request", { requestId, editedModel, channel, rows, cols });
+
+export const denySessionRequest = (requestId: string): Promise<SessionRequest> =>
+  invoke("deny_session_request", { requestId });
+
+// Clears every request the human has not acted on. Backend-authoritative:
+// the returned list is what to render next, not just an acknowledgement.
+export const resetSessionRequests = (): Promise<SessionRequestList> => invoke("reset_session_requests");
+
+// Tells the backend which pane ids survived from the last run, before any
+// approval can be admitted. Call once at startup with every restored roster
+// id; nothing in this module or in the approve/deny flow is safe to call
+// before it resolves (see allocatorReady in App.tsx).
+export const initializeSessions = (restoredIds: string[]): Promise<SessionRequestList> =>
+  invoke("initialize_sessions", { restoredIds });
+
+// Mints one fresh, backend-reserved session id for a human-launched pane
+// (the launcher button), replacing the old local sess-N counter: reserving
+// from the same allocator a request-approved pane draws from is what keeps
+// the two id sources from ever colliding.
+export const reserveSessionId = (): Promise<string> => invoke("reserve_session_id");

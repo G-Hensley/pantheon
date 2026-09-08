@@ -76,6 +76,21 @@ body {
   margin-right: 4px;
 }
 
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 6px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--acc-ink);
+  background: var(--acc);
+  border-radius: 999px;
+}
+
 button {
   font: inherit;
 }
@@ -631,6 +646,24 @@ button.ghost.on {
 
 .pane-spawn-error span {
   flex: 1;
+}
+
+.pane-attach-status {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  left: 8px;
+  padding: 4px 9px;
+  color: var(--dim);
+  background: var(--panel2);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.pane-attach-status[data-state="ready_timeout"] {
+  color: #e0af68;
+  border-color: #e0af68;
 }
 
 .launcher-hint {
@@ -1536,6 +1569,203 @@ button.ghost.on {
 .dispatch-foot .primary.sending {
   opacity: 0.8;
   cursor: wait;
+}
+
+/* ---- Session requests ---- */
+.sessreq-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 16, 0.55);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 25;
+  padding: 20px;
+}
+
+.sessreq {
+  width: min(560px, 100%);
+  max-height: min(640px, 90vh);
+  background: var(--panel2);
+  border: 1px solid var(--edge);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.sessreq-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px 8px;
+  border-bottom: 1px solid var(--edge);
+}
+
+.sessreq-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--txt);
+}
+
+.sessreq-count {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.sessreq-notready,
+.sessreq-error {
+  margin: 8px 14px 0;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+.sessreq-notready {
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+}
+
+.sessreq-error {
+  color: var(--danger);
+  background: var(--panel);
+  border: 1px solid var(--danger);
+}
+
+.sessreq-body {
+  padding: 10px 14px 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sessreq-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+}
+
+.sessreq-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sessreq-kind {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--acc);
+}
+
+.sessreq-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.sessreq-state[data-state="started"] {
+  color: #9ece6a;
+}
+
+.sessreq-state[data-state="failed"],
+.sessreq-state[data-state="denied"] {
+  color: var(--danger);
+}
+
+.sessreq-state[data-state="stale"] {
+  color: #e0af68;
+}
+
+.sessreq-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.sessreq-field input {
+  font: inherit;
+  color: var(--txt);
+  background: var(--panel2);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.sessreq-field input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sessreq-unverified {
+  font-size: 11px;
+  color: #e0af68;
+}
+
+.sessreq-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.sessreq-reason,
+.sessreq-detail {
+  margin: 0;
+  font-size: 12px;
+  color: var(--txt);
+}
+
+.sessreq-detail {
+  color: var(--dim);
+}
+
+.sessreq-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sessreq-actions .primary,
+.sessreq-actions .ghost {
+  font-size: 12px;
+}
+
+.sessreq-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.sessreq-history {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
+.sessreq-history .sessreq-model {
+  color: var(--dim);
+}
+
+.sessreq-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--edge);
 }
 
 .spinner {

@@ -12,6 +12,7 @@ import {
   type Bytes,
   type SavedWorktree,
   type SessionType,
+  type StartupState,
 } from "../lib/ipc";
 import { TERM_FONT } from "../lib/themes";
 import { useAppearance } from "../lib/appearance";
@@ -42,6 +43,16 @@ function isIsolationUnavailable(e: unknown): boolean {
 // One xterm terminal bound to one backend session. Owns the terminal lifecycle,
 // the output channel, keystroke write-back, container-driven resize, and live
 // re-theming when the app appearance changes.
+// A session request that a human already approved, with a channel the
+// backend is (or is about to be) writing to. `buffered` holds whatever that
+// channel's temporary handler collected between the approval call and this
+// pane actually mounting — see useSessionRequests.approve, which assigns the
+// handler synchronously before the approval RPC so nothing sent early is
+// lost. This pane takes over the channel outright; it never calls
+// spawnSession, since the backend already did the equivalent work as part of
+// approving the request.
+export type ExternalSession = { channel: Channel<Bytes>; buffered: Bytes[] };
+
 export function TerminalPane({
   sessionId,
   type,
@@ -52,6 +63,9 @@ export function TerminalPane({
   onExit,
   onIsolationChange,
   onSpawnError,
+  externalSession,
+  startupState,
+  alreadyExited,
 }: {
   sessionId: string;
   type: SessionType;
@@ -70,6 +84,26 @@ export function TerminalPane({
   // app say so somewhere the user is looking, which matters most on startup
   // when several panes come back at once.
   onSpawnError?: (id: string, message: string) => void;
+  // Set only for a pane installed from an approved session request. When
+  // present, this pane attaches to the given channel instead of spawning.
+  externalSession?: ExternalSession;
+  // The backend's own observation of this pane's startup, looked up by the
+  // caller from the latest session-requests list (see App.tsx). Undefined
+  // until that list has been read at least once, or if this pane's request
+  // has not registered a startup record yet — both render the same as
+  // "starting", since neither is evidence of a connection.
+  startupState?: StartupState;
+  // True when this exact session id's own end was already reported — either
+  // recovered once at mount from before this pane was ever installed (see
+  // App.tsx's exitEvents.take; only ever meaningful alongside
+  // externalSession, since a manually spawned pane exists before spawning
+  // could possibly fail this fast), or patched in later by App's shared
+  // useExitEvents hook onto an already-installed pane. This pane's own
+  // listener below is registered only at mount and does not actually
+  // subscribe until well after that (listen() is async), so either without
+  // this the pane would show as running forever for a process that already
+  // ended and can never emit that event again.
+  alreadyExited?: boolean;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -80,6 +114,26 @@ export function TerminalPane({
   const { theme, appearance } = useAppearance();
   const [isolationError, setIsolationError] = useState<string | null>(null);
   const continueWithoutIsolationRef = useRef<() => void>(() => {});
+  // Guards every path that can report this pane's own end (the alreadyExited
+  // mount branch below, this pane's own live listener, and the post-mount
+  // effect further down) so a session that ends exactly once is only ever
+  // reported here once, no matter which path observes it.
+  const exitReportedRef = useRef(false);
+  // The queued-output state and the flush-then-write operation built from it,
+  // lifted out of the mount effect so a second effect can reach them too.
+  // Batched output arriving on the channel is queued here and only actually
+  // written to the terminal on the next animation frame (see the mount
+  // effect below); anything that reports this pane's end has to flush that
+  // queue first, or an end marker written straight to the terminal can print
+  // ahead of output that arrived earlier but is still waiting for its frame.
+  // `writeAfterQueuedOutputRef` is assigned inside the mount effect, the same
+  // pattern `scheduleFitRef` and `continueWithoutIsolationRef` already use
+  // for a mount-scoped function another effect needs to call without forcing
+  // an exhaustive-deps re-run on every render.
+  const outputQueueRef = useRef<Uint8Array[]>([]);
+  const outputBytesRef = useRef(0);
+  const outputFrameRef = useRef<number | null>(null);
+  const writeAfterQueuedOutputRef = useRef<(data: string) => void>(() => {});
 
   // Create the terminal once for this pane.
   useEffect(() => {
@@ -97,6 +151,10 @@ export function TerminalPane({
     fit.fit();
     termRef.current = term;
     fitRef.current = fit;
+    exitReportedRef.current = false;
+    outputQueueRef.current = [];
+    outputBytesRef.current = 0;
+    outputFrameRef.current = null;
 
     let resizeInFlight = false;
     let desiredSize: { rows: number; cols: number } | null = null;
@@ -158,22 +216,20 @@ export function TerminalPane({
       writeSession(sessionId, data).catch(() => {});
     });
 
-    const channel = new Channel<Bytes>();
-    const outputQueue: Uint8Array[] = [];
-    let outputBytes = 0;
-    let outputFrame: number | null = null;
+    const channel = externalSession?.channel ?? new Channel<Bytes>();
     const flushOutput = () => {
-      outputFrame = null;
-      if (outputQueue.length === 0) return;
-      outputBytes = 0;
-      if (outputQueue.length === 1) {
-        term.write(outputQueue.shift()!);
+      outputFrameRef.current = null;
+      const queue = outputQueueRef.current;
+      if (queue.length === 0) return;
+      outputBytesRef.current = 0;
+      if (queue.length === 1) {
+        term.write(queue.shift()!);
         return;
       }
-      const total = outputQueue.reduce((n, chunk) => n + chunk.byteLength, 0);
+      const total = queue.reduce((n, chunk) => n + chunk.byteLength, 0);
       const merged = new Uint8Array(total);
       let offset = 0;
-      for (const chunk of outputQueue.splice(0)) {
+      for (const chunk of queue.splice(0)) {
         merged.set(chunk, offset);
         offset += chunk.byteLength;
       }
@@ -181,53 +237,86 @@ export function TerminalPane({
     };
     channel.onmessage = (msg) => {
       const bytes = toBytes(msg);
-      outputQueue.push(bytes);
-      outputBytes += bytes.byteLength;
-      if (outputBytes >= 64 * 1024) {
-        if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      outputQueueRef.current.push(bytes);
+      outputBytesRef.current += bytes.byteLength;
+      if (outputBytesRef.current >= 64 * 1024) {
+        if (outputFrameRef.current !== null) cancelAnimationFrame(outputFrameRef.current);
         flushOutput();
-      } else if (outputFrame === null) {
-        outputFrame = requestAnimationFrame(flushOutput);
+      } else if (outputFrameRef.current === null) {
+        outputFrameRef.current = requestAnimationFrame(flushOutput);
       }
     };
+    // Shared with the alreadyExited prop effect below (via the ref), so a
+    // pane's end is always reported through the same flush-then-write
+    // operation, whichever of the three paths observes it: nothing that
+    // reports an ending may write straight to the terminal while output
+    // that arrived earlier is still sitting in the queue.
     const writeAfterQueuedOutput = (data: string) => {
-      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      if (outputFrameRef.current !== null) cancelAnimationFrame(outputFrameRef.current);
       flushOutput();
       term.write(data);
     };
+    writeAfterQueuedOutputRef.current = writeAfterQueuedOutput;
 
     const ro = new ResizeObserver(scheduleFit);
     ro.observe(elRef.current!);
 
-    if (isolate) {
-      term.write("\x1b[38;5;245m[pantheon] creating an isolated git worktree…\x1b[0m\r\n");
+    if (externalSession) {
+      // Already spawned as part of approving the request; take over the
+      // buffer this channel's temporary handler collected before this pane
+      // existed, in the order it arrived, then fall through to the same
+      // onmessage handler above for everything from here on.
+      for (const msg of externalSession.buffered) {
+        const bytes = toBytes(msg);
+        outputQueueRef.current.push(bytes);
+        outputBytesRef.current += bytes.byteLength;
+      }
+      if (outputQueueRef.current.length > 0 && outputFrameRef.current === null) {
+        outputFrameRef.current = requestAnimationFrame(flushOutput);
+      }
+      if (alreadyExited) {
+        // The event this pane's own listener below exists to catch already
+        // happened, before this pane could exist to catch it, and a session
+        // cannot exit a second time to resend it. Replay whatever it wrote
+        // before dying (queued just above), then report the same ending the
+        // listener would have, through the same path, rather than leaving
+        // this pane looking like a live, running process forever.
+        exitReportedRef.current = true;
+        writeAfterQueuedOutput("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
+        onExit(sessionId);
+      }
+    } else {
+      if (isolate) {
+        term.write("\x1b[38;5;245m[pantheon] creating an isolated git worktree…\x1b[0m\r\n");
+      }
+      const start = (withIsolation: boolean) => {
+        setIsolationError(null);
+        spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
+          isolate: withIsolation,
+          cwd,
+          // Only an isolated attempt may rejoin the saved worktree. Carrying on
+          // without isolation means there is no worktree to rejoin, and handing
+          // one over anyway would ask the backend for a contradiction.
+          reuseWorktree: withIsolation ? reuseWorktree : undefined,
+          model: model && model.length > 0 ? model : undefined,
+          modelFlag: type.modelFlag,
+        }).catch((e) => {
+          const message = spawnErrorText(e);
+          writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);
+          if (isIsolationUnavailable(e)) setIsolationError(message);
+          onSpawnError?.(sessionId, message);
+        });
+      };
+      continueWithoutIsolationRef.current = () => {
+        onIsolationChange(sessionId, false);
+        start(false);
+      };
+      start(Boolean(isolate));
     }
-    const start = (withIsolation: boolean) => {
-      setIsolationError(null);
-      spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
-        isolate: withIsolation,
-        cwd,
-        // Only an isolated attempt may rejoin the saved worktree. Carrying on
-        // without isolation means there is no worktree to rejoin, and handing
-        // one over anyway would ask the backend for a contradiction.
-        reuseWorktree: withIsolation ? reuseWorktree : undefined,
-        model: model && model.length > 0 ? model : undefined,
-        modelFlag: type.modelFlag,
-      }).catch((e) => {
-        const message = spawnErrorText(e);
-        writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);
-        if (isIsolationUnavailable(e)) setIsolationError(message);
-        onSpawnError?.(sessionId, message);
-      });
-    };
-    continueWithoutIsolationRef.current = () => {
-      onIsolationChange(sessionId, false);
-      start(false);
-    };
-    start(Boolean(isolate));
 
     const unlisten = listen<string>("session-exited", (ev) => {
-      if (ev.payload === sessionId) {
+      if (ev.payload === sessionId && !exitReportedRef.current) {
+        exitReportedRef.current = true;
         writeAfterQueuedOutput("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
         onExit(sessionId);
       }
@@ -240,9 +329,10 @@ export function TerminalPane({
       desiredSize = null;
       ro.disconnect();
       if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
-      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      if (outputFrameRef.current !== null) cancelAnimationFrame(outputFrameRef.current);
       scheduleFitRef.current = () => {};
       continueWithoutIsolationRef.current = () => {};
+      writeAfterQueuedOutputRef.current = () => {};
       unlisten.then((f) => f());
       term.dispose();
       termRef.current = null;
@@ -251,6 +341,34 @@ export function TerminalPane({
     // sessionId is stable for a pane's lifetime; theme/appearance handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  // Catches the pre-listener-window race the alreadyExited-at-mount branch
+  // above cannot: a session-exited event that lands after this pane already
+  // existed (so App's shared useExitEvents hook patched alreadyExited onto
+  // it directly, rather than retaining it) but before this pane's own
+  // listener above finished subscribing (listen() resolves asynchronously,
+  // so there is always a gap after mount during which this pane cannot yet
+  // catch its own event). alreadyExited flips true exactly once, from a
+  // prop update rather than at this component's own mount, and a session
+  // cannot exit a second time to resend the event through the listener that
+  // missed it — so react to that prop change here instead of waiting for a
+  // listener subscription that will never see it. exitReportedRef keeps this
+  // from double-reporting whichever of the three paths (this one, the mount
+  // branch above, or the live listener above) actually observes a given
+  // session's end.
+  //
+  // Routed through writeAfterQueuedOutputRef, the same flush-then-write
+  // operation the mount branch and the live listener use, rather than
+  // writing to the terminal directly: output that arrived on the channel
+  // just before this prop flipped can still be sitting in the queue,
+  // waiting for its animation frame, and a direct write would print the end
+  // marker ahead of it.
+  useEffect(() => {
+    if (!alreadyExited || exitReportedRef.current) return;
+    exitReportedRef.current = true;
+    writeAfterQueuedOutputRef.current("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
+    onExit(sessionId);
+  }, [alreadyExited, sessionId, onExit]);
 
   // Live re-theme + font-size on the already-open terminal.
   useEffect(() => {
@@ -270,6 +388,13 @@ export function TerminalPane({
           <button type="button" onClick={() => continueWithoutIsolationRef.current()}>
             Continue without isolation
           </button>
+        </div>
+      )}
+      {externalSession && startupState !== "connected" && (
+        <div className="pane-attach-status" role="status" data-state={startupState ?? "starting"}>
+          {startupState === "ready_timeout"
+            ? "No connection observed within 120s. Check its state under Session requests."
+            : "Starting…"}
         </div>
       )}
       <div className="pane-term" ref={elRef} />
