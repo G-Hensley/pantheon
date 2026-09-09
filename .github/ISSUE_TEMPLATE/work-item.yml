@@ -6,48 +6,102 @@ body:
   - type: markdown
     attributes:
       value: |
-        The heading structure this form produces is a contract. An agent creating
-        the same issue with `gh issue create --body-file` must produce the same
-        headings, so one parser reads both. See `docs/templates/README.md`.
+        The heading structure this form produces is a contract. Something
+        creating the same issue with `gh issue create --body-file` must
+        produce the same headings, so one parser reads both. Check this
+        integration's own documentation for the exact rules, wherever it
+        was installed alongside this form.
+
+        Seven sections, all required. They exist because a ticket that says
+        only what to do, and not what changes or why, cannot be picked up by
+        someone who was not in the conversation that produced it.
+
+        Priority and status are not fields on this form on purpose: before
+        this repository adopts a GitHub Project for tracking, its existing
+        tracker stays authoritative; once it does, that Project is where
+        priority and status live. Either way there is exactly one place to
+        look, and this body never goes stale against it.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: >-
+        The concrete behavior you want to exist. Describe the end state, not
+        the activity: what is different once this is done, in terms someone
+        could recognise. Leave the reasoning for the next box.
+      placeholder: <the behavior that exists when this is finished>
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: >-
+        The context, the problem, and what is gained by solving it. Say what
+        goes wrong today, or what is impossible today, and who it affects. A
+        reader who was not in the conversation that produced this ticket
+        should finish this box understanding why it is worth doing.
+      placeholder: <what is broken or missing today, and what solving it buys>
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: >-
+        The bounds of this work. State what is included and, just as
+        importantly, what is deliberately excluded, so the ticket cannot
+        quietly grow. Two short lists beat a paragraph.
+      placeholder: |
+        In: <what this change covers>
+        Out: <what it deliberately does not cover, and why>
+    validations:
+      required: true
 
   - type: textarea
     id: done_when
     attributes:
       label: Done when
       description: >-
-        The observable condition that ends this work. Write what a reader could
-        check without asking you. Name the test that fails today, the command and
-        its expected output, or the file and the state it must be in. "Refactor
-        the loader" is not a condition; "the loader keeps an unknown field intact
-        across a save, proven by a test that fails against the current save path"
-        is.
+        The observable condition that ends this work. Write what a reader
+        could check without asking you. Name the test that fails today, the
+        command and its expected output, or the file and the state it must
+        be in. "Refactor the loader" is not a condition; "the loader keeps
+        an unknown field intact across a save, proven by a test that fails
+        against the current save path" is.
       placeholder: <what is true when this is finished, checkable by someone else>
     validations:
       required: true
 
-  - type: dropdown
-    id: priority
+  - type: textarea
+    id: validation
     attributes:
-      label: Priority
-      options:
-        - P1
-        - P2
-        - P3
+      label: Validation
+      description: >-
+        How the evidence will be obtained. The commands, tests or
+        observations someone will actually run to show the Done when
+        conditions hold. This is a plan for producing evidence, not a claim
+        that it already passed: it is written before the work, so it cannot
+        report a result.
+      placeholder: |
+        <the command or test that will demonstrate this, and what its
+        output must show>
     validations:
       required: true
 
-  - type: dropdown
-    id: status
+  - type: textarea
+    id: dependencies
     attributes:
-      label: Status
+      label: Dependencies and decisions
       description: >-
-        Mirrors the status label. Open and closed alone cannot express the
-        difference between queued, claimed, and awaiting review.
-      options:
-        - backlog
-        - todo
-        - doing
-        - review
+        What blocks this, what it waits on, and what is still undecided.
+        Name the issue, pull request or approval it needs, and any open
+        question whose answer would change the work. If there is genuinely
+        nothing, write "None" rather than leaving it implied.
+      placeholder: <blockers, prerequisites and open questions, or "None">
     validations:
       required: true
 
@@ -56,8 +110,11 @@ body:
     attributes:
       label: Links
       description: >-
-        Files, pull requests, or issues this depends on or touches. Reasoning
-        belongs in the project's own backlog document, linked from here. A task
-        links to its reasoning; it does not swallow it.
+        Files, pull requests, or issues this depends on or touches.
+        Reasoning belongs in this repository's own backlog or design
+        documents, linked from here. A task links to its reasoning; it does
+        not swallow it. If this ticket really stands alone, say
+        "Self-contained" rather than leaving it blank.
+      placeholder: <durable context worth reading first, or "Self-contained">
     validations:
-      required: false
+      required: true
