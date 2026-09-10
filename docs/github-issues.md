@@ -35,8 +35,8 @@ through 4) and resuming general claims through GitHub (step 7, reached only
 after the step 6 pickup recheck succeeds) are two different things, not one.
 
 GitHub Issues in `G-Hensley/pantheon` owns deliverable identity, acceptance
-criteria and resolution as soon as step 5 records activation; that is what
-completing the cutover means. General claims stay paused between steps 5
+criteria and resolution as soon as step 5 records activation.
+General claims stay paused between steps 5
 and 7: the selected Project's stage and priority fields are not yet
 operative for the queue as a whole, and only the one bounded candidate
 step 6 uses may move during that window. Once step 7 also completes, the
@@ -63,8 +63,8 @@ duplicating work.
 ## Pick up and hand off work
 
 This section describes pickup once general claims have resumed (step 7 of
-the activation checkpoint below), and it is also the exact procedure step 6
-runs against its one bounded candidate before general resumption. Legacy
+the activation checkpoint below). Step 6 uses only its read-only steps 1
+through 4 against one bounded candidate before general resumption. Legacy
 pickup through `.tasks/` and `lexicon task` per `AGENTS.md` is correct only
 when pre-activation state is independently confirmed, the cutover issue
 shows no recorded activation, and the writer pause is confirmed not in
@@ -200,8 +200,9 @@ resuming general claims:
    and every other claim stays paused; legacy writers remain disabled by the
    acknowledged handoff. Activation is now recorded, but general pickup is
    not yet resumed.
-6. Run the "Pick up and hand off work" procedure above in full, but only
-   against that one unstaged candidate. This is the bounded GitHub-only
+6. Run steps 1 through 4 of "Pick up and hand off work" above read-only,
+   against that one unstaged candidate. Do not claim or execute product
+   work during this probe. This is the bounded GitHub-only
    pickup recheck the approved cutover issue's own Validation requires
    before resuming claims, distinct from the pre-activation discovery probe
    in step 4 above. Every issue besides that one candidate remains staged
