@@ -35,19 +35,25 @@ Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
 
 ## Tasks
 
-This project's work is tracked in `.tasks/`, one JSON file per task, committed
-alongside the code. Read it when you pick work up and update it when you put it
-down. A status that no longer matches reality is worse than no status, because
-it is the one people trust.
+Read `docs/github-issues.md` before picking up work. It records a staged
+handoff, so first verify its activation checkpoint:
 
-    lexicon task list                    # what is open here
-    lexicon task show <id>               # one task, including done_when
-    lexicon task set <id> status=doing   # claim it
-    lexicon task set <id> status=todo done_when="..."   # several at once
-    lexicon task add "Title" --status backlog
+- Before verified activation, `.tasks/` remains authoritative. Use
+  `lexicon task` for an authorized update, except while the conductor has
+  explicitly paused legacy writers for the handoff.
+- After verified activation, GitHub Issues owns deliverable identity,
+  acceptance and resolution, and the repository's selected GitHub Project
+  owns stage and priority. Never run `lexicon task` or edit `.tasks/`; the
+  files become a read-only historical ledger.
+- A staged issue or Ready field is not permission to start. Read its full
+  body, dependencies, assignee, comments and latest conductor/session claim.
 
-Always go through the command rather than editing the JSON. The command holds
-the compare-and-swap that stops one agent's write reverting another's, and argv
-cannot be malformed the way a hand-written JSON document can.
+`docs/github-tracking-migration.md` maps every reviewed source identity to
+its owning issue or historical disposition. It is provenance, not another
+tracker: the active issue wins if the map and issue later disagree.
+Reasoning stays in `BACKLOG.md`; an issue links to it rather than restating
+it.
 
-Reasoning stays in `BACKLOG.md`. A task links to it; it does not swallow it.
+This manual tracker handoff installs no MCP tool, dispatch behavior, or
+runtime change. Pantheon's own dispatch/session journal (`brain.jsonl`) is
+unrelated and untouched by it.

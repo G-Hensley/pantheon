@@ -14,6 +14,13 @@ before relying on it. Runs on Windows and Linux: the terminal layer is
 unexercised rather than ruled out; nothing in the code targets Windows or Linux
 specifically, but nobody has run it there.
 
+Repository work tracking has a [staged GitHub handoff](docs/github-issues.md).
+Until its ordered activation checkpoint is verified, `.tasks/` remains
+authoritative. After activation, GitHub Issues owns deliverables and the
+repository's selected GitHub Project owns stage and priority; the
+[migration map](docs/github-tracking-migration.md) preserves the old ledger
+and source dispositions.
+
 ## Why it exists
 
 Running Claude Code, Codex, and opencode in parallel panes is easy. Getting
