@@ -22,9 +22,10 @@ worktree, `last_output`, program, and server; `session_cwd` and the final
 
 `dispatch_task` (`src-tauri/src/mcp.rs:968`) wraps the brief
 (`dispatch_prompt`, `mcp.rs:73`) and refuses it if it exceeds the current
-target's own limit (`Shared::prompt_limit`, `lib.rs:631`; checked via
-`oversize_refusal_at`, `mcp.rs:3360` — current as of the composer-fidelity
-change, not `2907adf` above): 8192 bytes for a Linux Codex pane
+target's own limit (`SessionManager::prompt_limit`, `lib.rs:631`; checked
+via `oversize_refusal_at`, `mcp.rs:3360`, current as of the
+composer-fidelity change, not `2907adf` above): 8192 bytes for a Linux
+Codex pane
 (`pane_input::CODEX_LINUX_MAX_BYTES`, `pane_input.rs:7`, evidence in
 `docs/dispatch-composer-evidence.md`), 1023 bytes
 (`pane_input::LEGACY_MAX_BYTES`, `pane_input.rs:6`) for every other
