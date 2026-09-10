@@ -21,9 +21,18 @@ worktree, `last_output`, program, and server; `session_cwd` and the final
 `args` are locals of `spawn_session` (`lib.rs:984-1069`).
 
 `dispatch_task` (`src-tauri/src/mcp.rs:968`) wraps the brief
-(`dispatch_prompt`, `mcp.rs:73`), refuses 1024 bytes or more
-(`MAX_INJECTION_BYTES`, `mcp.rs:39`; `dispatch_precheck`, `mcp.rs:383`),
-and types it via `submit_to` (`lib.rs:346`). The task closes only through
+(`dispatch_prompt`, `mcp.rs:73`) and refuses it if it exceeds the current
+target's own limit (`Shared::prompt_limit`, `lib.rs:631`; checked via
+`oversize_refusal_at`, `mcp.rs:3360` — current as of the composer-fidelity
+change, not `2907adf` above): 8192 bytes for a Linux Codex pane
+(`pane_input::CODEX_LINUX_MAX_BYTES`, `pane_input.rs:7`, evidence in
+`docs/dispatch-composer-evidence.md`), 1023 bytes
+(`pane_input::LEGACY_MAX_BYTES`, `pane_input.rs:6`) for every other
+target/platform combination. `dispatch_precheck` (`mcp.rs:730`) no longer
+performs this check for a real dispatch: `dispatch_task_mode` always calls
+it with an empty injection and applies the real, per-target limit itself
+immediately after. It is typed in via `submit_to` (`lib.rs:346`). The task
+closes only through
 `complete_task` (`mcp.rs:1926`, `finish_task` at `mcp.rs:865`) or
 `abandon_lost` (`mcp.rs:1089`) when `liveness` (`lib.rs:410`) says the pane
 is gone. `Task` (`mcp.rs:152-212`) records no exit code, usage, or delivery

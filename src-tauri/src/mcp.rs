@@ -22,21 +22,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-/// The largest injection that cannot lose a byte on the way to a pane.
-///
-/// Delivery drops every *complete* leading 1 KiB chunk and lands only the
-/// trailing partial one (measured; see BACKLOG.md). An injection strictly
-/// under one chunk has no complete leading chunk, so there is nothing for the
-/// mechanism to take. That is what makes this a guarantee rather than a
-/// mitigation, and it holds whatever turns out to be doing the chunking.
-///
-/// The real ceiling a conductor feels is lower: the wrapper costs 82 bytes of
-/// header (matching the measured prefix) and 111 of completion contract, so
-/// about **830 bytes of brief** get through. That is tight, and deliberately
-/// so: a brief that does not fit is one that should have been split or put in
-/// a file. Once the chunking is found and fixed this constant is the single
-/// place to raise.
-const MAX_INJECTION_BYTES: usize = 1024;
+/// Conservative limit for host-independent notices. Explicit dispatch uses
+/// the current target's measured allowance; unknown hosts retain this ceiling.
+const MAX_INJECTION_BYTES: usize = crate::pane_input::LEGACY_MAX_BYTES + 1;
 
 /// How far an injection exceeds what can be delivered intact, or `None` if it
 /// fits. Bytes, not chars: the truncation is a byte-buffer effect.
@@ -57,16 +45,19 @@ fn injection_overage(injection: &str) -> Option<usize> {
 /// read by a model deciding what to do next, and "too long" alone invites a
 /// retry of the same brief.
 fn oversize_refusal(injection: &str) -> Option<String> {
-    injection_overage(injection).map(|over| {
+    oversize_refusal_at(injection, MAX_INJECTION_BYTES - 1)
+}
+
+fn oversize_refusal_at(injection: &str, maximum: usize) -> Option<String> {
+    (injection.len() > maximum).then(|| {
+        let over = injection.len() - maximum;
         format!(
-            // "a {MAX} byte limit" read as though 1024 were allowed. It is the
-            // refusal threshold, so the largest that goes through is one less.
             "brief is {over} bytes too long to deliver intact ({} bytes; the most that \
-             can be delivered is {}). Longer briefs reach the agent with the beginning \
-             silently missing. Split this into smaller tasks, or shorten it and point \
+             can be delivered is {}). Longer briefs exceed the verified limit for this target. \
+             Split this into smaller tasks, or shorten it and point \
              the agent at a file for the detail, or use headless: true for Claude.",
             injection.len(),
-            MAX_INJECTION_BYTES - 1
+            maximum
         )
     })
 }
@@ -86,14 +77,7 @@ fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
 }
 
 fn dispatch_prompt_raw(conductor: &str, task_id: &str, task: &str) -> String {
-    // Deliberately lean. Every byte spent here is a byte the brief cannot
-    // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
-    // agent can learn from an MCP tool call does not belong in the terminal.
-    format!(
-        "[pantheon] Task from conductor '{conductor}' (task_id {task_id}): {task} \
-         When done, call the pantheon complete_task tool with task_id \"{task_id}\" \
-         and your result."
-    )
+    crate::pane_input::dispatch_prompt(conductor, task_id, task)
 }
 
 /// Truncate `s` to at most `max_bytes`, on a char boundary, marking the cut.
@@ -729,6 +713,20 @@ pub struct DispatchOutcome {
 /// has to be atomic with checking it (or two concurrent dispatches could both
 /// pass), so `dispatch_task` calls `take_dispatch_budget` itself, last, under
 /// its own lock.
+///
+/// `injection` reaches the flat, non-headless branch of
+/// `dispatch_mode_precheck` (`oversize_refusal`, bounded by
+/// `MAX_INJECTION_BYTES`), which stayed even after per-target byte limits
+/// (`oversize_refusal_at` with `engine.prompt_limit(target)`) were added
+/// elsewhere: `dispatch_task_mode`'s only call to this function always
+/// passes `""` here, and checks the real, per-target size itself
+/// immediately after, so this parameter's own gate never actually fires in
+/// production today. It is kept, with `injection` still a real parameter
+/// rather than hardcoded, because it is the one pure, lock-free surface this
+/// ordering (halted, self-dispatch, liveness, then size) is unit-tested
+/// against directly; `the_gate_refuses_an_oversized_brief_but_reports_the_target_first`
+/// below exercises that ordering and this gate's own flat bound, not the
+/// live per-target limit a real oversized dispatch is refused by.
 fn dispatch_precheck(
     halted: bool,
     from: &str,
@@ -3357,13 +3355,13 @@ impl Shared {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let injection = dispatch_prompt(from, &id, task);
         // Apply identity/liveness policy before the mode-specific size/host policy.
-        dispatch_precheck(
-            self.is_halted(),
-            from,
-            target,
-            target_is_live,
-            if headless { "" } else { &injection },
-        )?;
+        dispatch_precheck(self.is_halted(), from, target, target_is_live, "")?;
+        if !headless {
+            if let Some(refusal) = oversize_refusal_at(&injection, self.engine.prompt_limit(target))
+            {
+                return Err(refusal);
+            }
+        }
         // Startup admission for panes a session request created, after the
         // identity and liveness rules and still before the budget, so a pane
         // that is merely too early costs nothing and records no task.
@@ -3630,6 +3628,31 @@ impl Shared {
                 .any(|t| t.id == id && t.mode == "headless")
         {
             return Err(ReassignError::HeadlessRetarget);
+        }
+        if let Some(target) = new_target.filter(|_| new_reviewer.is_none()) {
+            if live.iter().any(|id| id == target) {
+                let limit = self.engine.prompt_limit(target);
+                if let Some(task) = self.tasks.lock().unwrap().iter().find(|t| t.id == id) {
+                    // `caller`, not `task.from`, on purpose: `reassign_pending`
+                    // below overwrites `t.from` to `caller` in this exact
+                    // branch (target reassignment) whenever they differ, so
+                    // both delivery sites' `dispatch_prompt(&task.from, ...)`
+                    // read the POST-mutation value, which by then already
+                    // equals `caller`. Measuring `caller` here is measuring
+                    // the same string delivery will use; measuring the
+                    // pre-mutation `task.from` (the original dispatcher, about
+                    // to be overwritten) would admit a brief that the actual
+                    // write then silently refuses whenever the two ids differ
+                    // in length. Confirmed empirically: reassigning
+                    // `"small brief"` from `"sess-1"` to a new target as
+                    // caller `"sess-10"` delivers with `sess-10` embedded, not
+                    // `sess-1`, matching `t.from = caller.to_string()` above.
+                    let prompt = dispatch_prompt(caller, &task.id, &task.task);
+                    if let Some(reason) = oversize_refusal_at(&prompt, limit) {
+                        return Err(ReassignError::Oversized(reason));
+                    }
+                }
+            }
         }
         let now = Self::now_ms();
 
@@ -4658,6 +4681,7 @@ fn cancel_pending(tasks: &mut [Task], id: &str, reason: &str, now_ms: u64) -> Ca
 /// Why a reassignment was refused.
 #[derive(Debug, PartialEq)]
 enum ReassignError {
+    Oversized(String),
     HeadlessRetarget,
     NotFound,
     /// `target` was given but the task is not pending or overdue, so there is
@@ -5697,6 +5721,7 @@ impl BrainHandler {
                 "Task '{}' reassigned to reviewer {}.",
                 task.id, task.reviewer
             ),
+            Err(ReassignError::Oversized(reason)) => format!("Refused: {reason}"),
             Err(ReassignError::HeadlessRetarget) => "Refused: cancel the headless task and dispatch a new one to retarget it.".to_string(),
             Err(ReassignError::NotFound) => format!("No task '{}'.", p.task_id),
             Err(ReassignError::NotOpenForRetarget) => "Refused: target only applies to a pending, overdue, abandoned, or queued task. Use reviewer for an in_review or rework task."
@@ -7368,6 +7393,13 @@ mod tests {
 
     #[test]
     fn the_gate_refuses_an_oversized_brief_but_reports_the_target_first() {
+        // Proves `dispatch_precheck`'s own refusal ordering and its flat
+        // `MAX_INJECTION_BYTES` bound, not the live dispatch path: production
+        // (`dispatch_task_mode`) always calls `dispatch_precheck` with
+        // `injection = ""` and checks the real, per-target byte limit itself
+        // right after via `oversize_refusal_at`. See `dispatch_precheck`'s
+        // doc comment for why this parameter is still real rather than
+        // hardcoded here.
         let long = dispatch_prompt("sess-1", "abc123", &"x".repeat(2000));
 
         let err = dispatch_precheck(false, "sess-1", "sess-2", true, &long).unwrap_err();
@@ -7424,6 +7456,144 @@ mod tests {
         // and this is a test process that is about to exit.
 
         (shared, dir)
+    }
+
+    #[test]
+    fn the_target_limit_counts_the_complete_utf8_dispatch_wrapper() {
+        let wrapper = dispatch_prompt("sess-1", "a".repeat(32).as_str(), "");
+        let room = crate::pane_input::CODEX_LINUX_MAX_BYTES - wrapper.len();
+        let brief = "é".repeat(room / 2) + &"x".repeat(room % 2);
+        let prompt = dispatch_prompt("sess-1", "a".repeat(32).as_str(), &brief);
+        assert_eq!(prompt.len(), 8192);
+        assert!(super::oversize_refusal_at(&prompt, 8192).is_none());
+        assert!(super::oversize_refusal_at(&(prompt.clone() + "x"), 8192).is_some());
+        assert!(super::oversize_refusal_at(&prompt, 1023).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_dispatch_admits_only_the_current_targets_complete_byte_limit() {
+        use crate::tests::RecordingPane;
+        for program in ["codex", "opencode", "claude", "unknown"] {
+            for unicode in [false, true] {
+                let (shared, _dir) = shared_for_test();
+                let pane = RecordingPane::new(&shared.engine, "sess-2", program);
+                let cap = shared.engine.prompt_limit("sess-2");
+                let room = cap - dispatch_prompt("sess-1", &"a".repeat(32), "").len();
+                let brief = if unicode {
+                    "é".repeat(room / 2) + &"x".repeat(room % 2)
+                } else {
+                    "x".repeat(room)
+                };
+                let error = shared
+                    .dispatch_task("sess-1", "sess-2", &(brief.clone() + "x"), "none")
+                    .unwrap_err();
+                assert!(error.contains("1 bytes too long"), "{error}");
+                assert_eq!(*shared.dispatches.lock().unwrap(), 0);
+                assert!(shared.tasks_from("sess-1").is_empty());
+                assert!(pane.bytes.lock().unwrap().is_empty());
+
+                let outcome = shared
+                    .dispatch_task("sess-1", "sess-2", &brief, "none")
+                    .unwrap();
+                assert!(outcome.delivered);
+                let prompt = dispatch_prompt("sess-1", &outcome.task_id, &brief);
+                assert_eq!(prompt.len(), cap);
+                let wire = crate::pane_input::frame(program, &prompt);
+                let got = pane.bytes.lock().unwrap();
+                assert!(got.starts_with(wire.as_bytes()));
+                assert!(got[wire.len()..].is_empty() || &got[wire.len()..] == b"\r");
+                assert_eq!(*shared.dispatches.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_retarget_and_final_write_recheck_the_destination_limit() {
+        use crate::tests::RecordingPane;
+        let (shared, _dir) = shared_for_test();
+        let codex = RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let other = RecordingPane::new(&shared.engine, "sess-3", "opencode");
+        let outcome = shared
+            .dispatch_task("sess-1", "sess-2", &"x".repeat(2000), "none")
+            .unwrap();
+        assert!(outcome.delivered);
+        assert!(matches!(
+            shared.reassign_task("sess-1", &outcome.task_id, Some("sess-3"), None),
+            Err(ReassignError::Oversized(_))
+        ));
+        assert_eq!(shared.tasks_from("sess-1")[0].target, "sess-2");
+        assert!(!shared.engine.submit_to("sess-3", &"x".repeat(2000)));
+        assert!(!shared.engine.submit_to("sess-2", &"x".repeat(8193)));
+        assert!(other.bytes.lock().unwrap().is_empty());
+        assert!(!codex.bytes.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retarget_guard_measures_what_actually_gets_delivered_when_the_dispatcher_changes() {
+        // A reviewer flagged this guard measuring `caller` while both
+        // delivery sites read `task.from`, on the theory that `task.from`
+        // stays the original dispatcher and the two could disagree when
+        // `caller`'s id is a different length. That is not what happens:
+        // `reassign_pending` overwrites `t.from = caller` in this exact
+        // branch (target reassignment) whenever they differ, so by the time
+        // either delivery site reads `task.from`, it already equals
+        // `caller`. Confirmed empirically before writing this test: a small
+        // reassigned brief embeds the *new* caller's id, not the original
+        // dispatcher's.
+        //
+        // This test proves the guard is measuring the right thing precisely
+        // by using ids of different lengths ("sess-1" dispatches, "sess-10"
+        // retargets) sized so the *pre-mutation* `task.from`-built prompt
+        // would land exactly at the destination's limit while the
+        // `caller`-built one (== what actually gets typed) exceeds it by
+        // one byte. A guard that measured `task.from` here, as the
+        // now-reverted change did, would wrongly admit this and then have
+        // the real write silently refuse it.
+        use crate::tests::RecordingPane;
+        let (shared, _dir) = shared_for_test();
+        let _origin = RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let destination = RecordingPane::new(&shared.engine, "sess-3", "codex");
+
+        let placeholder_id = "a".repeat(32); // matches the real uuid::simple() length
+        let base_len = dispatch_prompt("sess-1", &placeholder_id, "").len();
+        let task = "x".repeat(crate::pane_input::CODEX_LINUX_MAX_BYTES - base_len);
+
+        let outcome = shared
+            .dispatch_task("sess-1", "sess-2", &task, "none")
+            .unwrap();
+        assert!(outcome.delivered);
+        assert_eq!(
+            dispatch_prompt("sess-1", &outcome.task_id, &task).len(),
+            crate::pane_input::CODEX_LINUX_MAX_BYTES,
+            "fixture must land exactly at the limit when built from the original dispatcher"
+        );
+        assert_eq!(
+            dispatch_prompt("sess-10", &outcome.task_id, &task).len(),
+            crate::pane_input::CODEX_LINUX_MAX_BYTES + 1,
+            "fixture must exceed the limit by exactly one byte when built from the new caller"
+        );
+
+        // "sess-10" retargets a task originally dispatched by "sess-1", to a
+        // brief that only fits under "sess-1"'s (shorter) wrapper. Because
+        // retargeting also hands the dispatcher role to "sess-10"
+        // (`reassign_pending`), what is actually about to be typed is the
+        // longer, over-limit wrapper, and the guard must refuse it.
+        assert!(matches!(
+            shared.reassign_task("sess-10", &outcome.task_id, Some("sess-3"), None),
+            Err(ReassignError::Oversized(_))
+        ));
+        assert_eq!(
+            shared.tasks_from("sess-1")[0].target,
+            "sess-2",
+            "refused retarget must not move the task"
+        );
+        assert!(
+            destination.bytes.lock().unwrap().is_empty(),
+            "a refused retarget must write nothing"
+        );
     }
 
     #[test]
