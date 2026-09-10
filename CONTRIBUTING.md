@@ -165,10 +165,11 @@ python "$LEXICON_CHECKOUT/integration-library/github-tracking/work_item_check.py
 That check confirms the seven headings are present and not left as placeholder text; it cannot
 judge whether the content is adequate, which is what review is still for.
 
-This form carries no `Priority` or `Status` field, and adopting it changes nothing about which
-tracker is authoritative: this repository's `.tasks/` tracker stays the source of truth until
-an explicit cutover is decided, and no Project stage or priority mirror belongs in the issue
-body.
+This form carries no `Priority` or `Status` field. The staged handoff in
+`docs/github-issues.md` defines which tracker is authoritative: `.tasks/` stays
+authoritative until verified activation, then remains a read-only historical ledger while
+GitHub Issues owns deliverables and the repository's selected GitHub Project owns stage and
+priority. No Project stage or priority mirror belongs in the issue body.
 
 ## Code style
 
