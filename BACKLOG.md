@@ -324,6 +324,19 @@ The cost is real and is the reason to keep looking for the cause: the wrapper
 takes 82 bytes of header and 111 of completion contract, leaving about **830
 bytes of brief**. Raising that limit is what fixing this entry buys.
 
+**Raised for Linux Codex, 2026-09-10.** A real Codex CLI composer on Linux
+holds the complete prompt intact through at least 64 KiB
+(`docs/dispatch-composer-evidence.md`), so `pane_input::max_prompt_bytes`
+(`src-tauri/src/pane_input.rs:25`) now grants a Linux Codex pane 8192 bytes
+(`CODEX_LINUX_MAX_BYTES`, `pane_input.rs:7`) instead of the shared
+1023-byte bound, which every other target/platform combination
+(`LEGACY_MAX_BYTES`, `pane_input.rs:6`), including Windows and OpenCode,
+keeps unconditionally: this host and this CLI are the only pair with a
+real composer-export proof behind them. "Raising that limit" above was
+speculative when written; it is now measured for exactly that one pair,
+not lifted for all of them, and the 1 KiB chunking loss this entry
+describes is not reproducing on this host and CLI at any size tested.
+
 *An approach that did not work, recorded so it is not retried.* The first
 attempt appended an integrity footer to the prompt: its own length and opening
 quoted back, for the agent to check. Two flaws, both found by its own tests. The

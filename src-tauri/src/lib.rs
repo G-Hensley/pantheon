@@ -8,9 +8,10 @@
 
 pub mod headless;
 mod mcp;
+mod pane_input;
+use pane_input::is_codex;
 mod worktree;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -38,7 +39,7 @@ struct SessionHandle {
     /// absorbing a pasted prompt. See `SUBMIT_QUIET_MS`.
     last_output: Arc<AtomicU64>,
     /// The program this session launched, so `submit_to` can tell which CLI it is
-    /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
+    /// typing into. Only Codex gets bracketed-paste framing; see `pane_input::frame`.
     program: String,
     /// The resolved launch inputs retained for headless work in this pane's
     /// checkout and against this pane's MCP endpoint.
@@ -182,25 +183,6 @@ fn submit_floor_ms(payload_len: usize) -> u64 {
 /// backstop can never preempt the floor.
 fn submit_ceiling_ms(payload_len: usize) -> u64 {
     SUBMIT_CEILING_MS + delivery_allowance_ms(payload_len)
-}
-
-/// Bracketed paste markers (DECSET 2004). Wrapping a payload in these makes it
-/// one explicit paste event with a defined end, instead of something the target
-/// has to infer from keystroke burst timing — which removes the guesswork the
-/// timing policy above can only approximate.
-///
-/// Applied to Codex alone, deliberately. Codex is the CLI whose burst inference
-/// loses the Enter, and it recommends this framing for itself. Claude Code
-/// already submits reliably, so there is nothing to gain there and a real regression
-/// to risk if it turned out not to honour the markers: an unsupported sequence
-/// does not vanish, it lands in the composer as literal junk. opencode is
-/// verified to support them and can be added once it has been exercised.
-const PASTE_START: &str = "\x1b[200~";
-const PASTE_END: &str = "\x1b[201~";
-
-fn is_codex(program: &str) -> bool {
-    let p = program.to_ascii_lowercase();
-    p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
 }
 
 /// Whether `program` is the opencode CLI, normalised the same way as
@@ -645,13 +627,14 @@ impl SessionManager {
         false
     }
 
-    /// The session's output-activity clock and launched program, if it is live.
-    fn session_meta(&self, id: &str) -> Option<(Arc<AtomicU64>, String)> {
+    /// Current target capability, never inferred from a task's original target.
+    pub fn prompt_limit(&self, id: &str) -> usize {
         self.sessions
             .lock()
             .unwrap()
             .get(id)
-            .map(|h| (h.last_output.clone(), h.program.clone()))
+            .map(|h| pane_input::max_prompt_bytes(&h.program))
+            .unwrap_or(pane_input::LEGACY_MAX_BYTES)
     }
 
     /// Submit a prompt to a terminal UI as typing followed by a distinct Enter
@@ -670,25 +653,21 @@ impl SessionManager {
     /// A `true` return therefore means "delivered to the terminal", not "already
     /// submitted".
     pub fn submit_to(self: &Arc<Self>, id: &str, prompt: &str) -> bool {
-        // Resolved before the write so the output clock can be sampled first:
-        // the baseline is only meaningful if it predates the prompt.
-        let Some((clock, program)) = self.session_meta(id) else {
-            return false;
+        // Resolve the program, clock and final size guard under the same lock
+        // as the write. A queued/retargeted task cannot borrow another host's
+        // larger allowance. The probe uses this exact write/framing helper.
+        let (clock, baseline, payload_len) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some(h) = sessions.get_mut(id) else {
+                return false;
+            };
+            let baseline = h.last_output.load(Ordering::Relaxed);
+            let Ok(payload_len) = pane_input::write_prompt(h.writer.as_mut(), &h.program, prompt)
+            else {
+                return false;
+            };
+            (h.last_output.clone(), baseline, payload_len)
         };
-        let baseline = clock.load(Ordering::Relaxed);
-
-        let payload: Cow<'_, str> = if is_codex(&program) {
-            Cow::Owned(format!("{PASTE_START}{prompt}{PASTE_END}"))
-        } else {
-            Cow::Borrowed(prompt)
-        };
-        // Measured on the framed payload, not the bare prompt: the markers are
-        // bytes the target has to ingest too, and it is the full write that has
-        // to have landed before an Enter can mean "submit".
-        let payload_len = payload.len();
-        if !self.write_to(id, &payload) {
-            return false;
-        }
 
         let engine = self.clone();
         let id = id.to_string();
@@ -2376,6 +2355,72 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// A real session handle with a recording writer for dispatch-policy tests.
+    /// This is not CLI fidelity evidence; cli_composer supplies that separately.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct RecordingPane {
+        engine: std::sync::Arc<SessionManager>,
+        id: String,
+        pub bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RecordingPane {
+        pub fn new(engine: &std::sync::Arc<SessionManager>, id: &str, program: &str) -> Self {
+            use super::*;
+            struct Recorder(Arc<Mutex<Vec<u8>>>);
+            impl Write for Recorder {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            // Finite lifetime even if the test process itself is interrupted.
+            let child = Command::new("sleep").arg("60").spawn().unwrap();
+            engine.sessions.lock().unwrap().insert(
+                id.into(),
+                SessionHandle {
+                    master: pair.master,
+                    writer: Box::new(Recorder(bytes.clone())),
+                    child: Box::new(child),
+                    worktree: None,
+                    last_output: Arc::new(AtomicU64::new(mono_ms())),
+                    program: program.into(),
+                    launch: headless::LaunchSpec {
+                        cwd: std::env::temp_dir(),
+                        program: program.into(),
+                        args: vec![],
+                        model_args: vec![],
+                        mcp_args: vec![],
+                        env: vec![],
+                        endpoint: headless::LaunchEndpoint::Shared,
+                    },
+                    server: None,
+                },
+            );
+            Self {
+                engine: engine.clone(),
+                id: id.into(),
+                bytes,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RecordingPane {
+        fn drop(&mut self) {
+            if let Some(mut handle) = self.engine.sessions.lock().unwrap().remove(&self.id) {
+                let _ = handle.child.kill();
+                let _ = handle.child.wait();
+            }
+        }
+    }
+
     use super::{
         agent_mcp_wiring, build_command, choose_worktree, compatible_app_data_dir,
         delivery_allowance_ms, is_agent_cli, is_codex, is_opencode, is_paid_openrouter_model,
