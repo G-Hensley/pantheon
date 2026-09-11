@@ -35,6 +35,13 @@ Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
 
 ## Tasks
 
+Before picking up Orion-scoped work, read the canonical outcome order:
+[`docs/orion.md`](https://github.com/G-Hensley/projects/blob/main/docs/orion.md) in
+`G-Hensley/projects` (or `~/Projects/docs/orion.md` on this machine's primary checkout). It
+states which accepted outcome is next across Lexicon, Daedalus, Crucible, Pantheon and
+ai-kbase; this repository's own issues below remain authoritative for that outcome's scope,
+acceptance and status.
+
 Read `docs/github-issues.md` before picking up work. It records a staged
 handoff, so first verify its activation checkpoint:
 
