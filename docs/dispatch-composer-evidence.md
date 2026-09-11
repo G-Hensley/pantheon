@@ -1,6 +1,9 @@
 # Dispatch composer evidence
 
-Source: issue #51 (dispatch loses 1 KiB chunks) and `BACKLOG.md` line 209.
+Source: issue #51 (dispatch loses 1 KiB chunks) and `BACKLOG.md`'s
+["Dispatch loses whole 1 KiB chunks from the head of a long prompt"](../BACKLOG.md#dispatch-loses-whole-1-kib-chunks-from-the-head-of-a-long-prompt)
+entry (line 243 as of this change; a heading link survives the line-number
+drift a bare number would not).
 Backs `pane_input::max_prompt_bytes` (`src-tauri/src/pane_input.rs:25`)
 granting Linux Codex an 8192-byte prompt limit
 (`CODEX_LINUX_MAX_BYTES`, `pane_input.rs:7`) instead of the legacy
@@ -34,7 +37,8 @@ unconditionally.
 ## Prerequisites
 
 - Linux only: `src-tauri/tests/cli_composer.rs` is
-  `#![cfg(target_os = "linux")]` and will not compile elsewhere.
+  `#![cfg(target_os = "linux")]`, so the file compiles to an empty crate on
+  any other platform rather than failing to compile.
 - A `codex` executable on `PATH`. This evidence was recorded against
   codex-cli 0.154.0.
 - An existing, already-trusted Codex checkout directory. The probe never
@@ -65,8 +69,9 @@ expected and received bytes as `<encoding>-<size>.expected` /
 own comparison.
 
 The probe never sends Enter (only Codex's external-editor key, `Ctrl-G`,
-`\x07`) and passes `-s read-only -a never`, so no model request can be
-made regardless of what is typed. Its own process group is killed on exit,
+`\x07`); no model request is made because nothing the fixture does ever
+submits the prompt, not because of the `-s read-only -a never` flags it
+also passes. Its own process group is killed on exit,
 bounded by a 60-second watchdog, and its scratch files live in a
 `tempfile::tempdir()`.
 
