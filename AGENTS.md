@@ -33,14 +33,15 @@ broken, so fix the symlink rather than copying the rules back in.
 Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
 `build.sh` on Linux, wrap the usual commands.
 
-## Tasks
+## Documentation
 
-Before picking up Orion-scoped work, read the canonical outcome order:
-[`docs/orion.md`](https://github.com/G-Hensley/projects/blob/main/docs/orion.md) in
-`G-Hensley/projects` (or `~/Projects/docs/orion.md` on this machine's primary checkout). It
-states which accepted outcome is next across Lexicon, Daedalus, Crucible, Pantheon and
-ai-kbase; this repository's own issues below remain authoritative for that outcome's scope,
-acceptance and status.
+Orion member. Cross-repository specifications and decisions that bind this repository live in
+`orion/docs/`, and are cited here by identifier rather than restated.
+
+[`docs/README.md`](docs/README.md) maps every document in this repository and records every place
+this repository departs from the layout, with the condition that retires each one.
+
+## Tasks
 
 Read `docs/github-issues.md` before picking up work. It records a staged
 handoff, so first verify its activation checkpoint:
