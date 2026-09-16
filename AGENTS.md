@@ -26,21 +26,24 @@ broken, so fix the symlink rather than copying the rules back in.
 - `README.md` : what Pantheon is and what it cannot yet do.
 - `CONTRIBUTING.md` : setup, building, testing, branching, review, and pull
   requests. It is the authority on all of those; do not duplicate it here.
-- `BACKLOG.md` : the reasoning behind the open work. Entries record what was
-  measured, which hypotheses were refuted, and what was tried and did not work.
-  That is the part worth keeping, and it is why it stays prose.
+- `BACKLOG.md` : an index, one line per open item, pointing at the issue that
+  owns it and the document under `docs/design/` that holds its reasoning. The
+  reasoning is what was worth keeping: what was measured, which hypotheses were
+  refuted, what was tried and did not work. Sections whose work has shipped are
+  in `docs/archive/2026-09-16-backlog-delivered.md`.
 
 Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
 `build.sh` on Linux, wrap the usual commands.
 
-## Tasks
+## Documentation
 
-Before picking up Orion-scoped work, read the canonical outcome order:
-[`docs/orion.md`](https://github.com/G-Hensley/projects/blob/main/docs/orion.md) in
-`G-Hensley/projects` (or `~/Projects/docs/orion.md` on this machine's primary checkout). It
-states which accepted outcome is next across Lexicon, Daedalus, Crucible, Pantheon and
-ai-kbase; this repository's own issues below remain authoritative for that outcome's scope,
-acceptance and status.
+Orion member. Cross-repository specifications and decisions that bind this repository live in
+`orion/docs/`, and are cited here by identifier rather than restated.
+
+[`docs/README.md`](docs/README.md) maps every document in this repository and records every place
+this repository departs from the layout, with the condition that retires each one.
+
+## Tasks
 
 Read `docs/github-issues.md` before picking up work. It records a staged
 handoff, so first verify its activation checkpoint:

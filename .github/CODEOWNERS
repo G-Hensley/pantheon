@@ -1,0 +1,10 @@
+# Review routing. A document's content owner is its `owners:` frontmatter; this file is how
+# the platform acts on it. The last matching pattern wins, so the file owns itself on the
+# last line and cannot be edited to remove every other owner.
+*                        @G-Hensley
+/AGENTS.md               @G-Hensley
+/CLAUDE.md               @G-Hensley
+/.agents/                @G-Hensley
+/.claude/                @G-Hensley
+/.github/                @G-Hensley
+/.github/CODEOWNERS      @G-Hensley

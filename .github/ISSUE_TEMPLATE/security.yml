@@ -1,0 +1,52 @@
+name: Security work
+description: Hardening, a baseline, a dependency or permission policy. Not a vulnerability report.
+title: "<the control or policy, not the threat>"
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A vulnerability does not go here.** An issue is a disclosure, even on a private
+        repository. Report one through a security advisory instead:
+        https://github.com/G-Hensley/pantheon/security/advisories/new
+
+        This form is for security *work*: hardening, a baseline, a dependency or
+        permission policy, a control to add or tighten.
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: The control, baseline or policy change, stated as the end state.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: The risk it reduces or the requirement it satisfies, with the specification or decision that asks for it if one exists.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in and what is out, including which repositories or paths.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: The observable condition, and how it is verified.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and decisions
+      description: What this waits on, and any decision it needs made first.
+  - type: textarea
+    id: links
+    attributes:
+      label: Links
+      description: Specifications, decisions, threat-model findings, prior issues.

@@ -28,6 +28,16 @@ src-tauri/target-ui-v2/
 .pantheon/
 .mosaic/
 
+# Generated host configuration. `.agents/` is the authored source of truth and
+# `lexicon sync` writes these from it, so a committed copy is a second source
+# that drifts silently: the next sync overwrites it and the diff is noise.
+# `.claude/agent-memory/` is the exception and stays tracked, because memory is
+# written by the agent rather than generated from `.agents/`.
+.claude/*
+!.claude/agent-memory/
+.codex/
+.opencode/
+
 # Per-machine tool settings
 .claude/settings.local.json
 
