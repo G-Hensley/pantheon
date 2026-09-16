@@ -12,8 +12,9 @@ Three sections carry a note that is now stale in the other direction. "Two unsee
 is unmerged, and it merged. "Dispatch headlessly" says it is Claude-only, and it still is. Each is
 flagged in its evidence line rather than edited in place.
 
-Open issues that cite a section by name will find it here: #55, #57 and #58 cite three of them, and
-`BACKLOG.md` keeps a pointer table so the citation still resolves from where it was written.
+Open issues that cite a section by name will find it here: #55, #57 and #58 cite three of these
+fifteen. `BACKLOG.md` keeps a table mapping all twenty sections to where each one now lives, so a
+citation still resolves from where it was written.
 
 | Section | Closed by |
 | --- | --- |

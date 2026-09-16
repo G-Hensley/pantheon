@@ -6,4 +6,4 @@ here as a requirement. Records stay as written apart from metadata corrections. 
 
 | Record | Holds |
 | --- | --- |
-| [`2026-09-16-backlog-delivered.md`](2026-09-16-backlog-delivered.md) | The twelve `BACKLOG.md` sections describing work that has shipped, moved here verbatim on 2026-09-16 with the evidence that closed each one. |
+| [`2026-09-16-backlog-delivered.md`](2026-09-16-backlog-delivered.md) | The fifteen `BACKLOG.md` sections describing work that has shipped or research that has finished, moved here verbatim on 2026-09-16 with the commit, pull request or task that closed each one. |

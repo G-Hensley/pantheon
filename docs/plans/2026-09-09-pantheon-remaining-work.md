@@ -8,88 +8,113 @@ Routed here from `G-Hensley/projects` under `orion:SPEC-0001` FR-010. Source com
 The plan is an inventory, and it predates most of this repository's issue tracker: the cutover
 recorded in [`../github-tracking-migration.md`](../github-tracking-migration.md) filed 23 issues on
 2026-09-14, five days after the plan was written. So the plan is read through this audit rather than
-on its own. Every item below is **delivered**, **tracked** by an issue that now owns it, or **open**
-with nothing owning it yet.
+on its own.
+
+**Every item gets exactly one of three dispositions.** Delivered: it is done, with a commit, a pull
+request or a closed issue naming it. Tracked: an open issue in this repository owns it. Open:
+nothing owns it. "Open" is not the same as "nobody's": an item can be open here and belong to
+another repository, and the owner column says which. A compound item is split so that each half
+gets its own disposition rather than a hedge.
+
+| | Items |
+| --- | --- |
+| Delivered | 5 |
+| Tracked | 18 |
+| Open | 12 |
+| **Total** | **35** |
 
 The plan's own text is unchanged below this section. Where the audit and the plan disagree, the
 audit is later and wins.
 
-### Section 1: status corrections
+### Section 1: status corrections (4 items)
 
 All four merged, as the plan says. Three were carried forward as acceptance issues rather than
-closed outright, which is what the plan asked for.
+closed outright, which is what the plan asked for; the carry-forward is a separate item, not a
+reason to call the original anything but delivered.
 
-| Task | Disposition |
-| --- | --- |
-| `s9xc2s` dispatch allowance | Delivered, PR #46. Verification in an isolated fixture is #71. |
-| `qf7d1f` two unseen delivery notices | Delivered, PR #47. Nothing carried forward. |
-| `rd85p4` project-scoped roster | Delivered, PR #48. Verification across an app restart is #72. |
-| `jz8nsh` conductor session requests | Delivered, PR #49. The acceptance issue the plan asked for is #73. |
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| `s9xc2s` dispatch allowance | Delivered, PR #46 | Verification in an isolated fixture is #71 |
+| `qf7d1f` two unseen delivery notices | Delivered, PR #47 | Nothing carried forward |
+| `rd85p4` project-scoped roster | Delivered, PR #48 | Verification across an app restart is #72 |
+| `jz8nsh` conductor session requests | Delivered, PR #49 | The acceptance issue the plan asked for is #73 |
 
-### Section 2: open work from the task records
+### Section 2: open work from the task records (8 items)
 
-| Item | Disposition |
-| --- | --- |
-| `3xcwdb` raise the dispatch brief limit | **Delivered.** Issue #51 is closed; `4f7d894` raised the Linux Codex limit to 8192 bytes with the fidelity evidence the plan asked for, now at [`../dispatch-composer-evidence.md`](../dispatch-composer-evidence.md). |
-| `rg3wmk` capability profiles for routing | Tracked by #56. |
-| `y4fz0h` headless dispatch for OpenCode | Tracked by #58. |
-| `e67nyf` enforce free-tier OpenRouter at the account | Tracked by #53. |
-| `kyzzsx` authenticate the fallback MCP endpoint | Tracked by #54. Still guarded: it needs live approval before any code change. |
-| `q0h7c4` tell a conductor when panes sit idle | Tracked by #55. |
-| `t9x41e` report the timeout gap upstream | Tracked by #57. |
-| `zmk94k` measure whether disabling tools shrinks the prompt | Tracked by #59. |
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| `3xcwdb` raise the dispatch brief limit | **Delivered.** Issue #51 closed; `4f7d894` raised the Linux Codex limit to 8192 bytes with the fidelity evidence the plan asked for, now at [`../dispatch-composer-evidence.md`](../dispatch-composer-evidence.md) | Closed |
+| `rg3wmk` capability profiles for routing | Tracked | #56 |
+| `y4fz0h` headless dispatch for OpenCode | Tracked | #58 |
+| `e67nyf` enforce free-tier OpenRouter at the account | Tracked | #53 |
+| `kyzzsx` authenticate the fallback MCP endpoint | Tracked | #54. Still guarded: live approval before any code change |
+| `q0h7c4` tell a conductor when panes sit idle | Tracked | #55 |
+| `t9x41e` report the timeout gap upstream | Tracked | #57 |
+| `zmk94k` measure whether disabling tools shrinks the prompt | Tracked | #59 |
 
-### Section 3: model and context-window control
+### Section 3: model and context-window control (4 items)
 
 The plan's suggested issue split was taken exactly, one issue per bullet.
 
-| Suggested issue | Disposition |
-| --- | --- |
-| Per-pane health state from the shape of silence | Tracked by #60. |
-| Conductor-initiated context window clear, with the open-task interlock | Tracked by #61. |
-| Conductor-initiated model change for an unresponsive pane | Tracked by #62. |
-| Context window occupancy in `list_sessions` | Tracked by #63. |
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| Per-pane health state from the shape of silence | Tracked | #60 |
+| Conductor-initiated context window clear, with the open-task interlock | Tracked | #61 |
+| Conductor-initiated model change for an unresponsive pane | Tracked | #62 |
+| Context window occupancy in `list_sessions` | Tracked | #63 |
 
 The design these four scope is [`../design/context-window/design.md`](../design/context-window/design.md),
 which each issue links. The plan's constraint 3, that a 429 must never trigger a switch within the
 tier that just refused, is the one a reviewer should check survives into whatever is built.
 
-### Section 4: workspace cleanup
+### Section 4: workspace cleanup (7 items)
 
-| Item | Disposition |
-| --- | --- |
-| Pantheon: merge path from the UI, preserved path on a blocked close, reap or re-adopt its own worktrees | Tracked by #68, which carries all three. |
-| Lexicon: inventory and classifier, reclaim skill, report-only hook | Not Pantheon's. No issue here, by the plan's own ownership argument. |
-| Tree: the one-time cleanup of 20 worktrees and 21 merged branches | Not Pantheon's. |
+The plan's own suggested split, one row per bullet.
+
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| Pantheon: a merge path from the UI | Tracked | #68 |
+| Pantheon: surface the preserved path when a dirty worktree blocks a close | Tracked | #68 |
+| Pantheon: reap or re-adopt its own worktrees after a crash | Tracked | #68 |
+| Lexicon: a worktree inventory and classifier | **Open** | Lexicon. Nothing filed there, and it is not this repository's to file |
+| Lexicon: a reclaim skill for the clean-and-merged class | **Open** | Lexicon |
+| Lexicon: a report-only session-start hook | **Open** | Lexicon, and blocked on the delivery question the plan raises: `lexicon sync` writes agents, skills and MCP config, never `settings.json` |
+| Tree: the one-time cleanup of 20 worktrees and 21 merged branches | **Open** | `G-Hensley/projects` |
 
 The plan's measurements are from 2026-09-09 and were not re-taken for this audit. Its own caveat
 stands: that the three dirty `/tmp` worktrees are superseded by PR #49 is inferred from filenames
 and has never been checked against a diff.
 
-### Section 5: gaps with no record anywhere
+### Section 5: gaps with no record anywhere (2 items)
 
-Tracked by #69, which triages the five README limitations as one piece of work. The sixth, a pane
-alive but not answering, is #60, which is where the plan itself puts it.
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| The five README limitations, triaged as one piece of work | Tracked | #69 |
+| A pane alive but not answering | Tracked | #60, which is where the plan itself puts it |
 
-### Section 6: ideas, not commitments
+### Section 6: ideas, not commitments (9 items)
 
-Two of the eight have an owner. Six do not, and nothing here files them: an idea becomes an issue
-when somebody decides to do it, and this audit is not that decision.
+Item 5 is compound and is split, because its two halves have different owners. Nothing here is
+filed as an issue by this audit: an idea becomes an issue when somebody decides to do it, and an
+audit is not that decision. `../ideas/README.md` points at the open ones and states the trigger.
 
-| Idea | Disposition |
-| --- | --- |
-| 1. An attention rail | **Open.** Nothing owns it. |
-| 2. A next-approval hotkey | **Open.** |
-| 3. Listen for the bell rather than for text | **Open.** |
-| 4. Desktop notification when unfocused | **Open.** |
-| 5. Remove approvals instead of routing them | Partly tracked by #58, which is the headless half. The permission-allowlist half is open. |
-| 6. One pane status line instead of three features | Tracked by #60 and #63 together, which is the same consolidation argued from the other direction. |
-| 7. An opt-in tool to read the last N lines of a pane | **Open.** It reverses a deliberate architectural choice, so it needs a decision record before an issue. |
-| 8. Focus layout | **Open.** |
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| 1. An attention rail | **Open** | Nobody |
+| 2. A next-approval hotkey | **Open** | Nobody |
+| 3. Listen for the bell rather than for text | **Open** | Nobody |
+| 4. Desktop notification when unfocused | **Open** | Nobody |
+| 5a. Extend headless dispatch, which has no TUI approval surface | Tracked | #58 |
+| 5b. Per-project permission allowlists and an approval policy | **Open** | Nobody |
+| 6. One pane status line instead of three features | Tracked | #60 and #63 together, which is the same consolidation argued from the other direction |
+| 7. An opt-in tool to read the last N lines of a pane | **Open** | Nobody. Needs a decision record before an issue: it reverses a deliberate architectural choice |
+| 8. Focus layout | **Open** | Nobody |
 
-### Section 7: not Pantheon's problem
+### Section 7: not Pantheon's problem (1 item)
 
-Task status drift belongs to Lexicon, as the plan says. Recorded, not filed here.
+| Item | Disposition | Owner |
+| --- | --- | --- |
+| A check that a work item naming a merged pull request does not stay open | **Open** | Lexicon. Recorded by the plan so the finding is not lost, and still unfiled |
 
 ### What this audit did not do
 
@@ -98,8 +123,6 @@ directories, and the timing figures are all as of 2026-09-09 and are read as dat
 not verify that each tracked issue's scope actually covers the plan item it is matched to beyond
 reading both; where an issue is narrower than the plan bullet, the issue wins, because the issue is
 what somebody will work from.
-
----
 
 ## The plan as routed, unchanged
 
