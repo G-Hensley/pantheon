@@ -26,9 +26,11 @@ broken, so fix the symlink rather than copying the rules back in.
 - `README.md` : what Pantheon is and what it cannot yet do.
 - `CONTRIBUTING.md` : setup, building, testing, branching, review, and pull
   requests. It is the authority on all of those; do not duplicate it here.
-- `BACKLOG.md` : the reasoning behind the open work. Entries record what was
-  measured, which hypotheses were refuted, and what was tried and did not work.
-  That is the part worth keeping, and it is why it stays prose.
+- `BACKLOG.md` : the reasoning behind the open work, five sections, each naming
+  the issue that owns it. Entries record what was measured, which hypotheses
+  were refuted, and what was tried and did not work. That is the part worth
+  keeping, and it is why it stays prose. The fifteen sections whose work has
+  shipped are in `docs/archive/2026-09-16-backlog-delivered.md`.
 
 Build with `pnpm`. `dev.cmd` and `build.cmd` on Windows, or `dev.sh` and
 `build.sh` on Linux, wrap the usual commands.
