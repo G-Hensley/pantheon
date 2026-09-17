@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/G-Hensley/lexicon/policy-library/schemas/adr/schema.json",
+  "title": "Architecture Decision Record frontmatter",
+  "description": "Frontmatter for an ADR under docs/decisions/. Carries the ADR status vocabulary and the two conditional obligations the standard places on it: an accepted record owes its decision makers and what it governs, and a superseded record owes the identifier of the record that replaced it.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "#/$defs/identifier",
+      "description": "Stable document identifier. It does not change when the title or filename does."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable title."
+    },
+    "type": {
+      "const": "adr",
+      "description": "Document category, from the standard's closed set."
+    },
+    "status": {
+      "enum": [
+        "proposed",
+        "accepted",
+        "superseded",
+        "deprecated",
+        "rejected"
+      ],
+      "description": "Lifecycle state, from this type's controlled vocabulary. Agents do not invent statuses."
+    },
+    "created": {
+      "$ref": "#/$defs/date",
+      "description": "Date the document was created."
+    },
+    "updated": {
+      "$ref": "#/$defs/date",
+      "description": "Optional. Git already knows when the file changed; set this only where the document's own sense of currency differs from its last commit."
+    },
+    "reviewed": {
+      "$ref": "#/$defs/date",
+      "description": "Date a person or agent deliberately checked the document against reality and found it still true. Set it only where a review cadence has been declared."
+    },
+    "owners": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/person"
+      },
+      "description": "Who is answerable for the content. The first entry is the one answerable."
+    },
+    "related": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relatedEntry"
+      },
+      "description": "Declared relationships. Optional, so an absent relation proves nothing."
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/target"
+      },
+      "description": "Documents this one depends on. A separate field from `related`, not a relation within it."
+    },
+    "supersedes": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The record this one replaces. Reciprocated by that record's `superseded_by`."
+    },
+    "superseded_by": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The record that replaced this one. Reciprocated by that record's `supersedes`."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      }
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Canonical location, for a document that gets copied out of the repository."
+    },
+    "discussion": {
+      "type": "string",
+      "format": "uri",
+      "description": "Where the argument happened: the pull request, issue or thread. Carried on the types that are argued before they are settled."
+    },
+    "decision_makers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/person"
+      },
+      "description": "Who decided. Required and non-empty at `accepted`, because an ADR that does not record who decided cannot answer whether the right person did. A `proposed` record legitimately carries an empty list: nobody has decided yet."
+    },
+    "consulted": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/person"
+      },
+      "description": "Optional. Whose expertise was sought."
+    },
+    "informed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/person"
+      },
+      "description": "Optional. Who was told about the outcome."
+    },
+    "governs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/governed"
+      },
+      "description": "What this decision binds. An item is a repository name when the record binds a whole repository, which is the usual case in this tree, or a target when it binds one document. Both forms may appear in one list. Required at `accepted` and may be empty: an empty list means considered and there is none, while an absent field claims the question does not apply."
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "type",
+    "status",
+    "created"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$",
+      "description": "A document identifier such as SPEC-0012, ADR-0017 or ARCH-SECURITY."
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "A date as YYYY-MM-DD."
+    },
+    "person": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "description": "A reference resolvable from outside this document: an identifier (SPEC-0004), a qualified identifier (lexicon:SPEC-0004), an issue or pull request (argus#142), or a repository-relative path to a document that has no identifier (docs/plans/2026-09-11-project-doc-template.md). A path target is never qualified with a repository prefix.",
+      "anyOf": [
+        {
+          "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$"
+        },
+        {
+          "pattern": "^[a-z0-9][a-z0-9-]*:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$"
+        },
+        {
+          "pattern": "^[a-z0-9][a-z0-9-]*#[0-9]+$"
+        },
+        {
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$"
+        }
+      ]
+    },
+    "relatedEntry": {
+      "type": "object",
+      "description": "One declared relationship, as a predicate and what it points at.",
+      "properties": {
+        "relation": {
+          "enum": [
+            "promotes-to",
+            "contains",
+            "implemented-by",
+            "informed-by",
+            "realizes",
+            "produces",
+            "constrained-by",
+            "governs",
+            "references",
+            "rendered-by",
+            "satisfies",
+            "changes",
+            "verified-by"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      },
+      "required": [
+        "relation",
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "A repository name, such as lexicon or projects."
+    },
+    "governed": {
+      "type": "string",
+      "description": "What a decision binds: a repository name, or a target naming one document.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/repository"
+        },
+        {
+          "$ref": "#/$defs/target"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "An accepted decision owes its decision makers, named rather than merely listed, and what it governs.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "accepted"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "decision_makers",
+          "governs"
+        ],
+        "properties": {
+          "decision_makers": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A superseded decision owes the identifier that replaced it. The reciprocal check, that the named record points back, spans two documents and belongs to the validator rather than to any schema.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "superseded"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "superseded_by"
+        ],
+        "properties": {
+          "superseded_by": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "The standard states one transition for this type, supersession, and records it as an append rather than an edit. No full transition table is stated, so none is carried here."
+}
