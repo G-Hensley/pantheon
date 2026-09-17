@@ -532,12 +532,248 @@ fn parse_claude_output(
     })
 }
 
+/// `opencode run --format json` writes one JSON event per line rather than
+/// Claude's single JSON object, so every event this project has observed
+/// (`step_start`, `text`, `step_finish`, `error`) is matched by tag and
+/// anything else (a tool call, a patch, a future event kind) is ignored
+/// through `#[serde(other)]` rather than failing the whole parse.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum OpencodeEvent {
+    #[serde(rename = "text")]
+    Text(OpencodeTextEvent),
+    #[serde(rename = "step_finish")]
+    StepFinish(OpencodeStepFinishEvent),
+    #[serde(rename = "error")]
+    Error(OpencodeErrorEvent),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct OpencodeTextEvent {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    part: OpencodeTextPart,
+}
+
+#[derive(Deserialize)]
+struct OpencodeTextPart {
+    id: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct OpencodeStepFinishEvent {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    part: OpencodeStepFinishPart,
+}
+
+#[derive(Deserialize)]
+struct OpencodeStepFinishPart {
+    #[serde(default)]
+    tokens: OpencodeTokens,
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpencodeTokens {
+    #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+    #[serde(default)]
+    cache: Option<OpencodeCacheTokens>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpencodeCacheTokens {
+    #[serde(default)]
+    write: Option<u64>,
+    #[serde(default)]
+    read: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpencodeErrorEvent {
+    #[serde(rename = "sessionID", default)]
+    session_id: Option<String>,
+    error: OpencodeErrorBody,
+}
+
+#[derive(Deserialize)]
+struct OpencodeErrorBody {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    data: Option<OpencodeErrorData>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpencodeErrorData {
+    #[serde(default)]
+    message: String,
+}
+
+/// Parses the whole recorded stream after the child has exited, the same way
+/// `parse_claude_output` parses Claude's single JSON object after exit
+/// rather than following the events live. Token and cost fields sum across
+/// every `step_finish` event, so a multi-step (tool-using) run reports one
+/// total the way Claude's own single usage object does; `cost_usd` carries
+/// whatever opencode itself reported, including a genuine `0.0` for a local
+/// model, rather than becoming `None` and reading as "unknown".
+fn parse_opencode_output(
+    stdout: &[u8],
+    stderr: String,
+    exit_code: Option<i32>,
+) -> Result<HeadlessOutcome, HeadlessError> {
+    let stdout_text = String::from_utf8_lossy(stdout).into_owned();
+    let mut session_id = String::new();
+    // (part id, text) in first-seen order; a repeated id overwrites its text
+    // in place, so a truly streamed part still ends with its final content.
+    let mut text_parts: Vec<(String, String)> = Vec::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cache_write = 0u64;
+    let mut cache_read = 0u64;
+    let mut cost_usd = 0.0f64;
+    let mut saw_usage = false;
+    let mut error_message: Option<String> = None;
+
+    for line in stdout_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: OpencodeEvent =
+            serde_json::from_str(line).map_err(|error| HeadlessError::InvalidJson {
+                error: error.to_string(),
+                exit_code,
+                stdout: stdout_text.clone(),
+                stderr: stderr.clone(),
+            })?;
+        match event {
+            OpencodeEvent::Text(event) => {
+                if session_id.is_empty() {
+                    session_id = event.session_id;
+                }
+                match text_parts.iter_mut().find(|(id, _)| *id == event.part.id) {
+                    Some(existing) => existing.1 = event.part.text,
+                    None => text_parts.push((event.part.id, event.part.text)),
+                }
+            }
+            OpencodeEvent::StepFinish(event) => {
+                if session_id.is_empty() {
+                    session_id = event.session_id;
+                }
+                saw_usage = true;
+                input_tokens += event.part.tokens.input.unwrap_or(0);
+                output_tokens += event.part.tokens.output.unwrap_or(0);
+                if let Some(cache) = event.part.tokens.cache {
+                    cache_write += cache.write.unwrap_or(0);
+                    cache_read += cache.read.unwrap_or(0);
+                }
+                cost_usd += event.part.cost.unwrap_or(0.0);
+            }
+            OpencodeEvent::Error(event) => {
+                if let Some(id) = event.session_id {
+                    if session_id.is_empty() {
+                        session_id = id;
+                    }
+                }
+                let message = event
+                    .error
+                    .data
+                    .map(|data| data.message)
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or(event.error.name);
+                error_message = Some(message);
+            }
+            OpencodeEvent::Other => {}
+        }
+    }
+
+    let usage = saw_usage.then(|| HeadlessUsage {
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+        cache_creation_input_tokens: Some(cache_write),
+        cache_read_input_tokens: Some(cache_read),
+        cost_usd: Some(cost_usd),
+        turns: None,
+        duration_ms: None,
+        duration_api_ms: None,
+        permission_denials: Vec::new(),
+    });
+
+    let result = text_parts
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if let Some(message) = error_message {
+        return Err(HeadlessError::Exited {
+            exit_code,
+            message,
+            stderr,
+            usage: usage.map(Box::new),
+        });
+    }
+    if exit_code != Some(0) {
+        return Err(HeadlessError::Exited {
+            exit_code,
+            message: if result.is_empty() {
+                "opencode exited without emitting an error event".to_string()
+            } else {
+                result
+            },
+            stderr,
+            usage: usage.map(Box::new),
+        });
+    }
+    if result.is_empty() {
+        return Err(HeadlessError::InvalidJson {
+            error: "successful JSON stream carried no text part".into(),
+            exit_code,
+            stdout: stdout_text,
+            stderr,
+        });
+    }
+
+    Ok(HeadlessOutcome {
+        result,
+        cli_session: session_id,
+        usage,
+        exit_code,
+        stderr,
+    })
+}
+
 fn normalized_program(program: &str) -> String {
     program
         .to_ascii_lowercase()
         .trim_end_matches(".exe")
         .trim_end_matches(".cmd")
         .to_string()
+}
+
+/// Both CLIs ship as npm packages, so on Windows the real binary is a `.cmd`
+/// shim that needs a shell to resolve; `cmd.exe /c <program>` is how the
+/// interactive pane already launches either one.
+fn program_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/c");
+        command.arg(program);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
+    }
 }
 
 fn build_claude_command(spec: &LaunchSpec, cli_session: &str, budget_usd: f64) -> Command {
@@ -555,21 +791,33 @@ fn build_claude_command(spec: &LaunchSpec, cli_session: &str, budget_usd: f64) -
         budget_usd.to_string(),
     ];
 
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = Command::new("cmd.exe");
-        command.arg("/c");
-        command.arg(&spec.program);
-        command
-    };
-    #[cfg(not(windows))]
-    let mut command = Command::new(&spec.program);
-
+    let mut command = program_command(&spec.program);
     command.args(headless_args);
     command.args(&spec.model_args);
     // Must stay last because Claude treats every following argument as another
     // MCP config path.
     command.args(&spec.mcp_args);
+    command.current_dir(&spec.cwd);
+    command.envs(spec.env.iter().map(|(key, value)| (key, value)));
+    command
+}
+
+/// `opencode run` takes its message as a trailing positional argument rather
+/// than reading stdin the way Claude's print mode does, and it has no
+/// `--mcp-config`-style flag: the pane's MCP wiring already lives in
+/// `spec.env` (`OPENCODE_CONFIG`, see `agent_mcp_wiring`), so it rides along
+/// for free. `opencode` also has no CLI flag to cap spend the way Claude's
+/// `--max-budget-usd` does, so `budget_usd` is validated at admission (the
+/// same `InvalidBudget` check every program gets, in `HeadlessChild::spawn`)
+/// and recorded on the task, but the child process itself enforces nothing.
+fn build_opencode_command(spec: &LaunchSpec, brief: &str) -> Command {
+    let mut command = program_command(&spec.program);
+    command.arg("run");
+    command.arg("--format").arg("json");
+    command.args(&spec.model_args);
+    command.arg("--dir").arg(&spec.cwd);
+    command.args(&spec.mcp_args);
+    command.arg(brief);
     command.current_dir(&spec.cwd);
     command.envs(spec.env.iter().map(|(key, value)| (key, value)));
     command
@@ -588,10 +836,21 @@ struct RawOutput {
     input_error: Option<io::Error>,
 }
 
+/// Which parser `wait` applies to the collected stdout. Kept on the child
+/// rather than re-derived from `spec.program` at wait time, since a raw
+/// `Command` built straight from a fixture or test fixture has no
+/// `LaunchSpec` to re-derive it from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadlessProgram {
+    Claude,
+    Opencode,
+}
+
 pub(crate) struct HeadlessChild {
     child: Child,
     tree: Arc<dyn ProcessTree>,
     cli_session: String,
+    program: HeadlessProgram,
     started: Instant,
     input: Option<JoinHandle<io::Result<()>>>,
     reader_rx: mpsc::Receiver<ReaderResult>,
@@ -608,22 +867,35 @@ impl HeadlessChild {
         if matches!(spec.endpoint, LaunchEndpoint::Shared) {
             return Err(HeadlessError::SharedEndpoint(pane_id.to_string()));
         }
-        if normalized_program(&spec.program) != "claude" {
-            return Err(HeadlessError::Unsupported(spec.program.clone()));
-        }
+        let program = match normalized_program(&spec.program).as_str() {
+            "claude" => HeadlessProgram::Claude,
+            "opencode" => HeadlessProgram::Opencode,
+            _ => return Err(HeadlessError::Unsupported(spec.program.clone())),
+        };
         if !budget_usd.is_finite() || budget_usd <= 0.0 {
             return Err(HeadlessError::InvalidBudget);
         }
 
         let cli_session = Uuid::new_v4().to_string();
-        let command = build_claude_command(spec, &cli_session, budget_usd);
-        Self::spawn_command(command, brief, cli_session)
+        match program {
+            HeadlessProgram::Claude => {
+                let command = build_claude_command(spec, &cli_session, budget_usd);
+                Self::spawn_command(command, brief, cli_session, program)
+            }
+            // The brief travels as a trailing argv, not stdin; see
+            // `build_opencode_command`.
+            HeadlessProgram::Opencode => {
+                let command = build_opencode_command(spec, brief);
+                Self::spawn_command(command, "", cli_session, program)
+            }
+        }
     }
 
     fn spawn_command(
         mut command: Command,
         brief: &str,
         cli_session: String,
+        program: HeadlessProgram,
     ) -> Result<Self, HeadlessError> {
         command
             .stdin(Stdio::piped())
@@ -659,6 +931,7 @@ impl HeadlessChild {
             child: process.child,
             tree: process.tree,
             cli_session,
+            program,
             started,
             input,
             reader_rx,
@@ -688,7 +961,10 @@ impl HeadlessChild {
         if let Some(error) = raw.input_error {
             return Err(HeadlessError::Input(error));
         }
-        parse_claude_output(&raw.stdout, stderr, exit_code)
+        match self.program {
+            HeadlessProgram::Claude => parse_claude_output(&raw.stdout, stderr, exit_code),
+            HeadlessProgram::Opencode => parse_opencode_output(&raw.stdout, stderr, exit_code),
+        }
     }
 
     fn collect_output(
@@ -791,13 +1067,15 @@ fn read_stderr_ring(mut stderr: impl Read, capacity: usize) -> io::Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        build_claude_command, is_headless_quiet, parse_claude_output, spawn_process_tree,
-        terminate_process_tree, HeadlessChild, HeadlessError, LaunchEndpoint, LaunchSpec,
-        HEADLESS_QUIET_MS,
+        build_claude_command, build_opencode_command, is_headless_quiet, parse_claude_output,
+        parse_opencode_output, spawn_process_tree, terminate_process_tree, HeadlessChild,
+        HeadlessError, HeadlessProgram, LaunchEndpoint, LaunchSpec, HEADLESS_QUIET_MS,
     };
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     fn spec(endpoint: LaunchEndpoint) -> LaunchSpec {
         LaunchSpec::for_session(
@@ -1033,22 +1311,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_opencode_are_unsupported_in_this_increment() {
-        for program in ["codex", "opencode"] {
-            let mut launch = spec(LaunchEndpoint::Dedicated {
-                url: "http://127.0.0.1:43123/mcp".to_string(),
-                token: "secret".to_string(),
-            });
-            launch.program = program.to_string();
-            let error = match HeadlessChild::spawn("sess-4", &launch, "brief", 1.0) {
-                Ok(_) => panic!("{program} must not spawn in the Claude-only increment"),
-                Err(error) => error,
-            };
-            assert!(matches!(
-                error,
-                HeadlessError::Unsupported(ref found) if found == program
-            ));
-        }
+    fn codex_is_unsupported_in_this_increment() {
+        let mut launch = spec(LaunchEndpoint::Dedicated {
+            url: "http://127.0.0.1:43123/mcp".to_string(),
+            token: "secret".to_string(),
+        });
+        launch.program = "codex".to_string();
+        let error = match HeadlessChild::spawn("sess-4", &launch, "brief", 1.0) {
+            Ok(_) => panic!("codex must not spawn until it gets its own headless increment"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HeadlessError::Unsupported(ref found) if found == "codex"
+        ));
     }
 
     #[cfg(unix)]
@@ -1056,8 +1332,13 @@ mod tests {
     fn readers_drain_one_megabyte_of_stderr_without_deadlocking() {
         let mut command = Command::new("sh");
         command.args(["-c", "head -c 1048576 /dev/zero >&2"]);
-        let mut child =
-            HeadlessChild::spawn_command(command, "", "reader-test".to_string()).unwrap();
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "reader-test".to_string(),
+            HeadlessProgram::Claude,
+        )
+        .unwrap();
 
         let raw = child
             .collect_output(Duration::from_secs(5), Duration::from_millis(100))
@@ -1073,8 +1354,13 @@ mod tests {
     fn timeout_terminates_the_whole_process_tree() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 60 & sleep 60"]);
-        let mut child =
-            HeadlessChild::spawn_command(command, "", "timeout-test".to_string()).unwrap();
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "timeout-test".to_string(),
+            HeadlessProgram::Claude,
+        )
+        .unwrap();
 
         let raw = child
             .collect_output(Duration::from_millis(20), Duration::from_millis(50))
@@ -1087,8 +1373,13 @@ mod tests {
     fn timeout_still_applies_after_a_child_closes_both_output_pipes() {
         let mut command = Command::new("sh");
         command.args(["-c", "exec 1>&- 2>&-; sleep 60"]);
-        let mut child =
-            HeadlessChild::spawn_command(command, "", "closed-pipes-test".to_string()).unwrap();
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "closed-pipes-test".to_string(),
+            HeadlessProgram::Claude,
+        )
+        .unwrap();
 
         let started = Instant::now();
         let raw = child
@@ -1121,5 +1412,185 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn opencode_spec(endpoint: LaunchEndpoint) -> LaunchSpec {
+        LaunchSpec::for_session(
+            PathBuf::from("/tmp/pantheon-session"),
+            "opencode".to_string(),
+            Vec::new(),
+            Some("ollama/llama3"),
+            Some("-m"),
+            Vec::new(),
+            vec![(
+                "OPENCODE_CONFIG".to_string(),
+                "/tmp/pantheon-session/opencode.json".to_string(),
+            )],
+            "sess-4",
+            endpoint,
+        )
+    }
+
+    #[test]
+    fn opencode_command_runs_json_format_with_model_dir_and_trailing_brief() {
+        let spec = opencode_spec(LaunchEndpoint::Dedicated {
+            url: "http://127.0.0.1:43123/mcp".to_string(),
+            token: "secret".to_string(),
+        });
+        let command = build_opencode_command(&spec, "do the thing");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // On Windows the program runs through `cmd.exe /c <program>`, so the
+        // opencode arguments begin after those two, same as Claude's test.
+        #[cfg(windows)]
+        {
+            assert_eq!(&args[..2], ["/c", "opencode"]);
+        }
+        #[cfg(windows)]
+        let args = args[2..].to_vec();
+
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--format",
+                "json",
+                "-m",
+                "ollama/llama3",
+                "--dir",
+                "/tmp/pantheon-session",
+                "do the thing",
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/tmp/pantheon-session"))
+        );
+        // The pane's MCP wiring rides in `env` (`OPENCODE_CONFIG`), not argv;
+        // see `agent_mcp_wiring`'s `"opencode"` arm in lib.rs.
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "OPENCODE_CONFIG"),
+            Some((
+                std::ffi::OsStr::new("OPENCODE_CONFIG"),
+                Some(std::ffi::OsStr::new("/tmp/pantheon-session/opencode.json"))
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_opencode_jsonl_fixture_with_session_and_usage() {
+        let outcome = parse_opencode_output(
+            include_bytes!("../tests/fixtures/opencode-output.jsonl"),
+            String::new(),
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.result,
+            "I don't have the ability to generate original text, but I can provide two \
+             concise sentences about the ocean:\n\n1. The ocean is vast and mysterious, \
+             covering over 70% of Earth's surface.  \n2. Its deep blues hide secret life \
+             forms that glide silently through the water.  "
+        );
+        assert_eq!(outcome.cli_session, "ses_f4faf50a6ffe67GHvPhuteMbsa");
+        assert_eq!(outcome.exit_code, Some(0));
+        let usage = outcome.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(4));
+        assert_eq!(usage.output_tokens, Some(63));
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        assert_eq!(usage.cache_read_input_tokens, Some(14019));
+        // Local model: opencode itself reports $0, not an unknown cost. See
+        // `build_opencode_command`'s doc comment on why that is reported as
+        // written rather than degraded to `None`.
+        assert_eq!(usage.cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn opencode_error_event_is_reported_with_its_message() {
+        let error = parse_opencode_output(
+            br#"{"type":"error","timestamp":1789663971130,"sessionID":"ses_f4fb6fa08ffeDAooJb645z28jf","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_a04b968d"}}}"#,
+            String::new(),
+            Some(1),
+        )
+        .unwrap_err();
+        match error {
+            HeadlessError::Exited {
+                exit_code, message, ..
+            } => {
+                assert_eq!(exit_code, Some(1));
+                assert_eq!(
+                    message,
+                    "Unexpected server error. Check server logs for details."
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn opencode_success_with_no_text_parts_is_reported_as_invalid_json() {
+        assert!(matches!(
+            parse_opencode_output(
+                br#"{"type":"step_finish","timestamp":1,"sessionID":"ses_x","part":{"id":"p1","reason":"stop","messageID":"m1","sessionID":"ses_x","type":"step-finish","tokens":{"total":1,"input":1,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}"#,
+                String::new(),
+                Some(0)
+            ),
+            Err(HeadlessError::InvalidJson { .. })
+        ));
+    }
+
+    /// The acceptance test for pantheon#58: a fake `opencode` binary sleeps
+    /// past the 30s ceiling that cancels the same request in an interactive
+    /// pane (measured at 30.4s/30.5s, see BACKLOG.md's archived "Dispatch
+    /// headlessly" section and issue #57), then emits a JSON stream captured
+    /// once from the real CLI (`tests/fixtures/opencode-output.jsonl`, see
+    /// the PR description for the exact command). Headless measured
+    /// 32.7s/33.2s against the same request, so this sleeps 31s: past the
+    /// pane's ceiling, short of the measured headless completion, run for
+    /// real rather than simulated so a truncation defect in the reader
+    /// threads would actually show up.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_headless_completes_past_the_interactive_thirty_second_timeout() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/opencode-output.jsonl"
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("fake-opencode");
+        fs::write(&script, format!("#!/bin/sh\nsleep 31\ncat '{fixture}'\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let command = Command::new(&script);
+        let started = Instant::now();
+        let child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "opencode-timeout-test".to_string(),
+            HeadlessProgram::Opencode,
+        )
+        .unwrap();
+
+        let outcome = child.wait(Duration::from_secs(50)).unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(31),
+            "the fake binary must actually run past the 30s ceiling for this to prove anything"
+        );
+        assert_eq!(
+            outcome.result,
+            "I don't have the ability to generate original text, but I can provide two \
+             concise sentences about the ocean:\n\n1. The ocean is vast and mysterious, \
+             covering over 70% of Earth's surface.  \n2. Its deep blues hide secret life \
+             forms that glide silently through the water.  "
+        );
+        assert_eq!(outcome.cli_session, "ses_f4faf50a6ffe67GHvPhuteMbsa");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.usage.unwrap().output_tokens, Some(63));
     }
 }
