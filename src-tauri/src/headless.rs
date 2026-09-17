@@ -297,6 +297,10 @@ pub enum HeadlessError {
     Unsupported(String),
     SharedEndpoint(String),
     InvalidBudget,
+    BriefTooLarge {
+        limit: usize,
+        len: usize,
+    },
     Spawn(io::Error),
     Input(io::Error),
     Output(io::Error),
@@ -342,6 +346,10 @@ impl fmt::Display for HeadlessError {
             Self::InvalidBudget => {
                 formatter.write_str("budget_usd must be finite and greater than zero")
             }
+            Self::BriefTooLarge { limit, len } => write!(
+                formatter,
+                "opencode brief is {len} bytes, over the {limit}-byte argv limit"
+            ),
             Self::Spawn(error) => write!(formatter, "headless child failed to spawn: {error}"),
             Self::Input(error) => write!(formatter, "headless child rejected its brief: {error}"),
             Self::Output(error) => write!(formatter, "headless child output failed: {error}"),
@@ -802,6 +810,11 @@ fn build_claude_command(spec: &LaunchSpec, cli_session: &str, budget_usd: f64) -
     command
 }
 
+/// Below Linux's 128 KiB `MAX_ARG_STRLEN` per argv element, with headroom for
+/// the rest of the command line; see the admission check in
+/// `HeadlessChild::spawn`.
+const OPENCODE_BRIEF_LIMIT_BYTES: usize = 100_000;
+
 /// `opencode run` takes its message as a trailing positional argument rather
 /// than reading stdin the way Claude's print mode does, and it has no
 /// `--mcp-config`-style flag: the pane's MCP wiring already lives in
@@ -817,6 +830,11 @@ fn build_opencode_command(spec: &LaunchSpec, brief: &str) -> Command {
     command.args(&spec.model_args);
     command.arg("--dir").arg(&spec.cwd);
     command.args(&spec.mcp_args);
+    // opencode's yargs parser reads a leading `-` as an option rather than
+    // part of the message, and a conductor brief routinely starts with one
+    // ("- Read ..."). `--` stops option parsing so everything after it,
+    // brief included, is taken as a positional argument.
+    command.arg("--");
     command.arg(brief);
     command.current_dir(&spec.cwd);
     command.envs(spec.env.iter().map(|(key, value)| (key, value)));
@@ -883,8 +901,17 @@ impl HeadlessChild {
                 Self::spawn_command(command, brief, cli_session, program)
             }
             // The brief travels as a trailing argv, not stdin; see
-            // `build_opencode_command`.
+            // `build_opencode_command`. Linux caps a single argv element at
+            // 128 KiB (`MAX_ARG_STRLEN`), and headless dispatch is advertised
+            // as accepting long briefs, so refuse rather than let the child
+            // fail to spawn or silently truncate.
             HeadlessProgram::Opencode => {
+                if brief.len() > OPENCODE_BRIEF_LIMIT_BYTES {
+                    return Err(HeadlessError::BriefTooLarge {
+                        limit: OPENCODE_BRIEF_LIMIT_BYTES,
+                        len: brief.len(),
+                    });
+                }
                 let command = build_opencode_command(spec, brief);
                 Self::spawn_command(command, "", cli_session, program)
             }
@@ -1070,6 +1097,7 @@ mod tests {
         build_claude_command, build_opencode_command, is_headless_quiet, parse_claude_output,
         parse_opencode_output, spawn_process_tree, terminate_process_tree, HeadlessChild,
         HeadlessError, HeadlessProgram, LaunchEndpoint, LaunchSpec, HEADLESS_QUIET_MS,
+        OPENCODE_BRIEF_LIMIT_BYTES,
     };
     use std::path::PathBuf;
     use std::process::Command;
@@ -1327,6 +1355,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn opencode_brief_over_the_argv_limit_is_refused_before_spawning() {
+        let spec = opencode_spec(LaunchEndpoint::Dedicated {
+            url: "http://127.0.0.1:43123/mcp".to_string(),
+            token: "secret".to_string(),
+        });
+        let oversized_brief = "x".repeat(OPENCODE_BRIEF_LIMIT_BYTES + 1);
+        let error = match HeadlessChild::spawn("sess-4", &spec, &oversized_brief, 1.0) {
+            Ok(_) => panic!("a brief over the argv limit must not reach the child process"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HeadlessError::BriefTooLarge { limit, len }
+                if limit == OPENCODE_BRIEF_LIMIT_BYTES && len == OPENCODE_BRIEF_LIMIT_BYTES + 1
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "opencode brief is {} bytes, over the {OPENCODE_BRIEF_LIMIT_BYTES}-byte argv limit",
+                OPENCODE_BRIEF_LIMIT_BYTES + 1
+            )
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn readers_drain_one_megabyte_of_stderr_without_deadlocking() {
@@ -1437,7 +1490,8 @@ mod tests {
             url: "http://127.0.0.1:43123/mcp".to_string(),
             token: "secret".to_string(),
         });
-        let command = build_opencode_command(&spec, "do the thing");
+        let brief = "-x reply with the single word pong";
+        let command = build_opencode_command(&spec, brief);
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1461,9 +1515,13 @@ mod tests {
                 "ollama/llama3",
                 "--dir",
                 "/tmp/pantheon-session",
-                "do the thing",
+                "--",
+                brief,
             ]
         );
+        // A brief that starts with `-` must land after `--`, not be read as
+        // an option by opencode's yargs parser.
+        assert_eq!(&args[args.len() - 2..], ["--", brief]);
         assert_eq!(
             command.get_current_dir(),
             Some(std::path::Path::new("/tmp/pantheon-session"))
