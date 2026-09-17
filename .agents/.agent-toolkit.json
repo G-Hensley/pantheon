@@ -22,6 +22,87 @@
       },
       "source": "integration-library/mcp-registry/github"
     },
+    "schema:adr": {
+      "catalog": {
+        "digest": "sha256:58d42a69b5e223128efb4ccd57cd7b56e22ec5f99c25bf64c44040fa9f98245e",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/adr.schema.json": "561a2ad818df7b134caca1dabaea73de81759b566c756222cdf27c49eadad097"
+      },
+      "source": "policy-library/schemas/adr"
+    },
+    "schema:architecture": {
+      "catalog": {
+        "digest": "sha256:dcf41dde5dab77c259b3028df83d66a370da7795386b10d6abfa27dc5a594eda",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/architecture.schema.json": "b394efa1eb8a943ed1795cf802611de26d92b92c16784f6420a8ab65378c4151"
+      },
+      "source": "policy-library/schemas/architecture"
+    },
+    "schema:idea": {
+      "catalog": {
+        "digest": "sha256:156e4e9db99c047d46ea1b93e5b302e4b1b6ccc7ae331b22abfe750701b0bf28",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/idea.schema.json": "c461b34130133dc2a898756b67c0a5c5213654480a82b37b3df76cb151c110f8"
+      },
+      "source": "policy-library/schemas/idea"
+    },
+    "schema:spec": {
+      "catalog": {
+        "digest": "sha256:178ec2b9c7caec003cb1bcb0c98b1f57c4a6b1d5b5ffa0644d11c07e2ebb7017",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/spec.schema.json": "6fea1608ac53d29e32a289ed7834c8723efa475d6f9278f3dac1d2a4bdf1431f"
+      },
+      "source": "policy-library/schemas/spec"
+    },
+    "schema:threat-model": {
+      "catalog": {
+        "digest": "sha256:2bd8ccdad584bbd9c5824a733c6881d29edace3dc9d139e3f38ecf34de313e44",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/threat-model.schema.json": "5667596fe28356d0ea04d5ec8cc2a4dfe213a1a6707b739f13b7b3fb2046dfb4"
+      },
+      "source": "policy-library/schemas/threat-model"
+    },
+    "skill:adr-authoring": {
+      "catalog": {
+        "digest": "sha256:63eaa00f8f4882f2dda2275f91d506bedec201723ab71995e827f79d8c7612c5",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/adr-authoring/SKILL.md": "c8eea0f8d66616a90a655ec6b772e257ecd4c6a37bfff1dc85596d7585f85ef0",
+        ".agents/skills/adr-authoring/references/adr-template.md": "b9469983d3345dab5d961ac4fa80fe11934e7067c35accaa1ea149b344f7a12e",
+        ".agents/skills/adr-authoring/references/supersession.md": "d286a81f40ffd04d3be1a42981e3f392dc2071455575e2ea773fa735aed42ea4"
+      },
+      "source": "skill-library/adr-authoring"
+    },
+    "skill:architecture-docs": {
+      "catalog": {
+        "digest": "sha256:f15a3a336badeefb23d71bfe4f30f06a9703e78213feb627c8f1091a38e9ea88",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/architecture-docs/SKILL.md": "f01063ae6a52c40f072f8f7659348e4a7cd4be7293811f944fd2ec194ed7678e",
+        ".agents/skills/architecture-docs/references/diagram-state.md": "4cb753b93a9f5b229bbca105ac310fc1c47e210b68e854a14aa8a9f30668d6dd",
+        ".agents/skills/architecture-docs/references/document-set.md": "5864da759b5728010edc74f4fa4848001eb0242299698e560e10eb8f2f426ad0"
+      },
+      "source": "skill-library/architecture-docs"
+    },
     "skill:create-skill": {
       "files": {
         ".agents/skills/create-skill/SKILL.md": "ec33c3cf52eac2d9a66f7d5d4971be28a9ccb54945b195cc404acfcaaecf657e",
@@ -44,6 +125,19 @@
         ".agents/skills/create-subagent/references/opencode-template.md": "db22224fef4aa220f49bf453cc459a2cee0bfa9f702f243b2b5f7c0ae96b848e"
       },
       "source": "skill-library/create-subagent"
+    },
+    "skill:issue-planning": {
+      "catalog": {
+        "digest": "sha256:8206d8978a61e097b1ddb5d060e607e3ac2243abd1f4183f092e9ed544663dac",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/issue-planning/SKILL.md": "162269fc1eb3cf00d993dd60dec930554c2ef9f45ce8ee1fba8ce600fbe49d83",
+        ".agents/skills/issue-planning/references/backlog-triage.md": "02b4e360b7e6798cfa765ae0873991cfad29ff1c418a456a794343cc93b952a3",
+        ".agents/skills/issue-planning/references/issue-body.md": "48f6a78bf6be4e2183a41c250ac88e46ac699aecffd0c11508a206861f6bc75c"
+      },
+      "source": "skill-library/issue-planning"
     },
     "skill:research": {
       "files": {
@@ -70,6 +164,34 @@
         ".agents/skills/shape-ideas/references/interview-passes.md": "9fc60603cf0a98dec7e27dfb948964ab16aa78b9cf9d791114ef76b9737583d6"
       },
       "source": "skill-library/shape-ideas"
+    },
+    "skill:spec-authoring": {
+      "catalog": {
+        "digest": "sha256:4adf4a1f2e9ec651e40593a6fbfc6b88a8af7e1a7768046bb2a2dfdb22f9ad7f",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/spec-authoring/SKILL.md": "84323c67d35b6dd51fc1380d2039ccbc9e1cf67a4dc020e7dd61282950c6e494",
+        ".agents/skills/spec-authoring/references/design-template.md": "edc82ea2288b4cae3f1439747b717856ce44a5e39cffefc8a1cce23d29b2a4e9",
+        ".agents/skills/spec-authoring/references/frontmatter.md": "1af649890fa21c9d56173e425dd1c89142be78037b6170eaa4c3cbf91e24c78d",
+        ".agents/skills/spec-authoring/references/spec-template.md": "7ffaef0abc59a22d8ce874ab60915d835d5a015729e55716fdd251103c83a303"
+      },
+      "source": "skill-library/spec-authoring"
+    },
+    "skill:threat-model-authoring": {
+      "catalog": {
+        "digest": "sha256:d8db00b3aef67946726c4159434426ed3717fa468c9cf8ca1804d67186e96143",
+        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/threat-model-authoring/SKILL.md": "6158cb4382376c5663911e527a419847126b98ffe16a56fe0264102ba4d274f4",
+        ".agents/skills/threat-model-authoring/references/disclosure.md": "6026049be569ebb9aef0248f8059dd2fdf565fe27f64e244133239f46970cb8a",
+        ".agents/skills/threat-model-authoring/references/findings.md": "4794d4cf8a88fabe78fd9300730fd2447521292aefb726c2d7578ddde5469622",
+        ".agents/skills/threat-model-authoring/references/threat-model-template.md": "c80f287aedb5f782b88b33c6be96b982cd197c52f81a2ea5538605dac4bc0139"
+      },
+      "source": "skill-library/threat-model-authoring"
     }
   },
   "schema_version": 1
