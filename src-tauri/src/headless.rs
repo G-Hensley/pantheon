@@ -1512,10 +1512,30 @@ mod tests {
         );
         brief.push_str(&"y".repeat(200_000));
 
-        // `spawn` for opencode hands the brief to `spawn_command` unchanged
-        // (the argv test above proves the command carries nothing else), so
-        // this exercises the same delivery the real program gets.
-        let command = Command::new(&script);
+        // The command comes from `build_opencode_command` itself, with the
+        // fake binary as the program, so the script's argv guard runs over
+        // the real argument list and would catch a regression that put the
+        // brief back on it. `spawn` hands the brief to `spawn_command`
+        // unchanged, which is the delivery exercised here.
+        let spec = LaunchSpec::for_session(
+            scratch.path().to_path_buf(),
+            script.to_string_lossy().into_owned(),
+            Vec::new(),
+            Some("ollama/llama3"),
+            Some("-m"),
+            Vec::new(),
+            Vec::new(),
+            "sess-4",
+            LaunchEndpoint::Dedicated {
+                url: "http://127.0.0.1:43123/mcp".to_string(),
+                token: "secret".to_string(),
+            },
+        );
+        let command = build_opencode_command(&spec);
+        assert!(
+            command.get_args().count() >= 6,
+            "the guard below is only meaningful over a real argument list"
+        );
         let child = HeadlessChild::spawn_command(
             command,
             &brief,
