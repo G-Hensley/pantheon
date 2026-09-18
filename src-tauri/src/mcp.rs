@@ -158,10 +158,10 @@ fn conductor_briefing(peers: &[String]) -> String {
     // Single line: a newline lands in most composers as a submit, which would
     // fire this off half-written: exactly what we are avoiding.
     let roster = if peers.is_empty() {
-        "No other sessions are open yet (Ctrl+K opens one).".to_string()
+        "No other sessions are open yet: request_session asks the human for the panes you need (or Ctrl+Shift+K).".to_string()
     } else {
         format!(
-            "Live sessions you can dispatch to: {}.",
+            "Live sessions you can dispatch to: {}. If all are busy, request_session asks for more.",
             // Just id, kind, and model. `roster_lines` also carries brain= and the
             // conductor marker, which are useful in list_sessions output but are
             // noise in a line the user has to read and type around; the agent can
@@ -5443,7 +5443,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Ask the human to open a new agent session (claude, codex or opencode) with a named model. Conductor only. This does NOT start anything: it queues a request the human must approve in the Pantheon window, and returns an opaque request id. Poll session_request_status for the outcome. Approval, denial and the allowance reset are human actions with no tool equivalent. At most 3 requests may await a decision at once, and 10 may be admitted per app run."
+        description = "Ask the human to open a new agent session (claude, codex or opencode) with a named model. Conductor only. Call it when the plan needs a pane the workspace lacks: every live pane is busy, overdue or dead with independent work waiting, the work needs a CLI or model no live pane runs, an independent reviewer on a different CLI is wanted and none is free, or there are no other panes. This does NOT start anything: it queues a request the human must approve in the Pantheon window, and returns an opaque request id. Poll session_request_status for the outcome. Approval, denial and the allowance reset are human actions with no tool equivalent. At most 3 requests may await a decision at once, and 10 may be admitted per app run."
     )]
     fn request_session(&self, Parameters(p): Parameters<RequestSessionArgs>) -> String {
         if let Err(e) = self.require_conductor() {
@@ -6189,6 +6189,7 @@ If you ARE the conductor, the rest of the workspace is yours to direct, and usin
 - If a target already holds open work, dispatch tells you so rather than silently piling a second brief on top of the first. cancel_task closes any open task with a reason, in bulk if you give it several ids. reassign_task changes a pending or overdue task's target (redelivering the brief) or an in_review/rework task's reviewer, so a stuck or gone session does not leave the work stranded.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Pantheon session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
+- When the workspace lacks a pane your plan needs, call request_session yourself rather than waiting to be told or quietly doing the work alone. Ask when every live pane is busy, overdue or DEAD and independent work is waiting; when the work needs a CLI or model no live pane runs; when you want an independent reviewer on a different CLI and none is free; or when list_sessions shows no other panes at all. Say in reason what the session is for. The human approves each request in the Pantheon window, and at most 3 may await a decision with 10 admitted per app run, so request the panes the plan needs, not one per task. Keep working while a request is pending, and check session_request_status before dispatching to the new pane.
 
 If you are NOT the conductor, dispatch will refuse: that is expected, not an error to work around. When a line starting with "[pantheon] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
 
@@ -6407,7 +6408,8 @@ mod tests {
     use super::{
         abandon_headless_on_load, append_denial_note, apply_headless_exit, dispatch_mode_precheck,
         dispatch_prompt_raw, effective_headless_budget, pane_mode, DispatchBudget, Usage,
-        HEADLESS_BUDGET_CEILING_USD, HEADLESS_BUDGET_DEFAULT_USD, HEADLESS_MAX_MS, MAX_DISPATCHES,
+        BRAIN_INSTRUCTIONS, HEADLESS_BUDGET_CEILING_USD, HEADLESS_BUDGET_DEFAULT_USD,
+        HEADLESS_MAX_MS, MAX_DISPATCHES,
     };
     use super::{
         abandon_lost, age, answer_pending, append_queued, append_record, ask_pending,
@@ -7885,6 +7887,32 @@ mod tests {
 
         assert!(!msg.contains(['\r', '\n']));
         assert!(msg.contains("No other sessions are open yet"));
+        // An empty roster is the clearest case for asking: point the conductor
+        // at the tool, not only at the human's shortcut. Plain Ctrl+K belongs
+        // to the terminal; the launcher is Ctrl+Shift+K.
+        assert!(msg.contains("request_session"));
+        assert!(msg.contains("Ctrl+Shift+K"));
+    }
+
+    // A conductor only requests a session when told to unless something names
+    // the tool and when to use it (issue 97). The briefing and the connect-time
+    // instructions are the two places every conductor reads.
+    #[test]
+    fn conductor_briefing_names_request_session_with_peers() {
+        let peers = vec!["- sess-2 (codex) brain=main".to_string()];
+        assert!(conductor_briefing(&peers).contains("request_session"));
+    }
+
+    #[test]
+    fn brain_instructions_tell_the_conductor_when_to_request_a_session() {
+        assert!(BRAIN_INSTRUCTIONS.contains("call request_session yourself"));
+        assert!(BRAIN_INSTRUCTIONS.contains("session_request_status"));
+        assert!(BRAIN_INSTRUCTIONS.contains("human approves each request"));
+        // The prose repeats the admission limits; bind it to the constants so a
+        // change to either cannot drift silently.
+        assert!(BRAIN_INSTRUCTIONS.contains(&format!(
+            "at most {MAX_OUTSTANDING_REQUESTS} may await a decision with {MAX_ADMITTED_REQUESTS} admitted per app run"
+        )));
     }
 
     // The user has to be able to type their own instruction after it, so it has
@@ -7892,16 +7920,16 @@ mod tests {
     // lives in BRAIN_INSTRUCTIONS, which every agent gets on connect.
     #[test]
     fn conductor_briefing_stays_short_enough_to_type_after() {
-        let peers = vec!["- sess-2 (codex) brain=main".to_string()];
-        let msg = conductor_briefing(&peers);
-
-        assert!(
-            msg.len() < 400,
-            "briefing is {} chars; it prefills the composer, so it must stay skimmable",
-            msg.len()
-        );
-        // Trailing space so the user's own text does not run into the last word.
-        assert!(msg.ends_with(' '));
+        let one_peer = vec!["- sess-2 (codex) brain=main".to_string()];
+        for msg in [conductor_briefing(&one_peer), conductor_briefing(&[])] {
+            assert!(
+                msg.len() < 400,
+                "briefing is {} chars; it prefills the composer, so it must stay skimmable",
+                msg.len()
+            );
+            // Trailing space so the user's own text does not run into the last word.
+            assert!(msg.ends_with(' '));
+        }
     }
 
     #[test]
