@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc};
@@ -275,6 +275,9 @@ pub struct HeadlessUsage {
     pub turns: Option<u64>,
     pub duration_ms: Option<u64>,
     pub duration_api_ms: Option<u64>,
+    /// OpenCode JSONL events successfully read so far. `None` for CLIs whose
+    /// output is not an event stream.
+    pub events_read: Option<u64>,
     /// One entry per tool the child was refused, named where the JSON says
     /// so, so a task that completed after being silently refused a tool is
     /// visibly different from a clean one. Empty in the common case.
@@ -305,6 +308,12 @@ pub enum HeadlessError {
         timeout: Duration,
         exit_code: Option<i32>,
         stderr: String,
+    },
+    BudgetExceeded {
+        budget_usd: f64,
+        exit_code: Option<i32>,
+        stderr: String,
+        usage: Box<HeadlessUsage>,
     },
     Cancelled {
         exit_code: Option<i32>,
@@ -352,6 +361,14 @@ impl fmt::Display for HeadlessError {
                 formatter,
                 "headless child exceeded {} ms: {stderr}",
                 timeout.as_millis()
+            ),
+            Self::BudgetExceeded {
+                budget_usd, usage, ..
+            } => write!(
+                formatter,
+                "headless opencode child exceeded its ${budget_usd:.2} budget (usage so far: ${:.6}, {} event(s))",
+                usage.cost_usd.unwrap_or(0.0),
+                usage.events_read.unwrap_or(0)
             ),
             Self::Exited {
                 exit_code,
@@ -493,6 +510,7 @@ fn parse_claude_output(
             turns: parsed.num_turns,
             duration_ms: parsed.duration_ms,
             duration_api_ms: parsed.duration_api_ms,
+            events_read: None,
             permission_denials,
         })
     } else {
@@ -617,70 +635,59 @@ struct OpencodeErrorData {
     message: String,
 }
 
-/// Parses the whole recorded stream after the child has exited, the same way
-/// `parse_claude_output` parses Claude's single JSON object after exit
-/// rather than following the events live. Token and cost fields sum across
-/// every `step_finish` event, so a multi-step (tool-using) run reports one
-/// total the way Claude's own single usage object does; `cost_usd` carries
-/// whatever opencode itself reported, including a genuine `0.0` for a local
-/// model, rather than becoming `None` and reading as "unknown".
-fn parse_opencode_output(
-    stdout: &[u8],
-    stderr: String,
-    exit_code: Option<i32>,
-) -> Result<HeadlessOutcome, HeadlessError> {
-    let stdout_text = String::from_utf8_lossy(stdout).into_owned();
-    let mut session_id = String::new();
+/// The one event accumulator used by both the complete-stream parser and the
+/// live stdout reader. Keeping token and cost accounting here prevents a
+/// budget-stop report from disagreeing with a normally completed run.
+#[derive(Default)]
+struct OpencodeStream {
+    session_id: String,
     // (part id, text) in first-seen order; a repeated id overwrites its text
     // in place, so a truly streamed part still ends with its final content.
-    let mut text_parts: Vec<(String, String)> = Vec::new();
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut cache_write = 0u64;
-    let mut cache_read = 0u64;
-    let mut cost_usd = 0.0f64;
-    let mut saw_usage = false;
-    let mut error_message: Option<String> = None;
+    text_parts: Vec<(String, String)>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_write: u64,
+    cache_read: u64,
+    cost_usd: f64,
+    saw_usage: bool,
+    error_message: Option<String>,
+    events_read: u64,
+}
 
-    for line in stdout_text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let event: OpencodeEvent =
-            serde_json::from_str(line).map_err(|error| HeadlessError::InvalidJson {
-                error: error.to_string(),
-                exit_code,
-                stdout: stdout_text.clone(),
-                stderr: stderr.clone(),
-            })?;
+impl OpencodeStream {
+    fn apply(&mut self, event: OpencodeEvent) {
+        self.events_read += 1;
         match event {
             OpencodeEvent::Text(event) => {
-                if session_id.is_empty() {
-                    session_id = event.session_id;
+                if self.session_id.is_empty() {
+                    self.session_id = event.session_id;
                 }
-                match text_parts.iter_mut().find(|(id, _)| *id == event.part.id) {
+                match self
+                    .text_parts
+                    .iter_mut()
+                    .find(|(id, _)| *id == event.part.id)
+                {
                     Some(existing) => existing.1 = event.part.text,
-                    None => text_parts.push((event.part.id, event.part.text)),
+                    None => self.text_parts.push((event.part.id, event.part.text)),
                 }
             }
             OpencodeEvent::StepFinish(event) => {
-                if session_id.is_empty() {
-                    session_id = event.session_id;
+                if self.session_id.is_empty() {
+                    self.session_id = event.session_id;
                 }
-                saw_usage = true;
-                input_tokens += event.part.tokens.input.unwrap_or(0);
-                output_tokens += event.part.tokens.output.unwrap_or(0);
+                self.saw_usage = true;
+                self.input_tokens += event.part.tokens.input.unwrap_or(0);
+                self.output_tokens += event.part.tokens.output.unwrap_or(0);
                 if let Some(cache) = event.part.tokens.cache {
-                    cache_write += cache.write.unwrap_or(0);
-                    cache_read += cache.read.unwrap_or(0);
+                    self.cache_write += cache.write.unwrap_or(0);
+                    self.cache_read += cache.read.unwrap_or(0);
                 }
-                cost_usd += event.part.cost.unwrap_or(0.0);
+                self.cost_usd += event.part.cost.unwrap_or(0.0);
             }
             OpencodeEvent::Error(event) => {
                 if let Some(id) = event.session_id {
-                    if session_id.is_empty() {
-                        session_id = id;
+                    if self.session_id.is_empty() {
+                        self.session_id = id;
                     }
                 }
                 let message = event
@@ -689,31 +696,66 @@ fn parse_opencode_output(
                     .map(|data| data.message)
                     .filter(|message| !message.is_empty())
                     .unwrap_or(event.error.name);
-                error_message = Some(message);
+                self.error_message = Some(message);
             }
             OpencodeEvent::Other => {}
         }
     }
 
-    let usage = saw_usage.then(|| HeadlessUsage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        cache_creation_input_tokens: Some(cache_write),
-        cache_read_input_tokens: Some(cache_read),
-        cost_usd: Some(cost_usd),
-        turns: None,
-        duration_ms: None,
-        duration_api_ms: None,
-        permission_denials: Vec::new(),
-    });
+    fn usage(&self) -> Option<HeadlessUsage> {
+        self.saw_usage.then(|| HeadlessUsage {
+            input_tokens: Some(self.input_tokens),
+            output_tokens: Some(self.output_tokens),
+            cache_creation_input_tokens: Some(self.cache_write),
+            cache_read_input_tokens: Some(self.cache_read),
+            cost_usd: Some(self.cost_usd),
+            events_read: Some(self.events_read),
+            ..Default::default()
+        })
+    }
 
-    let result = text_parts
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    fn result(&self) -> String {
+        self.text_parts
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
 
-    if let Some(message) = error_message {
+fn parse_opencode_event(line: &[u8]) -> Result<OpencodeEvent, serde_json::Error> {
+    serde_json::from_slice(line)
+}
+
+/// Parses the complete recorded stream after the child has exited. The live
+/// reader uses the same `OpencodeStream` accumulator to report its progress.
+fn parse_opencode_output(
+    stdout: &[u8],
+    stderr: String,
+    exit_code: Option<i32>,
+) -> Result<HeadlessOutcome, HeadlessError> {
+    let stdout_text = String::from_utf8_lossy(stdout).into_owned();
+    let mut stream = OpencodeStream::default();
+
+    for line in stdout_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event =
+            parse_opencode_event(line.as_bytes()).map_err(|error| HeadlessError::InvalidJson {
+                error: error.to_string(),
+                exit_code,
+                stdout: stdout_text.clone(),
+                stderr: stderr.clone(),
+            })?;
+        stream.apply(event);
+    }
+
+    let usage = stream.usage();
+    let result = stream.result();
+
+    if let Some(message) = stream.error_message {
         return Err(HeadlessError::Exited {
             exit_code,
             message,
@@ -744,7 +786,7 @@ fn parse_opencode_output(
 
     Ok(HeadlessOutcome {
         result,
-        cli_session: session_id,
+        cli_session: stream.session_id,
         usage,
         exit_code,
         stderr,
@@ -811,10 +853,10 @@ fn build_claude_command(spec: &LaunchSpec, cli_session: &str, budget_usd: f64) -
 /// brief. Nothing the conductor wrote is ever placed on the command line.
 /// `opencode` has no `--mcp-config`-style flag: the pane's MCP wiring already
 /// lives in `spec.env` (`OPENCODE_CONFIG`, see `agent_mcp_wiring`), so it
-/// rides along for free. It also has no CLI flag to cap spend the way Claude's
-/// `--max-budget-usd` does, so `budget_usd` is validated at admission (the
-/// same `InvalidBudget` check every program gets, in `HeadlessChild::spawn`)
-/// and recorded on the task, but the child process itself enforces nothing.
+/// rides along for free. It has no CLI flag to cap spend the way Claude's
+/// `--max-budget-usd` does. `HeadlessChild` therefore reads its JSONL stream
+/// incrementally and stops the process tree when cumulative `step_finish`
+/// cost exceeds the admitted `budget_usd`.
 fn build_opencode_command(spec: &LaunchSpec) -> Command {
     let mut command = program_command(&spec.program);
     command.arg("run");
@@ -830,6 +872,10 @@ fn build_opencode_command(spec: &LaunchSpec) -> Command {
 enum ReaderResult {
     Stdout(io::Result<Vec<u8>>),
     Stderr(io::Result<Vec<u8>>),
+    /// A valid OpenCode JSONL event has arrived. The usage snapshot is sent
+    /// after every event so the wait loop can stop before the next one when a
+    /// `step_finish` pushes cumulative cost past the admitted budget.
+    OpencodeProgress(Option<HeadlessUsage>),
 }
 
 struct RawOutput {
@@ -837,6 +883,7 @@ struct RawOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+    budget_exceeded: Option<HeadlessUsage>,
     input_error: Option<io::Error>,
 }
 
@@ -855,6 +902,7 @@ pub(crate) struct HeadlessChild {
     tree: Arc<dyn ProcessTree>,
     cli_session: String,
     program: HeadlessProgram,
+    opencode_budget_usd: Option<f64>,
     started: Instant,
     input: Option<JoinHandle<io::Result<()>>>,
     reader_rx: mpsc::Receiver<ReaderResult>,
@@ -888,7 +936,9 @@ impl HeadlessChild {
             }
             HeadlessProgram::Opencode => {
                 let command = build_opencode_command(spec);
-                Self::spawn_command(command, brief, cli_session, program)
+                let mut child = Self::spawn_command(command, brief, cli_session, program)?;
+                child.opencode_budget_usd = Some(budget_usd);
+                Ok(child)
             }
         }
     }
@@ -914,9 +964,14 @@ impl HeadlessChild {
         let (reader_tx, reader_rx) = mpsc::channel();
         let stdout_tx = reader_tx.clone();
         let stdout_reader = thread::spawn(move || {
-            let mut stdout = stdout;
-            let mut bytes = Vec::new();
-            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+            let result = match program {
+                HeadlessProgram::Claude => {
+                    let mut stdout = stdout;
+                    let mut bytes = Vec::new();
+                    stdout.read_to_end(&mut bytes).map(|_| bytes)
+                }
+                HeadlessProgram::Opencode => read_opencode_stdout(stdout, &stdout_tx),
+            };
             let _ = stdout_tx.send(ReaderResult::Stdout(result));
         });
         let stderr_reader = thread::spawn(move || {
@@ -934,6 +989,7 @@ impl HeadlessChild {
             tree: process.tree,
             cli_session,
             program,
+            opencode_budget_usd: None,
             started,
             input,
             reader_rx,
@@ -960,6 +1016,16 @@ impl HeadlessChild {
                 stderr,
             });
         }
+        if let Some(usage) = raw.budget_exceeded {
+            return Err(HeadlessError::BudgetExceeded {
+                budget_usd: self
+                    .opencode_budget_usd
+                    .expect("OpenCode budget is set at spawn"),
+                exit_code,
+                stderr,
+                usage: Box::new(usage),
+            });
+        }
         if let Some(error) = raw.input_error {
             return Err(HeadlessError::Input(error));
         }
@@ -978,9 +1044,14 @@ impl HeadlessChild {
         let mut stdout = None;
         let mut stderr = None;
         let mut timed_out = false;
+        let mut budget_exceeded = None;
         while stdout.is_none() || stderr.is_none() {
             let now = Instant::now();
-            let message = if now >= deadline {
+            let message = if budget_exceeded.is_some() {
+                self.reader_rx
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+            } else if now >= deadline {
                 Err(mpsc::RecvTimeoutError::Timeout)
             } else {
                 self.reader_rx.recv_timeout(deadline - now)
@@ -988,6 +1059,17 @@ impl HeadlessChild {
             match message {
                 Ok(ReaderResult::Stdout(result)) => stdout = Some(result),
                 Ok(ReaderResult::Stderr(result)) => stderr = Some(result),
+                Ok(ReaderResult::OpencodeProgress(usage)) => {
+                    if !timed_out && budget_exceeded.is_none() {
+                        if let (Some(budget_usd), Some(usage)) = (self.opencode_budget_usd, usage) {
+                            if usage.cost_usd.is_some_and(|cost| cost > budget_usd) {
+                                terminate_process_tree(self.tree.as_ref(), termination_grace)
+                                    .map_err(HeadlessError::Output)?;
+                                budget_exceeded = Some(usage);
+                            }
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     timed_out = true;
                     terminate_process_tree(self.tree.as_ref(), termination_grace)
@@ -1000,6 +1082,7 @@ impl HeadlessChild {
                         })? {
                             ReaderResult::Stdout(result) => stdout = Some(result),
                             ReaderResult::Stderr(result) => stderr = Some(result),
+                            ReaderResult::OpencodeProgress(_) => {}
                         }
                     }
                 }
@@ -1025,7 +1108,7 @@ impl HeadlessChild {
             if let Some(status) = self.child.try_wait().map_err(HeadlessError::Wait)? {
                 break status;
             }
-            if !timed_out && Instant::now() >= deadline {
+            if !timed_out && budget_exceeded.is_none() && Instant::now() >= deadline {
                 timed_out = true;
                 terminate_process_tree(self.tree.as_ref(), termination_grace)
                     .map_err(HeadlessError::Output)?;
@@ -1043,9 +1126,43 @@ impl HeadlessChild {
             stdout,
             stderr,
             timed_out,
+            budget_exceeded,
             input_error,
         })
     }
+}
+
+fn read_opencode_stdout(
+    stdout: impl Read,
+    progress_tx: &mpsc::Sender<ReaderResult>,
+) -> io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(stdout);
+    let mut bytes = Vec::new();
+    let mut line = Vec::new();
+    let mut stream = OpencodeStream::default();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&line);
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        // Keep malformed output in `bytes` so the complete-stream parser can
+        // return its existing InvalidJson result after the child exits.
+        if let Ok(event) = parse_opencode_event(&line) {
+            stream.apply(event);
+            if progress_tx
+                .send(ReaderResult::OpencodeProgress(stream.usage()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn read_stderr_ring(mut stderr: impl Read, capacity: usize) -> io::Result<Vec<u8>> {
@@ -1576,6 +1693,125 @@ mod tests {
         // `build_opencode_command`'s doc comment on why that is reported as
         // written rather than degraded to `None`.
         assert_eq!(usage.cost_usd, Some(0.0));
+        assert_eq!(usage.events_read, Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_budget_stop_kills_the_tree_and_retains_usage_so_far() {
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("fake-opencode");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_budget\",\"part\":{\"tokens\":{\"input\":2,\"output\":3,\"cache\":{\"write\":4,\"read\":5}},\"cost\":0.40}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_budget\",\"part\":{\"tokens\":{\"input\":7,\"output\":11,\"cache\":{\"write\":13,\"read\":17}},\"cost\":0.20}}'\nsleep 60 & sleep 60\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut command = Command::new("sh");
+        command.arg(&script);
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "opencode-budget-stop".to_string(),
+            HeadlessProgram::Opencode,
+        )
+        .unwrap();
+        child.opencode_budget_usd = Some(0.50);
+        let process_group = child.child.id() as libc::pid_t;
+        let started = Instant::now();
+        let error = child.wait(Duration::from_secs(45)).unwrap_err();
+
+        match error {
+            HeadlessError::BudgetExceeded {
+                budget_usd, usage, ..
+            } => {
+                assert_eq!(budget_usd, 0.50);
+                assert_eq!(usage.input_tokens, Some(9));
+                assert_eq!(usage.output_tokens, Some(14));
+                assert_eq!(usage.cache_creation_input_tokens, Some(17));
+                assert_eq!(usage.cache_read_input_tokens, Some(22));
+                assert!((usage.cost_usd.unwrap() - 0.60).abs() < f64::EPSILON);
+                assert_eq!(usage.events_read, Some(2));
+            }
+            other => panic!("expected budget stop, got {other}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "budget stop waited for the fake process instead of terminating it"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "budget-stop process group {process_group} survived termination"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_under_budget_completes_with_the_incremental_totals() {
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("fake-opencode");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"ses_under\",\"part\":{\"id\":\"p1\",\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_under\",\"part\":{\"tokens\":{\"input\":2,\"output\":3},\"cost\":0.40}}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut command = Command::new("sh");
+        command.arg(&script);
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "opencode-under-budget".to_string(),
+            HeadlessProgram::Opencode,
+        )
+        .unwrap();
+        child.opencode_budget_usd = Some(0.50);
+        let outcome = child.wait(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(outcome.result, "done");
+        let usage = outcome.usage.unwrap();
+        assert_eq!(usage.cost_usd, Some(0.40));
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.events_read, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_costless_step_finish_does_not_stop_the_budget() {
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("fake-opencode");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"ses_free\",\"part\":{\"id\":\"p1\",\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_free\",\"part\":{\"tokens\":{}}}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut command = Command::new("sh");
+        command.arg(&script);
+        let mut child = HeadlessChild::spawn_command(
+            command,
+            "",
+            "opencode-costless-step".to_string(),
+            HeadlessProgram::Opencode,
+        )
+        .unwrap();
+        child.opencode_budget_usd = Some(0.01);
+        let outcome = child.wait(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(outcome.result, "done");
+        assert_eq!(outcome.usage.unwrap().cost_usd, Some(0.0));
     }
 
     #[test]
