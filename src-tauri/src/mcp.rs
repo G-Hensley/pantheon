@@ -418,6 +418,17 @@ fn apply_headless_exit(
                 timeout.as_millis()
             )),
         ),
+        Err(HeadlessError::BudgetExceeded {
+            budget_usd, usage, ..
+        }) => {
+            t.usage = Some(usage.as_ref().clone());
+            (
+                None,
+                Some(format!(
+                    "opencode budget cap exceeded (${budget_usd:.2}); process tree stopped"
+                )),
+            )
+        }
         Err(error) => (None, Some(error.to_string())),
     };
     t.exit_code = code;
@@ -5590,7 +5601,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. Pass headless: true to run a Claude or opencode print-mode/run child with a 40 minute deadline after 30 seconds of pane quiet; this accepts multiline briefs without the pane byte limit. Its budget defaults to $5.00 and can be set with budget_usd, up to a $25.00 ceiling; a cold-cache first Claude call alone can cost $0.17 to $0.25, so raise it for anything beyond a small task. opencode has no CLI budget flag, so its budget is recorded but not enforced by the child; local-model usage reports $0. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id (it does NOT block) so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you, preferring a live session running a different CLI than the target, and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking. If the target already has open work, this is queued rather than typed in on top of it: the response says what it is queued behind, and it is delivered automatically, in order, once the pane is free. Pass headless: true to run a Claude or opencode print-mode/run child with a 40 minute deadline after 30 seconds of pane quiet; this accepts multiline briefs without the pane byte limit. Its budget defaults to $5.00 and can be set with budget_usd, up to a $25.00 ceiling; a cold-cache first Claude call alone can cost $0.17 to $0.25, so raise it for anything beyond a small task. Claude passes its budget to the CLI; OpenCode has no budget flag, so Pantheon sums `step_finish` costs and stops its process tree when the total exceeds the requested budget. Local-model usage reports $0. A per-target queue holds at most 3; a fourth dispatch is refused with the ids already waiting."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -6893,6 +6904,35 @@ mod tests {
             "{}",
             t.result
         );
+    }
+
+    #[test]
+    fn an_opencode_budget_stop_is_not_reported_as_a_timeout() {
+        use crate::headless::HeadlessError;
+        let mut t = headless_task();
+        apply_headless_exit(
+            &mut t,
+            &Err(HeadlessError::BudgetExceeded {
+                budget_usd: 0.50,
+                exit_code: None,
+                stderr: String::new(),
+                usage: Box::new(Usage {
+                    input_tokens: Some(9),
+                    output_tokens: Some(14),
+                    cost_usd: Some(0.60),
+                    events_read: Some(2),
+                    ..Default::default()
+                }),
+            }),
+            42,
+        );
+        assert_eq!(t.status, "error");
+        assert_eq!(t.done_ms, Some(42));
+        assert!(t.result.contains("opencode budget cap exceeded ($0.50)"));
+        assert!(!t.result.contains("wall-clock cap exceeded"));
+        let usage = t.usage.unwrap();
+        assert_eq!(usage.cost_usd, Some(0.60));
+        assert_eq!(usage.events_read, Some(2));
     }
 
     #[test]
