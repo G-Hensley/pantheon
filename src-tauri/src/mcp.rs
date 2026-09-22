@@ -6190,6 +6190,7 @@ If you ARE the conductor, the rest of the workspace is yours to direct, and usin
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Pantheon session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
 - When the workspace lacks a pane your plan needs, call request_session yourself rather than waiting to be told or quietly doing the work alone. Ask when every live pane is busy, overdue or DEAD and independent work is waiting; when the work needs a CLI or model no live pane runs; when you want an independent reviewer on a different CLI and none is free; or when list_sessions shows no other panes at all. Say in reason what the session is for. The human approves each request in the Pantheon window, and at most 3 may await a decision with 10 admitted per app run, so request the panes the plan needs, not one per task. Keep working while a request is pending, and check session_request_status before dispatching to the new pane.
+- Route read-only work to Codex first. Assessment, audit, triage, survey and research tasks, the ones that change no files, go to a live Codex pane running gpt-6-astra or gpt-5.6-sol, the two models with measured results on this work; when none is free, call request_session with kind "codex" and model "gpt-6-astra". Treat a Codex pane on any other model as untested and route past it. If no such Codex pane can take the task, or one reports a usage or rate limit, use a Claude Sonnet pane, and a Claude Opus pane only when neither is available. Name the fallback and why in the dispatch so it shows in the record. Tasks that edit files, design with the human, and final acceptance are not covered by this rule; route those as you judge best.
 
 If you are NOT the conductor, dispatch will refuse: that is expected, not an error to work around. When a line starting with "[pantheon] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
 
@@ -7913,6 +7914,35 @@ mod tests {
         assert!(BRAIN_INSTRUCTIONS.contains(&format!(
             "at most {MAX_OUTSTANDING_REQUESTS} may await a decision with {MAX_ADMITTED_REQUESTS} admitted per app run"
         )));
+    }
+
+    // The rule's evidence is G-Hensley/projects docs/llm-practice/research/2026-09-21-b-routing.md,
+    // recommendation 1 as corrected. Pin its order so a later edit cannot quietly drop the fallback.
+    #[test]
+    fn brain_instructions_route_read_only_work_to_codex_with_a_fallback() {
+        let rule = BRAIN_INSTRUCTIONS
+            .lines()
+            .find(|l| l.starts_with("- Route read-only work to Codex first."))
+            .expect("the read-only routing bullet is missing");
+        let codex = rule.find("Codex pane").unwrap();
+        let sonnet = rule.find("Claude Sonnet pane").unwrap();
+        let opus = rule.find("Claude Opus pane").unwrap();
+        assert!(
+            codex < sonnet && sonnet < opus,
+            "fallback order must be Codex, Sonnet, Opus"
+        );
+        // The measured models, and how to ask for one, not just "a Codex pane".
+        assert!(rule.contains("gpt-6-astra or gpt-5.6-sol"));
+        assert!(rule.contains(r#"request_session with kind "codex" and model "gpt-6-astra""#));
+        assert!(rule.contains("any other model as untested"));
+        // The fallback trigger, and that the choice is recorded with its reason.
+        assert!(rule.contains("usage or rate limit"));
+        assert!(rule.contains("Name the fallback and why"));
+        // The evidence covers read-only work only; the rule must keep saying so.
+        assert!(rule.contains("the ones that change no files"));
+        assert!(rule.contains(
+            "Tasks that edit files, design with the human, and final acceptance are not covered"
+        ));
     }
 
     // The user has to be able to type their own instruction after it, so it has
