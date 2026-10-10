@@ -11507,6 +11507,117 @@ mod tests {
         assert_eq!(snapshot[0].result, "submitted work");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_snapshot_journals_aging_once_and_observes_only_open_tasks() {
+        let (shared, dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let old = Shared::now_ms() - TASK_OVERDUE_MS - 1;
+        shared.tasks.lock().unwrap().extend([
+            task_at("aged", "pending", old),
+            task_at("queued", STATUS_QUEUED, old),
+            task_at("finished", "done", old),
+        ]);
+        let snapshot = shared.observed_tasks_snapshot();
+        assert_eq!(snapshot[0].status, "overdue");
+        let journaled = load_brain(dir.path()).tasks;
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].id, "aged");
+        assert_eq!(journaled[0].status, "overdue");
+        let path = dir.path().join("brain.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+        shared.observed_tasks_snapshot();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        let observations = shared.task_activity_snapshot(&snapshot);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].task_id, "aged");
+        assert_eq!(observations[0].state, "overdue");
+        assert_eq!(observations[1].task_id, "queued");
+        assert_eq!(observations[1].state, "queued");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn roster_attributes_interrupted_review_observations_only_to_the_reviewer() {
+        let (shared, _dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let _reviewer = crate::tests::RecordingPane::new(&shared.engine, "sess-3", "claude");
+        let mut task = task_at("review", "in_review", 10);
+        task.reviewer = "sess-3".into();
+        task.recovery_reason = "App restarted".into();
+        shared.tasks.lock().unwrap().push(task);
+        let lines = shared.roster_lines();
+        assert_eq!(lines.len(), 2);
+        let reviewer = lines
+            .iter()
+            .find(|line| line.starts_with("- sess-3 "))
+            .unwrap();
+        let worker = lines
+            .iter()
+            .find(|line| line.starts_with("- sess-2 "))
+            .unwrap();
+        assert!(
+            reviewer
+                .contains("task review: assignment interrupted; explicit reassignment required"),
+            "{reviewer}"
+        );
+        assert!(!worker.contains("task review"), "{worker}");
+        shared.tasks.lock().unwrap().clear();
+        assert!(shared
+            .roster_lines()
+            .iter()
+            .all(|line| !line.contains("assignment interrupted")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn quiet_wait_attention_is_scoped_to_requested_tasks_and_preserves_work() {
+        let (shared, _dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let quiet_ms = crate::fleet::QUIET_WARNING_MS + 1000;
+        shared
+            .engine
+            .test_output_ages
+            .lock()
+            .unwrap()
+            .insert("sess-2".into(), quiet_ms);
+        shared.pane_contact.lock().unwrap().insert(
+            "sess-2".into(),
+            std::time::Instant::now() - std::time::Duration::from_millis(quiet_ms),
+        );
+        let old = Shared::now_ms() - quiet_ms;
+        shared.tasks.lock().unwrap().extend([
+            task_at("quiet", "pending", old),
+            task_at("finished", "done", old),
+        ]);
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-1".into());
+        let response = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "quiet".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(response.starts_with("Attention:"), "{response}");
+        assert!(
+            response.contains("task quiet on sess-2: no observed activity"),
+            "{response}"
+        );
+        assert_eq!(shared.tasks_snapshot()[0].status, "pending");
+        let unrelated = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "finished".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(unrelated.contains("1 task(s) finished"), "{unrelated}");
+        assert!(!unrelated.contains("Attention:"), "{unrelated}");
+        shared.note_pane_contact("sess-2");
+        assert_eq!(
+            shared.task_activity_snapshot(&shared.tasks_snapshot())[0].state,
+            "pending"
+        );
+    }
+
     // ---- review_request_notice / rework_notice: delivered message shape ----
 
     #[test]

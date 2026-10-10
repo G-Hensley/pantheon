@@ -28,6 +28,7 @@ type TaskDrawerProps = {
 // dialogs (SettingsPanel, DispatchDialog): no focus trap, Escape closes.
 export function TaskDrawer({ tasks, panes, activity = [], requests = [], onOpenRequests, onClose, onFocusPane }: TaskDrawerProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const activityByTask = useMemo(() => new Map(activity.map((entry) => [entry.task_id, entry])), [activity]);
   const groups = useMemo(() => groupTasks(tasks), [tasks]);
   const paneMap = useMemo(() => {
     const map: Record<string, PaneRef> = {};
@@ -85,7 +86,7 @@ export function TaskDrawer({ tasks, panes, activity = [], requests = [], onOpenR
                 title="Open"
                 hint="pending · overdue · rework · blocked · queued"
                 items={groups.open}
-                activity={activity}
+                activityByTask={activityByTask}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing open."
@@ -93,7 +94,7 @@ export function TaskDrawer({ tasks, panes, activity = [], requests = [], onOpenR
               <TaskSection
                 title="Awaiting review"
                 items={groups.review}
-                activity={activity}
+                activityByTask={activityByTask}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing waiting on a reviewer."
@@ -101,7 +102,7 @@ export function TaskDrawer({ tasks, panes, activity = [], requests = [], onOpenR
               <TaskSection
                 title="Recent"
                 items={groups.recent}
-                activity={activity}
+                activityByTask={activityByTask}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing finished yet."
@@ -120,7 +121,7 @@ function TaskSection({
   hint,
   items,
   paneMap,
-  activity,
+  activityByTask,
   onActivate,
   emptyLabel,
   hiddenCount,
@@ -129,7 +130,7 @@ function TaskSection({
   hint?: string;
   items: ConductorTask[];
   paneMap: Record<string, PaneRef>;
-  activity: TaskActivity[];
+  activityByTask: ReadonlyMap<string, TaskActivity>;
   onActivate: (task: ConductorTask) => void;
   emptyLabel: string;
   hiddenCount?: TaskGroups["recentHiddenCount"];
@@ -145,7 +146,7 @@ function TaskSection({
       {items.length === 0 ? (
         <div className="taskdrawer-section-empty">{emptyLabel}</div>
       ) : (
-        items.map((t) => <TaskItem key={t.id} task={t} pane={paneMap[taskActionPane(t)]} targetPane={paneMap[t.target]} activity={activity.find((a) => a.task_id === t.id)} onActivate={onActivate} />)
+        items.map((t) => <TaskItem key={t.id} task={t} pane={paneMap[taskActionPane(t)]} targetPane={paneMap[t.target]} activity={activityByTask.get(t.id)} onActivate={onActivate} />)
       )}
       {!!hiddenCount && (
         <div className="taskdrawer-hidden-note">

@@ -22,8 +22,8 @@ The running Pantheon application, its panes and journal were not used for verifi
 
 ## Local checks
 
-- Rust tests: 464 unit tests and 2 integration tests passed; 1 measurement harness ignored.
-- Frontend tests: 220 tests in 18 files passed.
+- Rust tests: 467 unit tests and 2 integration tests passed; 1 measurement harness ignored.
+- Frontend tests: 221 tests in 18 files passed.
 - `pnpm build`, Rust formatting, Clippy with warnings denied, and `git diff --check` passed.
 - `cargo audit` exited successfully with 9 dependency warnings, including unmaintained and unsoundness advisories and a yanked dependency.
 - `pnpm audit --audit-level=high` passed after incorporating merged PR #112. The previous failure was the existing `source-map-js` advisory; the patched dependency, frontend tests and production build were verified again. No lockfile changes are included in this fleet increment.
@@ -68,3 +68,13 @@ GPT-6 Astra (`/root/fleet_review`) approved the follow-up and independently ran 
 targeted frontend tests. The implementer reran the full Rust and frontend suites,
 production build, and Clippy with warnings denied. All passed; the pre-existing
 large-chunk build warning remains.
+
+A second review added six findings. The overview now indexes tasks by actor and
+questions by conductor, and both task views index activity by task ID rather than
+rescanning full lists for each pane or row. A positive reviewer-ownership test
+also verifies reassignment back to the worker updates the overview. Three Linux
+integration tests cover journaled aging and repeat-read idempotence, roster
+observation attribution, and quiet waits scoped to requested task IDs. The quiet
+fixture uses a per-engine test-only output-age override instead of sleeping or
+changing the shared clock. GPT-6 Astra approved this delta and independently ran
+25 component tests. The full local checks listed above passed again.

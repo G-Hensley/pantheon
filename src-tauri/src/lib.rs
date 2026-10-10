@@ -509,6 +509,10 @@ pub struct SessionManager {
     /// prove the ordering of a code path that does not exist.
     #[cfg(test)]
     pub(crate) test_live_panes: Mutex<std::collections::HashSet<String>>,
+    // Per-engine observation seam: exercise long quiet periods without sleeping
+    // or changing the global monotonic clock used by concurrent tests.
+    #[cfg(test)]
+    pub(crate) test_output_ages: Mutex<HashMap<String, u64>>,
 }
 
 fn report_worktree_cleanup(worktree: &worktree::Worktree) {
@@ -764,6 +768,10 @@ impl SessionManager {
     /// for every session, and the startup admission check for a
     /// request-created interactive pane needs exactly this number.
     pub(crate) fn output_age_ms(&self, id: &str) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(age) = self.test_output_ages.lock().unwrap().get(id).copied() {
+            return Some(age);
+        }
         self.sessions
             .lock()
             .unwrap()

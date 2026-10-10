@@ -52,6 +52,19 @@ describe("FleetOverview ownership exclusions", () => {
     expect(worker).not.toHaveTextContent(task.id);
   });
 
+  it("moves review ownership to the reviewer and refreshes it when the task returns", () => {
+    const review = { ...task, status: "in_review", reviewer: "conductor" };
+    const props = { panes, activity: [], requests: [], onFocusPane: () => {} };
+    const { rerender } = render(<FleetOverview {...props} tasks={[review]} />);
+    const worker = screen.getByRole("button", { name: "Open pane worker" });
+    const reviewer = screen.getByRole("button", { name: "Open pane conductor" });
+    expect(worker).toHaveTextContent("No dispatched task");
+    expect(reviewer).toHaveTextContent("task-1: in_review");
+    rerender(<FleetOverview {...props} tasks={[{ ...review, status: "rework" }]} />);
+    expect(worker).toHaveTextContent("task-1: rework");
+    expect(reviewer).toHaveTextContent("No dispatched task");
+  });
+
   it("shows a stopped pane's state even when a task still names it", () => {
     render(<FleetOverview panes={[{ ...panes[0], status: "exited" }]} tasks={[task]}
       activity={[]} requests={[]} onFocusPane={() => {}} />);

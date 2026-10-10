@@ -1,5 +1,8 @@
+import { useMemo } from "react";
 import type { ConductorTask, SessionRequest, SessionType, TaskActivity } from "../lib/ipc";
 import { activityLabel, taskActor, TERMINAL_STATUSES } from "../lib/tasks";
+
+const terminalStatuses = new Set<string>(TERMINAL_STATUSES);
 
 type Props = {
   panes: { id: string; type: SessionType; status: string }[];
@@ -11,6 +14,22 @@ type Props = {
 };
 
 export function FleetOverview({ panes, tasks, activity, requests, onFocusPane, onOpenRequests }: Props) {
+  const { heldByActor, answersByConductor } = useMemo(() => {
+    const heldByActor = new Map<string, ConductorTask[]>();
+    const answersByConductor = new Map<string, number>();
+    for (const task of tasks) {
+      if (task.status === "blocked") {
+        answersByConductor.set(task.from, (answersByConductor.get(task.from) ?? 0) + 1);
+      }
+      if (terminalStatuses.has(task.status) || task.recovery_reason) continue;
+      const actor = taskActor(task);
+      const held = heldByActor.get(actor) ?? [];
+      held.push(task);
+      heldByActor.set(actor, held);
+    }
+    return { heldByActor, answersByConductor };
+  }, [tasks]);
+  const activityByTask = useMemo(() => new Map(activity.map((entry) => [entry.task_id, entry])), [activity]);
   const pending = requests.filter((request) => request.state === "pending");
   return (
     <section className="fleet-overview" aria-label="Fleet overview">
@@ -21,17 +40,15 @@ export function FleetOverview({ panes, tasks, activity, requests, onFocusPane, o
         </button>
       )}
       {panes.map((pane) => {
-        const held = tasks.filter((task) => taskActor(task) === pane.id
-          && !TERMINAL_STATUSES.includes(task.status as typeof TERMINAL_STATUSES[number])
-          && !task.recovery_reason);
-        const answers = tasks.filter((task) => task.status === "blocked" && task.from === pane.id).length;
+        const held = heldByActor.get(pane.id) ?? [];
+        const answers = answersByConductor.get(pane.id) ?? 0;
         return (
           <button key={pane.id} type="button" className="fleet-pane"
             onClick={() => onFocusPane(pane.id)} aria-label={`Open pane ${pane.id}`}>
             <span><b>{pane.type.label} {pane.id}</b></span>
             <span>{pane.status !== "running" ? pane.status
               : held.length === 0 ? "No dispatched task" : held.map((task) => {
-                const observed = activity.find((entry) => entry.task_id === task.id);
+                const observed = activityByTask.get(task.id);
                 return `${task.id}: ${observed ? activityLabel(observed) : task.status}`;
               }).join(" · ")}</span>
             {answers > 0 && <span className="fleet-attention">{answers} question{answers === 1 ? "" : "s"} to answer</span>}
