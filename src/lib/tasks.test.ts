@@ -55,6 +55,7 @@ describe("groupTasks", () => {
       "rework",
       "overdue",
       "pending",
+      "queued",
       "in_review",
       "done",
       "error",
@@ -66,7 +67,7 @@ describe("groupTasks", () => {
     );
     const groups = groupTasks(tasks);
 
-    expect(groups.open.map((t) => t.id)).toEqual(["blocked", "rework", "overdue", "pending"]);
+    expect(groups.open.map((t) => t.id)).toEqual(["blocked", "rework", "overdue", "pending", "queued"]);
     expect(groups.review.map((t) => t.id)).toEqual(["in_review"]);
     expect(groups.recent.map((t) => t.id).sort()).toEqual(
       ["abandoned", "cancelled", "done", "error"].sort(),

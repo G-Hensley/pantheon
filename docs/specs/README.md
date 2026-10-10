@@ -8,7 +8,4 @@ a specification in the next numbered directory.
 
 | Specification | Status | Subject |
 | --- | --- | --- |
-
-None yet. Pantheon's requirements live in GitHub Issues and in the design documents under
-[`../design/`](../design/), which predate this directory. A design that has to state what is
-required rather than how it works becomes the first specification here.
+| [SPEC-0001](0001-fleet-coordination/spec.md) | implementing | Factual fleet coordination: restart recovery, feedback delivery, activity and wait ownership. |

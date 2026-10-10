@@ -1,10 +1,11 @@
 import { useMemo } from "react";
-import { type ConductorTask, type DispatchBudget } from "../lib/ipc";
+import { type ConductorTask, type DispatchBudget, type TaskActivity } from "../lib/ipc";
 import { groupTasks } from "../lib/tasks";
 
 type ConductorBarProps = {
   conductor: string;
   tasks: ConductorTask[];
+  activity?: TaskActivity[];
   halted: boolean;
   onDemote: () => void;
   onHaltChange: (halted: boolean) => void;
@@ -27,6 +28,7 @@ type ConductorBarProps = {
 export function ConductorBar({
   conductor,
   tasks,
+  activity = [],
   halted,
   onDemote,
   onHaltChange,
@@ -45,11 +47,11 @@ export function ConductorBar({
 
   const groups = useMemo(() => groupTasks(tasks), [tasks]);
   const pending = tasks.filter((t) => t.status === "pending").length;
-  // Blocked tasks are the ones a human is most likely to need to act on (nudge
-  // the conductor pane to answer). Never derived from silence — see
-  // src/lib/tasks.ts — only ever true because the backend already set
-  // status === "blocked".
-  const needsAttention = groups.open.some((t) => t.status === "blocked");
+  // Backend observations identify questions, interrupted reviews and quiet
+  // tasks. Attention does not imply failure or a native CLI approval wait.
+  const needsAttention = groups.open.some((t) => t.status === "blocked")
+    || groups.review.some((t) => t.reviewer_gone || t.recovery_reason)
+    || activity.some((a) => a.state === "quiet");
   const openCount = groups.open.length + groups.review.length;
 
   return (

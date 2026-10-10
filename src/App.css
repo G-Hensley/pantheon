@@ -1150,7 +1150,8 @@ button.ghost.on {
   white-space: nowrap;
 }
 
-.taskitem-status[data-status="pending"] {
+.taskitem-status[data-status="pending"],
+.taskitem-status[data-status="queued"] {
   color: var(--acc);
   border-color: var(--acc);
 }
@@ -1951,3 +1952,17 @@ button.ghost.on {
   color: var(--txt);
   background: var(--sel);
 }
+
+/* Factual fleet observations alongside the task ledger. */
+.fleet-overview { margin-bottom: 20px; }
+.fleet-overview h3 { font-size: 13px; margin: 0 0 8px; }
+.fleet-pane { display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  width: 100%; padding: 10px 12px; margin: 4px 0; text-align: left;
+  color: inherit; background: transparent; border: 1px solid var(--edge); border-radius: 6px;
+  overflow-wrap: anywhere; }
+.fleet-pane:hover, .fleet-pane:focus-visible { background: var(--panel2); }
+.fleet-pane > span:not(:first-child), .fleet-note { font-size: 12px; }
+.fleet-note { opacity: .75; line-height: 1.5; }
+.fleet-attention, .fleet-approvals { color: var(--acc); }
+.fleet-approvals { width: 100%; padding: 10px; margin-bottom: 8px; text-align: left;
+  background: transparent; border: 1px solid currentColor; border-radius: 6px; }

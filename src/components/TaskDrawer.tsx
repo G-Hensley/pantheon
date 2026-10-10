@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useRef } from "react";
-import { type ConductorTask, type SessionType } from "../lib/ipc";
-import { groupTasks, openQuestion, statusLabel, type TaskGroups } from "../lib/tasks";
+import { type ConductorTask, type SessionType, type TaskActivity, type SessionRequest } from "../lib/ipc";
+import { groupTasks, openQuestion, statusLabel, taskActionPane, activityLabel, type TaskGroups } from "../lib/tasks";
+
+import { FleetOverview } from "./FleetOverview";
 
 type PaneRef = { id: string; type: SessionType; status: string };
 
 type TaskDrawerProps = {
   tasks: ConductorTask[];
+  activity?: TaskActivity[];
+  requests?: SessionRequest[];
+  onOpenRequests?: () => void;
   panes: PaneRef[];
   onClose: () => void;
   // Focuses (maximizes) the task's target pane — the same mechanism
@@ -21,7 +26,7 @@ type TaskDrawerProps = {
 // Every list item is a real <button>, so Tab / Shift+Tab and Enter / Space
 // work without any extra keyboard wiring, matching the rest of the app's
 // dialogs (SettingsPanel, DispatchDialog): no focus trap, Escape closes.
-export function TaskDrawer({ tasks, panes, onClose, onFocusPane }: TaskDrawerProps) {
+export function TaskDrawer({ tasks, panes, activity = [], requests = [], onOpenRequests, onClose, onFocusPane }: TaskDrawerProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const groups = useMemo(() => groupTasks(tasks), [tasks]);
   const paneMap = useMemo(() => {
@@ -43,8 +48,9 @@ export function TaskDrawer({ tasks, panes, onClose, onFocusPane }: TaskDrawerPro
   }, [onClose]);
 
   function activate(task: ConductorTask) {
-    if (!paneMap[task.target]) return; // pane closed — nothing to focus
-    onFocusPane(task.target);
+    const actor = taskActionPane(task);
+    if (!paneMap[actor]) return;
+    onFocusPane(actor);
   }
 
   return (
@@ -69,14 +75,17 @@ export function TaskDrawer({ tasks, panes, onClose, onFocusPane }: TaskDrawerPro
         </div>
 
         <div className="taskdrawer-body">
+          <FleetOverview panes={panes} tasks={tasks} activity={activity} requests={requests}
+            onFocusPane={onFocusPane} onOpenRequests={onOpenRequests} />
           {tasks.length === 0 ? (
             <div className="taskdrawer-empty">No tasks dispatched yet.</div>
           ) : (
             <>
               <TaskSection
                 title="Open"
-                hint="pending · overdue · rework · blocked"
+                hint="pending · overdue · rework · blocked · queued"
                 items={groups.open}
+                activity={activity}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing open."
@@ -84,6 +93,7 @@ export function TaskDrawer({ tasks, panes, onClose, onFocusPane }: TaskDrawerPro
               <TaskSection
                 title="Awaiting review"
                 items={groups.review}
+                activity={activity}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing waiting on a reviewer."
@@ -91,6 +101,7 @@ export function TaskDrawer({ tasks, panes, onClose, onFocusPane }: TaskDrawerPro
               <TaskSection
                 title="Recent"
                 items={groups.recent}
+                activity={activity}
                 paneMap={paneMap}
                 onActivate={activate}
                 emptyLabel="Nothing finished yet."
@@ -109,6 +120,7 @@ function TaskSection({
   hint,
   items,
   paneMap,
+  activity,
   onActivate,
   emptyLabel,
   hiddenCount,
@@ -117,6 +129,7 @@ function TaskSection({
   hint?: string;
   items: ConductorTask[];
   paneMap: Record<string, PaneRef>;
+  activity: TaskActivity[];
   onActivate: (task: ConductorTask) => void;
   emptyLabel: string;
   hiddenCount?: TaskGroups["recentHiddenCount"];
@@ -132,7 +145,7 @@ function TaskSection({
       {items.length === 0 ? (
         <div className="taskdrawer-section-empty">{emptyLabel}</div>
       ) : (
-        items.map((t) => <TaskItem key={t.id} task={t} pane={paneMap[t.target]} onActivate={onActivate} />)
+        items.map((t) => <TaskItem key={t.id} task={t} pane={paneMap[taskActionPane(t)]} targetPane={paneMap[t.target]} activity={activity.find((a) => a.task_id === t.id)} onActivate={onActivate} />)
       )}
       {!!hiddenCount && (
         <div className="taskdrawer-hidden-note">
@@ -146,10 +159,14 @@ function TaskSection({
 function TaskItem({
   task,
   pane,
+  targetPane,
+  activity,
   onActivate,
 }: {
   task: ConductorTask;
   pane: PaneRef | undefined;
+  targetPane: PaneRef | undefined;
+  activity: TaskActivity | undefined;
   onActivate: (task: ConductorTask) => void;
 }) {
   const question = task.status === "blocked" ? openQuestion(task) : undefined;
@@ -160,20 +177,23 @@ function TaskItem({
       className="taskitem"
       onClick={() => onActivate(task)}
       disabled={!pane}
-      title={pane ? `Focus ${pane.type.label} ${task.target}` : `${task.target} is no longer open`}
+      title={pane ? `Focus ${pane.type.label} ${pane.id}` : `${taskActionPane(task)} is no longer open`}
     >
       <div className="taskitem-top">
-        {pane && <span className="taskitem-agent">{pane.type.label}</span>}
+        {targetPane && <span className="taskitem-agent">{targetPane.type.label}</span>}
         <span className="taskitem-target">{task.target}</span>
         <span className="taskitem-mode">{task.mode ?? "pane"}</span>
         {task.exit_code != null && <span className="taskitem-exit">exit {task.exit_code}</span>}
-        {!pane && <span className="taskitem-pane-closed">pane closed</span>}
+        {!targetPane && <span className="taskitem-pane-closed">worker pane closed</span>}
         <span className="taskitem-status" data-status={task.status}>
           {statusLabel(task.status)}
         </span>
       </div>
       <div className="taskitem-brief">{task.task}</div>
-      {question && <div className="taskitem-question">Waiting on you: {question.question}</div>}
+      {question && <div className="taskitem-question">Waiting for {task.from} to answer: {question.question}</div>}
+      {activity?.state === "quiet" && <div className="taskitem-question">{activityLabel(activity)}</div>}
+      {task.recovery_reason && <div className="taskitem-question">{task.recovery_reason}</div>}
+      {task.reviewer_gone && !task.recovery_reason && <div className="taskitem-question">Reviewer unavailable; reassignment needed.</div>}
       {task.status === "in_review" && task.reviewer && (
         <div className="taskitem-meta">
           Awaiting review by <b>{task.reviewer}</b>
@@ -190,7 +210,7 @@ function TaskItem({
           {task.findings}
         </div>
       )}
-      {(task.status === "done" || task.status === "error") && task.result && (
+      {["done", "error", "abandoned", "cancelled", "in_review"].includes(task.status) && task.result && (
         <div className="taskitem-meta">{task.result}</div>
       )}
     </button>

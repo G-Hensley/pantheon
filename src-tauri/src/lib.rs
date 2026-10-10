@@ -1,3 +1,4 @@
+mod fleet;
 // Pantheon — multi-session PTY engine.
 //
 // Each live agent runs on its own pseudo-terminal (ConPTY). Sessions are keyed
@@ -2201,15 +2202,19 @@ struct ConductorState {
     conductor: Option<String>,
     halted: bool,
     tasks: Vec<mcp::Task>,
+    activity: Vec<fleet::TaskActivity>,
     dispatch_budget: mcp::DispatchBudget,
 }
 
 #[tauri::command]
 fn conductor_state(shared: State<'_, Arc<mcp::Shared>>) -> ConductorState {
+    let tasks = shared.observed_tasks_snapshot();
+    let activity = shared.task_activity_snapshot(&tasks);
     ConductorState {
         conductor: shared.conductor(),
         halted: shared.is_halted(),
-        tasks: shared.tasks_snapshot(),
+        tasks,
+        activity,
         dispatch_budget: shared.dispatch_budget(),
     }
 }
