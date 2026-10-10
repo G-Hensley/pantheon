@@ -153,6 +153,22 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_reviewer_requires_reassignment_even_with_recent_activity() {
+        let mut t = task("in_review");
+        t.reviewer_gone = true;
+        assert!(t.recovery_reason.is_empty());
+        let observation = observe(&t, Some(0), Some(0), 900_100);
+        assert_eq!(observation.state, "reviewer_unavailable");
+        assert_eq!(observation.actor, "reviewer");
+        assert_eq!(observation.quiet_ms, None);
+        assert_eq!(
+            describe(&observation),
+            "task task-1: reviewer reviewer unavailable; reassign review"
+        );
+        assert_eq!(t.status, "in_review");
+    }
+
+    #[test]
     fn queued_interrupted_and_headless_work_do_not_borrow_pane_silence() {
         let mut t = task("queued");
         assert_eq!(observe(&t, Some(900_000), None, 900_100).quiet_ms, None);

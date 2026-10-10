@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { type ConductorTask } from "./ipc";
+import { type ConductorTask, type TaskActivity } from "./ipc";
 import {
+  activityLabel,
   groupTasks,
   openQuestion,
   OPEN_STATUSES,
@@ -138,5 +139,22 @@ describe("statusLabel", () => {
     const labels = all.map(statusLabel);
     expect(labels.every((l) => l.length > 0)).toBe(true);
     expect(new Set(labels).size).toBe(labels.length);
+  });
+});
+
+describe("activityLabel", () => {
+  it.each<[string, Partial<TaskActivity>, string]>([
+    ["waiting_on_conductor", { waiting_on: "sess-1" }, "Waiting for sess-1 to answer"],
+    ["waiting_on_conductor", {}, "Waiting for conductor to answer"],
+    ["interrupted", {}, "Assignment interrupted; reassignment required"],
+    ["reviewer_unavailable", {}, "Reviewer unavailable"],
+    ["headless", {}, "Headless task open"],
+    ["quiet", { quiet_ms: 359999 }, "No observed activity for 5m; task still open"],
+    ["quiet", {}, "No observed activity for 0m; task still open"],
+    ["in_review", {}, "In review"],
+    ["new_backend_state", {}, "new_backend_state"],
+  ])("labels %s using known observations", (state, fields, expected) => {
+    expect(activityLabel({ task_id: "task-1", actor: "worker", state,
+      quiet_ms: null, waiting_on: null, ...fields })).toBe(expected);
   });
 });

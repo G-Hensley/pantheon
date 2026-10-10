@@ -11482,6 +11482,31 @@ mod tests {
         assert_eq!(shared.tasks_snapshot()[0].result, "retained submission");
     }
 
+    #[tokio::test]
+    async fn waiting_on_an_unavailable_reviewer_returns_reassignment_guidance() {
+        let (shared, _dir) = shared_for_test();
+        let mut task = task_at("review", "in_review", 10);
+        task.reviewer = "sess-3".into();
+        task.reviewer_gone = true;
+        task.result = "submitted work".into();
+        assert!(task.recovery_reason.is_empty());
+        shared.tasks.lock().unwrap().push(task);
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-1".into());
+        let response = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "review".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(
+            response.contains("reviewer sess-3 unavailable; reassign review"),
+            "{response}"
+        );
+        let snapshot = shared.tasks_snapshot();
+        assert_eq!(snapshot[0].status, "in_review");
+        assert_eq!(snapshot[0].result, "submitted work");
+    }
+
     // ---- review_request_notice / rework_notice: delivered message shape ----
 
     #[test]

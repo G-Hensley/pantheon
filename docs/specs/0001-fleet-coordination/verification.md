@@ -22,8 +22,8 @@ The running Pantheon application, its panes and journal were not used for verifi
 
 ## Local checks
 
-- Rust tests: 462 unit tests and 2 integration tests passed; 1 measurement harness ignored.
-- Frontend tests: 198 tests in 18 files passed.
+- Rust tests: 464 unit tests and 2 integration tests passed; 1 measurement harness ignored.
+- Frontend tests: 220 tests in 18 files passed.
 - `pnpm build`, Rust formatting, Clippy with warnings denied, and `git diff --check` passed.
 - `cargo audit` exited successfully with 9 dependency warnings, including unmaintained and unsoundness advisories and a yanked dependency.
 - `pnpm audit --audit-level=high` passed after incorporating merged PR #112. The previous failure was the existing `source-map-js` advisory; the patched dependency, frontend tests and production build were verified again. No lockfile changes are included in this fleet increment.
@@ -55,3 +55,16 @@ A disposable desktop project should exercise restart recovery, reviewer reassign
 question navigation and session approval navigation before installation into the user's
 running application. Native CLI approval detection and automatic reminders remain outside
 SPEC-0001; a quiet pane does not identify an approval prompt.
+
+## PR review follow-up
+
+PR #115's five test-quality findings were addressed with two Rust tests and 22
+frontend cases. These cover unavailable-reviewer observations and wait replies,
+attention indicators, terminal and interrupted ownership exclusions, stopped pane
+status, task-scoped quiet notices, recovery-reason precedence, and activity labels
+including missing values and unknown states. No production behavior changed.
+
+GPT-6 Astra (`/root/fleet_review`) approved the follow-up and independently ran 58
+targeted frontend tests. The implementer reran the full Rust and frontend suites,
+production build, and Clippy with warnings denied. All passed; the pre-existing
+large-chunk build warning remains.
