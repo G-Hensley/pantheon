@@ -153,6 +153,23 @@ mod tests {
     }
 
     #[test]
+    fn quiet_description_reports_seconds_and_preserves_uncertainty() {
+        let t = task("pending");
+        let quiet_ms = QUIET_WARNING_MS + 5999;
+        let observation = observe(&t, Some(quiet_ms), None, t.ts_ms + quiet_ms);
+        assert_eq!(
+            describe(&observation),
+            "task task-1 on worker: no observed activity for 305s; task still open, reason unknown"
+        );
+        // Unknown output observations retain the task status instead of
+        // inventing a quiet duration.
+        assert_eq!(
+            describe(&observe(&t, None, None, t.ts_ms + quiet_ms)),
+            "task task-1: pending"
+        );
+    }
+
+    #[test]
     fn unavailable_reviewer_requires_reassignment_even_with_recent_activity() {
         let mut t = task("in_review");
         t.reviewer_gone = true;

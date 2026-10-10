@@ -78,3 +78,16 @@ observation attribution, and quiet waits scoped to requested task IDs. The quiet
 fixture uses a per-engine test-only output-age override instead of sleeping or
 changing the shared clock. GPT-6 Astra approved this delta and independently ran
 25 component tests. The full local checks listed above passed again.
+
+A third review clarified FR-004's interrupted-review navigation and added an exact
+seconds-format assertion for quiet observations, including unknown-output fallback.
+All six fleet unit tests and Clippy passed after this test-only Rust change; the
+reviewer approved it. Existing wait and roster integration tests already assert
+interrupted-review guidance.
+
+CI for `caad646` passed frontend, Windows, CodeQL and secret scanning. Linux reported
+466 unit tests passed and one unchanged headless fixture failed to launch with
+`ExecutableFileBusy: Text file busy`. This is recorded in [#116](https://github.com/G-Hensley/pantheon/issues/116).
+A failed-job rerun was denied to the worker App. This evidence does not establish
+the cause or make that CI run successful; the subsequent review-fix commit needs
+its own CI results.

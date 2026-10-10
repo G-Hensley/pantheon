@@ -68,8 +68,9 @@ observations for requested tasks.
 ### FR-004
 
 The task view MUST retain all queued work, show the responsible conductor for a
-question, focus the reviewer for review work, and display interruption reasons and
-retained results. It MUST provide a fleet overview and a route to pending Pantheon
+question, focus the reviewer for active review work, and display interruption reasons
+and retained results. An interrupted review with a suspended reviewer assignment
+MUST focus its responsible conductor for reassignment. It MUST provide a fleet overview and a route to pending Pantheon
 session approvals. Native CLI approval state MUST NOT be inferred from these facts.
 
 ## Acceptance Criteria
