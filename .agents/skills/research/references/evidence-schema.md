@@ -55,6 +55,11 @@ load-bearing and does not need a record at all.
 | `query` | The exact search, API call, or command used |
 | `corroboration` | Independent evidence supporting the same claim |
 | `conflicts` | Sources that disagree, and how |
+| `coverage` | Any negative claim ("no advisory affects", "not supported on", "no such option"): the surfaces and queries checked. The same field emitted records require for `no-evidence-found` |
+
+A negative claim without `coverage` is unbounded, and an unbounded negative is
+the easiest wrong answer to give because nothing in it can be checked. Render it
+inline: "No advisory in OSV or GHSA for pkg 1.2.3, checked 2026-09-18."
 
 `published: unknown` is a legitimate value and more honest than a guess. An
 undated source is weaker evidence, and recording that is the point.
@@ -220,3 +225,27 @@ is more authoritative and why, and what would settle it.
 Do not resolve a conflict by omission. A vendor's documentation contradicted by
 an open issue in the vendor's own repository is a genuinely useful finding, and
 usually more useful than whichever side you would have picked.
+
+## Paraphrase fidelity
+
+A `claim` restates its source. The restatement must not move the claim in
+either direction, because a quote match (and `researchctl verify --fetch`)
+proves the span exists, not that the claim beside it says the same thing.
+
+Keep these as the source states them:
+
+| Keep | Examples | The drift it prevents |
+|---|---|---|
+| Normative strength | MUST, SHOULD, MAY, "required", "recommended" | A recommendation reported as a requirement, or the reverse |
+| Lifecycle wording | "experimental", "preview", "planned", "deprecated" | A planned feature reported as shipped |
+| Scope qualifiers | Platform, edition, tier, region, deployment mode | A Linux-only behavior reported as universal |
+| Version range | "since 2.3", "before 1.8", "in 3.x" | A fixed-in-3.1 claim reported against 3.0 |
+| Hedges and conditions | "by default", "unless", "in most cases" | A default reported as the only behavior |
+
+Weakening is as much a defect as strengthening. Dropping a "MUST" to "should",
+or a caveat the source attached, misreports the source as surely as inflating
+it. When the source's word does not fit your sentence, quote the word.
+
+When reopening a delegated span, check fidelity as well as presence: a span that
+exists but carries a different strength or scope from the worker's claim is a
+distortion, and the claim takes the source's version.

@@ -1,12 +1,17 @@
 {
   "items": {
     "agent:toolsmith": {
+      "catalog": {
+        "digest": "sha256:5f1edf5d3e7f0f7ff39c9a25f0d5b2b32adceff0d7d77cb866a5921bfde6e704",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/agents/toolsmith.claude.yaml": "4e378f5db9c4fc3f74532a27135457654ea35f476103808b3f8df7d4e574b9a8",
-        ".agents/agents/toolsmith.codex.toml": "b3265425b99ef2433a7786936003e6aa2147bdda2b00d835108beab02ad0c441",
-        ".agents/agents/toolsmith.md": "0907fb84b2f83561aae7dc4286af8a6b97f9cc5fdfea6c9374fcbc3b73455140",
-        ".agents/agents/toolsmith.memory.yaml": "b5101784414527fa92f71d68489ee9a17cf4d720625245ac433e0898e85d0791",
-        ".agents/agents/toolsmith.opencode.yaml": "a62b26c3a3b45a2baa4ce0ce6f9ebc6db262c2c570a713cd6ecf2102c3c20aaa"
+        ".agents/agents/toolsmith.claude.yaml": "882f373c3bb5ed7f9106ff4979ba425a40a301ec16030a28fb3554d2b03c8070",
+        ".agents/agents/toolsmith.codex.toml": "cc4f8f11ad3b2689b7b36b2ea9161ffb3a65327d60d8c73e508d9f3d378377a8",
+        ".agents/agents/toolsmith.md": "87558b88d843ea3ea51cfcb106d9e7de3143f1c5d8cb5cd59a392e436c0ffbe9",
+        ".agents/agents/toolsmith.memory.yaml": "5bcf15192dab16add422e72914c4afde6d0521c949d4dba7487d66ef43ceada9",
+        ".agents/agents/toolsmith.opencode.yaml": "36c54d33905fb6a3037b60e7b2e35d7e9a46f82f5fe13a477defb84e741a42a9"
       },
       "source": "agent-library/toolsmith"
     },
@@ -25,7 +30,7 @@
     "schema:adr": {
       "catalog": {
         "digest": "sha256:58d42a69b5e223128efb4ccd57cd7b56e22ec5f99c25bf64c44040fa9f98245e",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
@@ -36,7 +41,7 @@
     "schema:architecture": {
       "catalog": {
         "digest": "sha256:dcf41dde5dab77c259b3028df83d66a370da7795386b10d6abfa27dc5a594eda",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
@@ -44,10 +49,21 @@
       },
       "source": "policy-library/schemas/architecture"
     },
+    "schema:design": {
+      "catalog": {
+        "digest": "sha256:e45ddf5c5e521a0672265ed13782eddaa186304cc91a4a592af647c84acf240f",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/design.schema.json": "3f5b563f0e9fdb761f16a491fbb57b516802f6f65b6e7a6ed09e2e5788a172aa"
+      },
+      "source": "policy-library/schemas/design"
+    },
     "schema:idea": {
       "catalog": {
         "digest": "sha256:156e4e9db99c047d46ea1b93e5b302e4b1b6ccc7ae331b22abfe750701b0bf28",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
@@ -55,10 +71,21 @@
       },
       "source": "policy-library/schemas/idea"
     },
+    "schema:research": {
+      "catalog": {
+        "digest": "sha256:bc43402f7112916b9a687556968bfbb9f2b13e89c865ceb4a4d5b508a1afc3ac",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/schemas/research.schema.json": "be9ace0e42009c02ead49cb5a25173f7cfbe1abf6be147fc68a58cfbeab207b1"
+      },
+      "source": "policy-library/schemas/research"
+    },
     "schema:spec": {
       "catalog": {
         "digest": "sha256:178ec2b9c7caec003cb1bcb0c98b1f57c4a6b1d5b5ffa0644d11c07e2ebb7017",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
@@ -69,7 +96,7 @@
     "schema:threat-model": {
       "catalog": {
         "digest": "sha256:2bd8ccdad584bbd9c5824a733c6881d29edace3dc9d139e3f38ecf34de313e44",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
@@ -77,121 +104,343 @@
       },
       "source": "policy-library/schemas/threat-model"
     },
-    "skill:adr-authoring": {
+    "schema:verification": {
       "catalog": {
-        "digest": "sha256:63eaa00f8f4882f2dda2275f91d506bedec201723ab71995e827f79d8c7612c5",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "digest": "sha256:b351ec65d0592a2846551358c7038d684cbf707d28d2ccc2afc5978266fc11eb",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
-        ".agents/skills/adr-authoring/SKILL.md": "c8eea0f8d66616a90a655ec6b772e257ecd4c6a37bfff1dc85596d7585f85ef0",
-        ".agents/skills/adr-authoring/references/adr-template.md": "b9469983d3345dab5d961ac4fa80fe11934e7067c35accaa1ea149b344f7a12e",
-        ".agents/skills/adr-authoring/references/supersession.md": "d286a81f40ffd04d3be1a42981e3f392dc2071455575e2ea773fa735aed42ea4"
+        ".agents/schemas/verification.schema.json": "4e4caf0d564aef817a61db5e56143fd5c927aa5cfb0506fd0ac00167727de139"
       },
-      "source": "skill-library/adr-authoring"
+      "source": "policy-library/schemas/verification"
     },
-    "skill:architecture-docs": {
+    "skill:archify": {
       "catalog": {
-        "digest": "sha256:f15a3a336badeefb23d71bfe4f30f06a9703e78213feb627c8f1091a38e9ea88",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "digest": "sha256:3f04dd802aa272dd2fa040e03a10133274a15b190f0db50b25c887a80521fd52",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
-        ".agents/skills/architecture-docs/SKILL.md": "f01063ae6a52c40f072f8f7659348e4a7cd4be7293811f944fd2ec194ed7678e",
-        ".agents/skills/architecture-docs/references/diagram-state.md": "4cb753b93a9f5b229bbca105ac310fc1c47e210b68e854a14aa8a9f30668d6dd",
-        ".agents/skills/architecture-docs/references/document-set.md": "5864da759b5728010edc74f4fa4848001eb0242299698e560e10eb8f2f426ad0"
+        ".agents/skills/archify/LICENSE": "b799ab081703e7821ae5096d2c1abdf14bbdc75e8ea1c4045998c36ed6db9706",
+        ".agents/skills/archify/SKILL.md": "cd5b3329371145ec3fb9a86f365c411d1d516c5eb2694fc06fe91652908b4be3",
+        ".agents/skills/archify/THIRD_PARTY_NOTICES.md": "f8dec2a3a8c977069f07a370b5580757191202a805c19d3cad2c5bcaf9e3a8b3",
+        ".agents/skills/archify/assets/template.html": "35b2210b120c56a6c58d953ffe0cf815c2e67d0a5ff3e8b9518c45b737dd3fc3",
+        ".agents/skills/archify/bin/archify.mjs": "b0eb73f0e4c462100cc72ebb83a2b6e7bb9596b3b9ef0fe10d68219fd3cf99d3",
+        ".agents/skills/archify/bin/open-artifact.mjs": "add1722186683c12770c575585bbb8774919c15b87361e10d2fe834623223159",
+        ".agents/skills/archify/bin/preview.mjs": "6d41e491d42070c05b5e278548714da1fcef6e6adfd84a0391ab2bf12f47373c",
+        ".agents/skills/archify/bin/visual-check.mjs": "8fa8c6f233f3598f4f22e58c48a4de6f45b3b072ad8e7aee4731c49b4bfbdc52",
+        ".agents/skills/archify/examples/agent-run.lifecycle.json": "af939579dcafc8b4c49f09594591577994398aee57a57369d4c791dfc0d85a42",
+        ".agents/skills/archify/examples/agent-tool-call.workflow.json": "4d3f6c23de2ca7d306e05d0041a9506833bb5a164a2bddc2d1984cf4da3ee90c",
+        ".agents/skills/archify/examples/async-job-roundtrip.sequence.json": "545f20920c89b69c2bb1f15508d5543fddbeb15cffba61e102206e04bd5a5cd9",
+        ".agents/skills/archify/examples/brand-aware-delivery.architecture.json": "d4f0df8114b3524756ffa49529c015e00757b0594a357183490c1edeb341e3c6",
+        ".agents/skills/archify/examples/cache-miss-request.sequence.json": "4bbaa6ca3cd4036002fd5d0f3a332eb922cec69d09bac3d7925f95beb4308389",
+        ".agents/skills/archify/examples/checkout-platform.base.architecture.json": "c112195e7285e3e4aedaeab3e1f85f5891d30fccc2c260aebe4e1da12c80cf84",
+        ".agents/skills/archify/examples/checkout-platform.head.architecture.json": "e3aaf47f77afeadafc81c6ce853dc1df68cc1e6932dec972cf478f4008fdda99",
+        ".agents/skills/archify/examples/deployment-release.lifecycle.json": "735c2c5819266e6ea2a71775b6eefce98b53030ce90cb721dc8e1d022ce5be71",
+        ".agents/skills/archify/examples/event-stream.dataflow.json": "a92d6597ddbe164f395da32a7d4b33cfae08edd7d9600a6fb45a2058e5bbb43e",
+        ".agents/skills/archify/examples/incident-response.workflow.json": "5c760c82eee545dfb7da38a4e628059d7891af4cfbfc13c8a7009ea64f69aa1b",
+        ".agents/skills/archify/examples/product-analytics.dataflow.json": "6fa38a7ccedf96da592d60b392783b846188eaa3ec9136c6dc06ca020e43a110",
+        ".agents/skills/archify/examples/production-deployment.architecture.json": "ec484aa8576664fdb207b543fa49486b23273faccb7a5071e1a0becfb48c22eb",
+        ".agents/skills/archify/examples/release-delivery.workflow.json": "e5c880417eac1623923c3dd5461e0c78acd762e1621a28bd53fc14a84cad6a91",
+        ".agents/skills/archify/examples/web-app.architecture.json": "483350f5297df682aba4e4a0fa491307ce3d3abd725ae4df07fab177490752cf",
+        ".agents/skills/archify/migrations/workflow-v2.mjs": "77aadc38460e5e778344901f492cc00f16f74e8fe1def14b01e6d6d346b9f4c7",
+        ".agents/skills/archify/package.json": "7fe2a96f0d6730b2d35811d7d4f5e7e969c166a47a0c87543cdf667a221815be",
+        ".agents/skills/archify/recipes/scenarios.mjs": "e77d31d5b65b921799f4f560287fbac24feb3cd683bee8cabe49ed1ddde1a8ac",
+        ".agents/skills/archify/references/authoring-contract.md": "8f2b583d0d84fb315e4c4dfa685bbcb93343bf7673b92ea0e70d361f8ffca4d7",
+        ".agents/skills/archify/references/brand-marks.md": "8010869da70677e686ecb312d9c3eec2d20723a44f817ab2bbf5525361c8a136",
+        ".agents/skills/archify/references/delivery-contract.md": "a614c31f41d270995a5aee99036532470a43722f8208fdc8ef922805914d1d01",
+        ".agents/skills/archify/references/viewer-runtime.md": "dc0d9ffe6b9987d73d2d48710fce5ab4c120bbf1940ff1eb9355259c5d4f32b6",
+        ".agents/skills/archify/renderers/architecture/grid.mjs": "f6de99c32436feed3378b0ddef516bb4732ff27a89c543b50635d4d14a15a55a",
+        ".agents/skills/archify/renderers/architecture/render-architecture.mjs": "f57077cb9fa64a8412ab0af705cb31e2e7a920114b31852882c04a76840365dc",
+        ".agents/skills/archify/renderers/dataflow/README.md": "18c4f86ba62fcee371d9fe38094625b3a68cc76231c36ab8c8124acb4c1ffa42",
+        ".agents/skills/archify/renderers/dataflow/render-dataflow.mjs": "5a5da505e5c68041990de92847f53a38215efb9212bc36fc911774e8829335c9",
+        ".agents/skills/archify/renderers/lifecycle/README.md": "f8ef88dc859189bb18bad7bb2e27d997cbc9d30936cf20f8bf401bae7f57deec",
+        ".agents/skills/archify/renderers/lifecycle/render-lifecycle.mjs": "23720729a14495b4085839653ec0622f2465be3b1e8c9eb556b602ab3f4a8cda",
+        ".agents/skills/archify/renderers/sequence/README.md": "a442335dcf44b1587d3ad88809e31b001a4fafdf7a134040e8b1927455af4206",
+        ".agents/skills/archify/renderers/sequence/render-sequence.mjs": "230c0fb79775badb4beb6fd74f45ed1ffbb70e932c3641a24bedcc61f912bddf",
+        ".agents/skills/archify/renderers/shared/brand-marks.mjs": "4557b7f3eec25a3dba66a0f5da1c5dca6ec607e2a68e9be51cd697cefe9e6425",
+        ".agents/skills/archify/renderers/shared/cli.mjs": "2a6b8fa11234451627a70bca71985d80362a4c52401a90a21840d6e2ae3012d9",
+        ".agents/skills/archify/renderers/shared/desktop-readability.mjs": "b36203a11df348706e541f309266a0f9b914dac6a7eb8ba804e3abe8f8d6c710",
+        ".agents/skills/archify/renderers/shared/diagnostics.mjs": "855fea15daf2beb5be7fad0d54b72a63a4af8595f227facf845ba1852b3b365a",
+        ".agents/skills/archify/renderers/shared/engineering-profiles.mjs": "7e99f9d5423f66cc9ab6224da56dc2d5aa6c6faec29178034794e9db6b5b2889",
+        ".agents/skills/archify/renderers/shared/generated-brand-marks.mjs": "0f157d229c12df6f53763a3b88684baa5803a52484c49c4d34ec40b8743beea2",
+        ".agents/skills/archify/renderers/shared/generated-validators.mjs": "b32d852053a2159477393c38df55f4759633bd3d36d829bd307b9389611e06b8",
+        ".agents/skills/archify/renderers/shared/geometry.mjs": "161785af32241fc96df051c9be4f2bb9c3b897418d708f4a051b63f1c44952cf",
+        ".agents/skills/archify/renderers/shared/i18n.mjs": "da0320ac6c002f421c516cb4921e9b806a4ba5b3e9a4f6cbcdef0b16e2917d47",
+        ".agents/skills/archify/renderers/shared/layout-report.mjs": "44c2f74a20e483dd37dae6791ede39284ce3bac1a2a13872d2912999e8504df5",
+        ".agents/skills/archify/renderers/shared/legend.mjs": "4c8b37f10fb5c783a28bff6aa35bc3966155213ee32f64a8252eab5b9e64a747",
+        ".agents/skills/archify/renderers/shared/output-path.mjs": "44a5f63239703a0a56623711bb9565272488c540650cb8c3f0a3aac57928d1cf",
+        ".agents/skills/archify/renderers/shared/repository-evidence.mjs": "e36c109c84b338ea77d2ae74e9fa9ffe4317e7780a2be8d4d78e588ddb387677",
+        ".agents/skills/archify/renderers/shared/text-fit.mjs": "35b6ef2c64d88c1ea4e5aab2af7c4e8a2c2e1be62db71263787d39a9797e7dea",
+        ".agents/skills/archify/renderers/shared/utils.mjs": "20124265300eb286db184a053561005cc32b6128dc1bc1b3f9520ffa8d43a241",
+        ".agents/skills/archify/renderers/shared/validator.mjs": "7460d7fcbcdf710649256c5e96142ae26d807a655d3296ee8caf7f5e158622cc",
+        ".agents/skills/archify/renderers/workflow/README.md": "7e1bd65cc5cc38206304ae2f61f4f0f493da98d71a111a61d0754c9da362c5c9",
+        ".agents/skills/archify/renderers/workflow/render-workflow.mjs": "83be05d1efd1816c527fccdf3ebbd4a0f1454c6cb0c9f7554c6702eb40d9c540",
+        ".agents/skills/archify/renderers/workflow/workflow-compiler.mjs": "06dc97f67041037d71fd8731934d4833ece95ac1a4278e3ef875b0e51e516104",
+        ".agents/skills/archify/renderers/workflow/workflow-migration-geometry.mjs": "ebfc5085dd008ae63802f500402fb7bf8ca0ae28460997d867f45e5493b8fbe6",
+        ".agents/skills/archify/schemas/README.md": "f4ca94ec18cf60ad02211f2c5bb64e9c26a87467a22215e06db34dbfc5d6145f",
+        ".agents/skills/archify/schemas/architecture.schema.json": "8c96140b6af8d93fb825a3c63e46b74176c9485185c978074ffe89e0f614576c",
+        ".agents/skills/archify/schemas/common.schema.json": "2630c958314eeebb92e0f6f6330475f1a2bc48f8c1b53201ba3b58889b319c80",
+        ".agents/skills/archify/schemas/dataflow.schema.json": "09d238a6a18f2e074ec69c8f905f58a44d3a0b68fc6a925b8346c484a912af90",
+        ".agents/skills/archify/schemas/lifecycle.schema.json": "05b46c0db95ee7ed44305b61496a96bb4f69342b20f9903d6534d952ebc65083",
+        ".agents/skills/archify/schemas/sequence.schema.json": "c9fec3fad087f14d55c0bb2d34446246e3405f0238c292c1cb6bef28d1120fcb",
+        ".agents/skills/archify/schemas/workflow.schema.json": "2128e82afd2b971fcb7d80ada86fa836bb4a5035b504053b87d3aeefec380e3c",
+        ".agents/skills/archify/scripts/check-render-output.mjs": "5b86f60bd6607c580e1d2daaf181a129d81c3293310b3c7f38eda6435b8520b5",
+        ".agents/skills/archify/scripts/check-update.mjs": "7c7f47b35a55754fd85468c5e1cfc467bb2e1b9dd5c683dd60172844882b1970",
+        ".agents/skills/archify/scripts/generate-brand-marks.mjs": "0434c31903b831382a91e85a329bcbcb39b32f29c656273a273f896b3b0a42e7",
+        ".agents/skills/archify/scripts/generate-validators.mjs": "a5f5f67d3cd4675b16fa620043a5463f3c15aad89afb1b0c7cf42cf35e883f9a",
+        ".agents/skills/archify/scripts/render-examples.mjs": "a173a053fb26c0ac3cd72eb9b4e50411e67ca8c50bec57f05d4ca8ba79db2c0b",
+        ".agents/skills/archify/scripts/update-contract.mjs": "7c5d34c5fa2e08fcd0b42e33a0f3b4685fcecf3ac88f1ed820528df8fdc46cbc",
+        ".agents/skills/archify/skill-release.json": "269772492c38663b5d19730a54e5d7ad973ef04e47eb4f75b6dfa2e249614097"
       },
-      "source": "skill-library/architecture-docs"
+      "source": "skill-library/archify"
     },
     "skill:create-skill": {
+      "catalog": {
+        "digest": "sha256:0cb9d5a36ef3b0a3e9b1881914dd0230a6c5d78a58b722fac80c9aa217928b4c",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/skills/create-skill/SKILL.md": "ec33c3cf52eac2d9a66f7d5d4971be28a9ccb54945b195cc404acfcaaecf657e",
-        ".agents/skills/create-skill/references/anti-patterns.md": "9969325692ccebef6e4af25092709b0fd1c5887e57e3cfd9e6af503e87da2135",
+        ".agents/skills/create-skill/SKILL.md": "35fd5f272520ec0b1edd6e3dc096a167cd810b911070b6986770db0c5d5da598",
+        ".agents/skills/create-skill/references/anti-patterns.md": "2c254c7c56df26839a328be9d474560a25b185ca77dd547f7c54b22af935518e",
         ".agents/skills/create-skill/references/bulletproofing-discipline-skills.md": "144fb9ecfe42f46367d41223ec0f03806fd23d8bfafd289ad7875c79ec928f97",
         ".agents/skills/create-skill/references/description-discipline.md": "c15992c7d237a93739206963221a71804a9b3d7c8d09b13cb97bce49442a95c9",
-        ".agents/skills/create-skill/references/skill-template.md": "e1112eddd2affef28650e73259bde14f9ce35a831015f7fbd5085a6cd508cc2b",
-        ".agents/skills/create-skill/references/testing-skills.md": "d0d3db470f773aae24b9263ed6099b2129c1aba2133d56964705e3747ec7c62e"
+        ".agents/skills/create-skill/references/grading-outputs.md": "748b3aa86b7386fc491137f89d3258ad82344aef8f6fc88abc8c232930b20621",
+        ".agents/skills/create-skill/references/skill-template.md": "05bcd8dc52759696ab21b2b23759c4fbecb1ef6c782ea89e613b5a4e5f996244",
+        ".agents/skills/create-skill/references/testing-skills.md": "15df18fffd92e3634e9ed75a5bbbf105ff317e1d6c5f869aefaf9e1504e357f7",
+        ".agents/skills/create-skill/scripts/init_skill.py": "cbbf0a0e26514c034dd4d1610670e0380823ae8ebcbcdad3f959979d2e015502",
+        ".agents/skills/create-skill/scripts/validate_skill.py": "ca39680647225c47796fdc91cb00f3f1357384f5e4f32e1cda4cd8ed9c3164dd"
       },
       "source": "skill-library/create-skill"
     },
     "skill:create-subagent": {
+      "catalog": {
+        "digest": "sha256:f8da5d80107b1b5de4e2e3e97b992b3b4c32a3ecefc52b7507fa4d29c585af3b",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/skills/create-subagent/SKILL.md": "4e299adcacfb1c412afba6cfe3ddce76fd6cd5b09d6f42995f5c8e7503b128f2",
+        ".agents/skills/create-subagent/SKILL.md": "40f1412fd45ecc5c1b3e31879af287a9ab4ffde61e0f63084d593f55634ce071",
         ".agents/skills/create-subagent/references/agy-template.md": "d7b15953631912e0ab4827593766061e5c3b2a371df2d8991c9c4836c6e5d0f7",
         ".agents/skills/create-subagent/references/best-practices.md": "42896bb6b3e1a28f355b301f6964484ac18ddf50e02168a88e1ceaa15b569a6f",
         ".agents/skills/create-subagent/references/claude-template.md": "50f2781745faabaeaf79c5d34dd20625681f8df804f06644b4d857a76b0f1fb3",
         ".agents/skills/create-subagent/references/codex-template.md": "8bf2eab108884c4806111cdac706e59c2255ddf874a11469e9d4fdb4d565b524",
+        ".agents/skills/create-subagent/references/evaluating-subagents.md": "ab988a8a98e647f57803cc922c70a1746575645f8070de68a1017d0ada61d3dd",
         ".agents/skills/create-subagent/references/memory-template.md": "281c43308bf61a1a32835fc2d98e4a3bb56f6847cd25615ff34bfd38ae079f8b",
         ".agents/skills/create-subagent/references/opencode-template.md": "db22224fef4aa220f49bf453cc459a2cee0bfa9f702f243b2b5f7c0ae96b848e"
       },
       "source": "skill-library/create-subagent"
     },
-    "skill:issue-planning": {
+    "skill:document-architecture": {
       "catalog": {
-        "digest": "sha256:8206d8978a61e097b1ddb5d060e607e3ac2243abd1f4183f092e9ed544663dac",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "digest": "sha256:4f22a5abfb205d3dae6d8343ce2709bbfb2189e711c0f41d9958f1fe29c67f22",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
-        ".agents/skills/issue-planning/SKILL.md": "162269fc1eb3cf00d993dd60dec930554c2ef9f45ce8ee1fba8ce600fbe49d83",
+        ".agents/skills/document-architecture/SKILL.md": "a2321d2a36d4065bb9f7e931b03b8636d2c22cd867ea99b604cfc9f1432c6cf9",
+        ".agents/skills/document-architecture/references/diagram-state.md": "4cb753b93a9f5b229bbca105ac310fc1c47e210b68e854a14aa8a9f30668d6dd",
+        ".agents/skills/document-architecture/references/document-set.md": "5864da759b5728010edc74f4fa4848001eb0242299698e560e10eb8f2f426ad0"
+      },
+      "source": "skill-library/document-architecture"
+    },
+    "skill:fix-bug": {
+      "catalog": {
+        "digest": "sha256:bf52ce1851467d6927819139eb0f8460b8a8bc8c6b10de84e483629667be1ea8",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/fix-bug/SKILL.md": "27a41e4153ca60585ff7ff69bfc0d8cf935732b769634a6fdef66317a666a3f2"
+      },
+      "source": "skill-library/fix-bug"
+    },
+    "skill:implement-change": {
+      "catalog": {
+        "digest": "sha256:0edc111f99cc4b71cc7580824cf68aa46479dfcb4e7523ca7cf076d4ba50a5a9",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/implement-change/SKILL.md": "0ef865e4361a73f1391a28549d04072dd134d73c5f7065c41c40726e4e64b728",
+        ".agents/skills/implement-change/references/result-contract.md": "914bf3452ff0c589e06bf94ddf0830665ae083ca17f37f95525d19422127f3f8"
+      },
+      "source": "skill-library/implement-change"
+    },
+    "skill:issue-planning": {
+      "catalog": {
+        "digest": "sha256:15bfa844145a4c97a107c5655b7908a57317429156ad4212206912d82a2b71a5",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/issue-planning/SKILL.md": "42cac2485fe9fca941ce44725110e2f696964affab6b8f2efa8083ff994a37ad",
         ".agents/skills/issue-planning/references/backlog-triage.md": "02b4e360b7e6798cfa765ae0873991cfad29ff1c418a456a794343cc93b952a3",
-        ".agents/skills/issue-planning/references/issue-body.md": "48f6a78bf6be4e2183a41c250ac88e46ac699aecffd0c11508a206861f6bc75c"
+        ".agents/skills/issue-planning/references/contractless-body.md": "4bfcc2b1831bc7c5cde5ccae7d5d58e929f1e8db64d73b87931b6404d02798cb",
+        ".agents/skills/issue-planning/references/issue-body.md": "613541823c83e9b42e94e561933b7797c083f8ec3300a936b39f1964a461290d",
+        ".agents/skills/issue-planning/references/milestone-routing.md": "7a61d113f2fe9c90b434d98d88ec548306704b83cf5b8e77dacfdb6ba2528c48",
+        ".agents/skills/issue-planning/references/owner-steps.md": "6e792c27f410d540b453ed78a4abdda599a07c5d7698de290e7668c3194bec31",
+        ".agents/skills/issue-planning/references/repository-contract.md": "71f35a045fe512661064a905010256d72d3c7c050f43b02f1387453152cb9337"
       },
       "source": "skill-library/issue-planning"
     },
-    "skill:research": {
+    "skill:model-threats": {
+      "catalog": {
+        "digest": "sha256:503fe132560d727550196e9af1d15cc82a753c7695447a7b72fa1aa615551425",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/skills/research/SKILL.md": "0a6f1550bcfb273e76a8c777a692cacbf863ee398de8532d2969c27cff791f39",
-        ".agents/skills/research/references/evidence-schema.md": "f100326c399521943bf963665483e614e672635b56e06c9577d37de2f7eac73e",
-        ".agents/skills/research/references/source-policy.md": "18cb2688c101bcf878a74c6913a8bff5bf22466e794f5ead9d869dc022566c41"
+        ".agents/skills/model-threats/SKILL.md": "1ec3edfa1ff4827ba64f752e1595393fa4d25a05d590c9cf0b9fe90d6495f919",
+        ".agents/skills/model-threats/references/disclosure.md": "6026049be569ebb9aef0248f8059dd2fdf565fe27f64e244133239f46970cb8a",
+        ".agents/skills/model-threats/references/findings.md": "4794d4cf8a88fabe78fd9300730fd2447521292aefb726c2d7578ddde5469622",
+        ".agents/skills/model-threats/references/threat-model-template.md": "c80f287aedb5f782b88b33c6be96b982cd197c52f81a2ea5538605dac4bc0139"
+      },
+      "source": "skill-library/model-threats"
+    },
+    "skill:plan-repository": {
+      "catalog": {
+        "digest": "sha256:e693e571c5009e0ccc9571072d5d32eff77f2456ee18969dd3a10fce9a922622",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/plan-repository/SKILL.md": "6107888cad9147a6a74a2248fa0ef572072c7dcc1ce8ae71ea38cefa1181e868",
+        ".agents/skills/plan-repository/references/catalog-freshness.md": "08ca0beaee61a14710cfc25c47ea1fd4726098672dd96cf86fbc19e81f008c00",
+        ".agents/skills/plan-repository/references/checklist.md": "5568a757aa64d028c1cbbe93b0ac094dd387b9598f3561d90d716389d586d7fb",
+        ".agents/skills/plan-repository/references/enforcement-layers.md": "20d862aec0f5040e25ebc556695a466cf5358c994f8b4f35685a00eaad940958",
+        ".agents/skills/plan-repository/references/plan-template.md": "1e0b3e92d780dfc7edc7221c547d55fa86f0f8f2a31a9dfa72130ef34967d2f2",
+        ".agents/skills/plan-repository/scripts/check-plan.py": "c0097cbfe63c4cf8cd4ed7a59ac012cd544a367d6d906f33e4faa775c4dca86f"
+      },
+      "source": "skill-library/plan-repository"
+    },
+    "skill:reconcile-project": {
+      "catalog": {
+        "digest": "sha256:d12b8b46bb446966724d9354a8b2376d6ab820a01b88516d42e99c7e726f76e5",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/reconcile-project/SKILL.md": "e3bbd36cfc2d51dbcf22c292fe8cc73e36fd06dda3a1eb81b4d6cf86118aa042",
+        ".agents/skills/reconcile-project/references/reckon-inputs.md": "0be69ce4c172332d0cf2a13c11eed7036f5ec676f4d9043195540f8d16ed98e2",
+        ".agents/skills/reconcile-project/references/reconciliation-examples.md": "1cb89e9f8cfe8b43ae17a31a83eafb2ba9f14c6c7a19db685db522737a7a3903"
+      },
+      "source": "skill-library/reconcile-project"
+    },
+    "skill:record-decision": {
+      "catalog": {
+        "digest": "sha256:936ae3e2dc080b070f0f82566f3646746d8eb77412e7b1c3c413d0ab00d864a9",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/record-decision/SKILL.md": "5518b1b5f3c9e94ebb2af4698024672be06e7e1497bec723bb14d0b515bf974b",
+        ".agents/skills/record-decision/references/adr-template.md": "b9469983d3345dab5d961ac4fa80fe11934e7067c35accaa1ea149b344f7a12e",
+        ".agents/skills/record-decision/references/supersession.md": "d286a81f40ffd04d3be1a42981e3f392dc2071455575e2ea773fa735aed42ea4"
+      },
+      "source": "skill-library/record-decision"
+    },
+    "skill:research": {
+      "catalog": {
+        "digest": "sha256:a2c3d8a2763effff6953fbddf8593cb93d039c43a0dfedb5eed892e9201d05f7",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/research/SKILL.md": "1409e84f246a9375c567f5abeed1254e010237dfbbbff219af7e761528b56d22",
+        ".agents/skills/research/references/evidence-schema.md": "d1e67308b5fd37b7c077aabaca70c473511dea6373c12272a686aa5bc1c60763",
+        ".agents/skills/research/references/plan-and-bound.md": "3c220d0e249bd1ace8d7787fff5392c5c54f190c7fb5351eee88178fba3754d2",
+        ".agents/skills/research/references/source-policy.md": "823bb7ccfb9a3a88dbad411aaf0a1850f642b00eba78d5c63e9d06e3cb311b76"
       },
       "source": "skill-library/research"
     },
     "skill:resolve-pr-feedback": {
+      "catalog": {
+        "digest": "sha256:3959eedb7219f1ee98f61a1b24a99a94250bb558665553941cba62ec33febccf",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/skills/resolve-pr-feedback/SKILL.md": "c078ccd48b10ce3838eac165358a87bda3947fb838c07fff0ad8673ccedb166d",
-        ".agents/skills/resolve-pr-feedback/scripts/pr_feedback.py": "97d8d455feb24f7b5af27ad1878df2ee5ab28a3862aadbc1f19fa21ecc7a47e0"
+        ".agents/skills/resolve-pr-feedback/SKILL.md": "f370819dbc9ae641f0f53d0bc53abca7883a5f541854a767b4c5e8ca90acd581",
+        ".agents/skills/resolve-pr-feedback/scripts/pr_feedback.py": "b357b86aa6cc6efac0127a177ec0a541359299fc9a8a0277d27450547a05500e"
       },
       "source": "skill-library/resolve-pr-feedback"
     },
-    "skill:shape-ideas": {
+    "skill:route-work": {
+      "catalog": {
+        "digest": "sha256:b343416c3b424cef17ef8c2a3632566baaf955d6928a8857ddc926c6d8f5ef0f",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
       "files": {
-        ".agents/skills/shape-ideas/SKILL.md": "f993c75293342d84ccb680bc1eca1908910918f52a43799c76aab04402edac3b",
-        ".agents/skills/shape-ideas/assets/increment.md": "ffc2cd26a4e94b8c974f3efebcb58b747c2513f984a2564b789af1e67d98f510",
-        ".agents/skills/shape-ideas/assets/north-star.md": "e6a284072fba742991de80fcc59d52d63d30864987c7ccc38bd0bab265d41020",
-        ".agents/skills/shape-ideas/references/definition-of-good.md": "5023f10710997f98209658de7fd25ceca29fe77dc55c35fe0edd52f764720a1e",
-        ".agents/skills/shape-ideas/references/increment-slicing.md": "b962b97a392e2873741b29e81e465cbb5728afaa72881f61c7626445091eda86",
-        ".agents/skills/shape-ideas/references/interview-passes.md": "9fc60603cf0a98dec7e27dfb948964ab16aa78b9cf9d791114ef76b9737583d6"
+        ".agents/skills/route-work/SKILL.md": "f8c25ff9d67f7a65423506cbcc7e420feeeb79188815b41f056cbd2a7de5386c",
+        ".agents/skills/route-work/references/failure-ladder.md": "b42ebd857bfe67e7572c6a6aa3d3fcb288c367fccaa83fb0b75e17379f995853",
+        ".agents/skills/route-work/references/host-routing.md": "736e2dcd3e0f8362b66155b63ced125fd554f40ae7f5ce48aea9de04180c0ea7",
+        ".agents/skills/route-work/references/worker-contract.md": "f43098dae802546a1085c784c73dac2c0683b4cd5a974b8703883b7eb8ad912b"
+      },
+      "source": "skill-library/route-work"
+    },
+    "skill:scaffold-repository": {
+      "catalog": {
+        "digest": "sha256:5335c135badd64bb420ac485f0ca339b3c88a0b64724b71aa0b12e76bd1c06f4",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/scaffold-repository/SKILL.md": "7255b3d39a2d337ee98102099202129febb96c25c0f9cea7638df21dfa712d61",
+        ".agents/skills/scaffold-repository/references/agents-md.md": "e2d384bd6e3550f56f2f0f0222a6bb37d35ba161606d5ac2acd8c3f7b628309c",
+        ".agents/skills/scaffold-repository/references/catalog-freshness.md": "08ca0beaee61a14710cfc25c47ea1fd4726098672dd96cf86fbc19e81f008c00",
+        ".agents/skills/scaffold-repository/references/day-one-surface.md": "209bdacfc60e4578605f02e5e4ff50e3d0876dac1d8382b4db0bf22acaca7fd6",
+        ".agents/skills/scaffold-repository/references/lifecycle-block.md": "9e7a5fd4687e3929deba94f7d810fefbc39fb8f63c1bd486dbcf498da3e34fda",
+        ".agents/skills/scaffold-repository/references/tree-checker.md": "39af3aa59b919b7400fbf2ca009abfdf801392d51efc0c040c4ef552484f34a7",
+        ".agents/skills/scaffold-repository/scripts/copy-skeleton.sh": "5fb9573b6bbf13722b328b83bd0b416ef7a2610f5b13e0a6670cc92b695a0f16",
+        ".agents/skills/scaffold-repository/scripts/verify-day-one.sh": "b4b3cc16a3559adce3457068a0b85143d0fcf57ac3d58e06deccf764e937c2ea"
+      },
+      "source": "skill-library/scaffold-repository"
+    },
+    "skill:shape-ideas": {
+      "catalog": {
+        "digest": "sha256:ca576ba8e74d548b1c0969fa39d0ae8fc44f6b27a944f2fbf56a6a7dbee22009",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
+        "git_dirty": false
+      },
+      "files": {
+        ".agents/skills/shape-ideas/SKILL.md": "3cc022804b18a15b017b8ff6a59eedf132474a87a3dbb456d1c6a35ba0417b86",
+        ".agents/skills/shape-ideas/assets/increment.md": "e2e81d468adcc1c621592517a1808e03a0722e9420b1e13721375e8a735e2858",
+        ".agents/skills/shape-ideas/assets/north-star.md": "5a4fdbcaccc8c117c724e1e86b3c565fc4f9aebde689f1a4d6c00886ce112911",
+        ".agents/skills/shape-ideas/references/definition-of-good.md": "d1b8930db5dabe760bb7520607a64555288aa34955f2e019bc52da6e7b6da47f",
+        ".agents/skills/shape-ideas/references/increment-slicing.md": "3f027088a012e49900cfb1195ea2e0c629687fa6ba71844a5de3fb0221ee591d",
+        ".agents/skills/shape-ideas/references/interview-passes.md": "188f3695cb8578674b16790eea9b94ba0fe52001e9ebc7228dc33e99b1e27d95"
       },
       "source": "skill-library/shape-ideas"
     },
-    "skill:spec-authoring": {
+    "skill:ship-change": {
       "catalog": {
-        "digest": "sha256:4adf4a1f2e9ec651e40593a6fbfc6b88a8af7e1a7768046bb2a2dfdb22f9ad7f",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "digest": "sha256:317dc9f18a6a429555cc66c4b7d30e9c3e6bbd30d308d18b92a8e67d3bc47fcc",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
-        ".agents/skills/spec-authoring/SKILL.md": "84323c67d35b6dd51fc1380d2039ccbc9e1cf67a4dc020e7dd61282950c6e494",
-        ".agents/skills/spec-authoring/references/design-template.md": "edc82ea2288b4cae3f1439747b717856ce44a5e39cffefc8a1cce23d29b2a4e9",
-        ".agents/skills/spec-authoring/references/frontmatter.md": "1af649890fa21c9d56173e425dd1c89142be78037b6170eaa4c3cbf91e24c78d",
-        ".agents/skills/spec-authoring/references/spec-template.md": "7ffaef0abc59a22d8ce874ab60915d835d5a015729e55716fdd251103c83a303"
+        ".agents/skills/ship-change/SKILL.md": "187afe67deb47ff8231e5cb2fb52e2e8d3c401a2b02d0ae1bfc7172c4a53e00d",
+        ".agents/skills/ship-change/references/signed-commits.md": "0067d3ef669c44dd1c599b0be99704abeeaf11b1e694c144538d1827176eaf7c"
       },
-      "source": "skill-library/spec-authoring"
+      "source": "skill-library/ship-change"
     },
-    "skill:threat-model-authoring": {
+    "skill:write-spec": {
       "catalog": {
-        "digest": "sha256:d8db00b3aef67946726c4159434426ed3717fa468c9cf8ca1804d67186e96143",
-        "git_commit": "9bd47410230bff3fa54ec789954d5d9aca7ff769",
+        "digest": "sha256:64b5dbb7491667c014b46109deb2e54b5bc1a6b770d9a7459d816879793b9d79",
+        "git_commit": "4db58965aee740ee168d2e51791af6716e29e8b2",
         "git_dirty": false
       },
       "files": {
-        ".agents/skills/threat-model-authoring/SKILL.md": "6158cb4382376c5663911e527a419847126b98ffe16a56fe0264102ba4d274f4",
-        ".agents/skills/threat-model-authoring/references/disclosure.md": "6026049be569ebb9aef0248f8059dd2fdf565fe27f64e244133239f46970cb8a",
-        ".agents/skills/threat-model-authoring/references/findings.md": "4794d4cf8a88fabe78fd9300730fd2447521292aefb726c2d7578ddde5469622",
-        ".agents/skills/threat-model-authoring/references/threat-model-template.md": "c80f287aedb5f782b88b33c6be96b982cd197c52f81a2ea5538605dac4bc0139"
+        ".agents/skills/write-spec/SKILL.md": "1fbeae0d436abec405770347d640d7b603ae13417961ff4bcf958070a3b5eb2f",
+        ".agents/skills/write-spec/references/design-template.md": "edc82ea2288b4cae3f1439747b717856ce44a5e39cffefc8a1cce23d29b2a4e9",
+        ".agents/skills/write-spec/references/frontmatter.md": "1af649890fa21c9d56173e425dd1c89142be78037b6170eaa4c3cbf91e24c78d",
+        ".agents/skills/write-spec/references/spec-template.md": "7ffaef0abc59a22d8ce874ab60915d835d5a015729e55716fdd251103c83a303"
       },
-      "source": "skill-library/threat-model-authoring"
+      "source": "skill-library/write-spec"
     }
   },
   "schema_version": 1

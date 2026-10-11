@@ -3,7 +3,7 @@
 One Architecture Decision Record per file, `NNNN-slug.md`, for choices that should outlive the task
 that caused them. An accepted record is immutable in its reasoning: to reverse it, write a new one,
 mark the old `superseded` with `superseded_by`, and keep its row here. Use the installed
-`adr-authoring` skill to create and validate the next numbered decision record.
+`record-decision` skill to create and validate the next numbered decision record.
 
 | ID | Decision | Status | Decided by | Superseded by |
 | --- | --- | --- | --- | --- |

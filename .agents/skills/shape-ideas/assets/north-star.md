@@ -1,76 +1,82 @@
+---
+id: IDEA-NNNN
+title: <Idea name>
+type: idea
+status: candidate
+created: YYYY-MM-DD
+---
+
 # <Idea name>
 
-Durable design context. This file holds what stays true across increments. Anything
-specific to one shippable slice belongs in that increment's spec instead.
+Shaping record: discovery, rationale, hypotheses and tentative direction. This is
+not a specification or authority to implement. Use one file under `docs/ideas/`;
+fill its increment section from `increment.md`. Remove template guidance before
+handing it over, and omit sections that do not apply.
 
-Drop any section that does not apply rather than filling it with "N/A".
+## North Star
 
-## Goal
+**Goal:** what should ultimately become possible, in the user's language.
 
-One sentence. What is true after this exists that is not true now, stated in the
-language of the person it serves.
+**Who it serves:** the concrete user, their situation and current workaround.
 
-## Who it serves
+**Success evidence:** the observation that would show the direction was useful.
+This is a hypothesis, not accepted requirements or claimed verification.
 
-The concrete user and what they are doing when they hit this problem. Name their
-current workaround, since that is the thing your design has to beat.
+**Constraints:** existing systems, stack, data boundaries and investment limits.
 
-## Success evidence
+**Non-goals:** what a reasonable reader might expect but this direction excludes.
 
-The observation, some months out, that would say this worked. A metric with a
-direction, a behavior that becomes common, a cost that disappears.
+## Direction and alternatives
 
-## Constraints
+Chosen approach and discriminating criteria, including reversibility. State why
+it won and what would change the recommendation. Keep implementation detail out
+unless it changes the direction.
 
-The things that cannot change: stack, team, deadline, budget, compliance, runtime
-environment, systems this has to live alongside.
+| Alternative | Why not chosen | Revisit if |
+| --- | --- | --- |
+| <option> | <reason> | <evidence> |
 
-## Non-goals
+## Appetite and delivery strategy
 
-What this deliberately does not do. Include the things a reasonable person would
-assume are in scope and are not.
+**Appetite:** <agreed number> agent sessions for <bounded work>, optionally capped
+at <$amount> when the host reports cost. One session is one bounded worker session.
 
-## Approach
+**Delivery strategy:** <Direct Build / Incremental Build / Experimental Build>,
+because <scope, clarity, uncertainty, failure consequence, reversibility,
+integration breadth and verification difficulty that discriminate here>.
 
-The chosen direction and the criteria it was chosen against. Cover architecture,
-main components and their boundaries, data flow, and how failures surface.
+Direct Build has exactly one increment, the complete bounded solution. Incremental
+Build has a smallest useful outcome and later outcome hypotheses. Experimental
+Build begins with an evidence-producing increment; further product work depends on
+its result. Each increment carries its own appetite without silently enlarging
+the agreed bound. If it does not fit, state what needs a smaller cut and what
+scope decision remains open.
 
-Keep this at the level someone needs to understand the shape. Implementation detail
-belongs in the increment specs.
-
-## Rejected alternatives
-
-| Option | Why it lost | What would change this |
-|---|---|---|
-| <option> | <the specific reason> | <the condition that would make it right> |
-
-This table is what stops the same debate from reopening later.
-
-## Assumptions
-
-Carried from the interview. Mark the load-bearing ones.
+## Assumptions and risks
 
 | Assumption | Load-bearing | If wrong |
-|---|---|---|
-| <assumption> | Yes / No | <what breaks or changes> |
+| --- | --- | --- |
+| <assumption> | Yes / No | <what changes> |
 
-## Risks
+| Risk | Treatment and reason |
+| --- | --- |
+| <risk> | <accepted / mitigated / investigated by a bounded experiment> |
 
-| Risk | Resolution |
-|---|---|
-| <risk> | Accepted because <reason> / Mitigated by <design choice> / Experiment in <increment> |
+## Increments
 
-## Increment ladder
-
-The sequence, with one line each. The next increment is specified in full in its
-own file; later ones stay as intent until the one before them ships.
-
-| Increment | Outcome | Status |
-|---|---|---|
-| v0 | <what a user can do> | Specified |
-| v1 | <what a user can do> | Sketch |
-| v2 | <what a user can do> | Sketch |
+Insert the next increment from `increment.md`. Later outcomes, only where the
+strategy warrants them, stay a paragraph each: intended benefit, appetite,
+assumptions, dependencies and evidence that would justify pursuing them. No
+executable backlog or duplicated progress status belongs here.
 
 ## Open questions
 
-What is still unknown, who can answer it, and which increment needs the answer.
+What is still unknown, who can answer it, and which decision needs the answer.
+
+## Handoff
+
+Next step: `write-spec` promotes accepted requirements into a specification
+when the work warrants one; obvious bounded work may go directly to an issue.
+This record's definitions of good remain hypotheses until promoted. On consumption
+by `write-spec`, its status becomes `promoted`, it links to the specification,
+and the record remains history, not a competing source of requirements.

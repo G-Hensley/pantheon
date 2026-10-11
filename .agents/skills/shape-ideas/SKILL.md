@@ -1,14 +1,14 @@
 ---
 name: shape-ideas
-description: Shape a rough idea into a validated design and a sequence of independently valuable increments, each with an explicit definition of good. Use when someone wants to brainstorm, whiteboard, or think through a feature, product, system, process, or rework before building; wants help scoping an MVP or a v0, v1, v2 ladder; wants to decide what ships first; or asks what "good" or "done" should mean for a slice of work.
+description: Shape a rough idea into a shaping record with a delivery strategy, an appetite and a sequence of independently valuable increments, each with a definition of good held as a hypothesis. Use when someone wants to brainstorm, whiteboard, or think through a feature, product, system, process, or rework before building; wants help scoping an MVP or a v0, v1, v2 ladder; wants to decide what ships first; or asks what "good" or "done" should mean for a slice of work.
 ---
 
 # Shape Ideas
 
 Turn a rough idea into a design the person actually believes in, then cut it into
 increments that ship one at a time, each with a stated definition of good. The
-value is in the interview, not the paperwork: specs are a byproduct of having
-thought clearly, so never let producing them become the point.
+value is in the interview, not the paperwork. The shaping record holds discovery,
+rationale and hypotheses; it is never the requirements authority.
 
 ## Do not run this skill when
 
@@ -30,8 +30,8 @@ let the person move it.
 | Depth | Fits | Interview | Output |
 |---|---|---|---|
 | Quick | One reversible slice, low blast radius, clear intent | One round of clarification | Options and a recommendation in conversation |
-| Standard | A feature with real unknowns or several moving parts | Passes 1, 2, and 4 | Increment specs, north-star only if more than one increment |
-| Deep | A new system or product, or several interacting subsystems | All four passes plus risks and validation experiments | North-star spec and increment specs |
+| Standard | A feature with real unknowns or several moving parts | Passes 1, 2, and 4 | Shaping record with the next increment and later outcomes |
+| Deep | A new system or product, or several interacting subsystems | All four passes plus risks and validation experiments | Shaping record with North Star, increments and risks |
 
 Consequence is not depth. A guarded area (auth, secrets, personal or production
 data, schemas and migrations, deployment) raises the approval bar and makes the
@@ -78,21 +78,8 @@ correct a wrong turn cheaply.
 4. **Slice.** Increments, sequencing, and the definition of good for each. Exits
    when the first increment is small enough to build and its evidence is agreed.
 
-Question discipline, in priority order:
-
-- Ask the question whose answer most changes the design. If an answer would not
-  change the design, the boundaries, or the definition of good, do not ask it.
-- **Assume, do not interrogate.** Anything you can reasonably infer becomes a
-  stated assumption the person corrects, not a question they answer. Keep a running
-  assumption ledger and show it at each recap. Correcting is far cheaper than
-  answering.
-- Batch independent questions, up to three or four at a time. Ask serially only
-  when the answer genuinely determines the next question.
-- Stop when no unknown would change the design. Past roughly six questions in a
-  pass, present a best-effort design with assumptions flagged instead.
-
-See [interview-passes.md](references/interview-passes.md) for the question banks,
-recap format, and the assumption ledger shape.
+Use [interview-passes.md](references/interview-passes.md) for question discipline,
+question banks, the recap format and the assumption ledger.
 
 ## 4. Compare approaches against stated criteria
 
@@ -105,82 +92,96 @@ forecloses. Lead with your recommendation and the reason. Record the rejected
 alternatives and why they lost, which is what stops the debate reopening in three
 weeks. Never recommend without stating what would change your mind.
 
-## 5. Cut the work into increments
+## 5. Resolve appetite and choose the delivery strategy before slicing
 
-Every increment must be independently shippable and independently valuable. If v1
-is useless without v2, they are one increment.
+Resolve how much the work is worth before cutting it: **agent sessions**, each a
+bounded session of one worker, with an optional dollar ceiling where the host
+reports cost. Reuse a supplied bound; otherwise ask and wait for agreement before
+slicing. Wall-clock estimates and model-tier choices are not an appetite.
 
-- Slice by user-visible outcome, never by layer. "Database, then API, then UI"
-  ships nothing until the end and hides integration problems until they are costly.
-- v0 is the smallest thing delivering the core outcome for one real user on the
-  happy path, with the riskiest assumption tested.
-- Sequence by risk, not by ease. A validation experiment that reduces uncertainty
-  may come before v0 without pretending to be a product increment.
-- Specify the next increment in detail; keep later ones to a paragraph of intent.
-  Detail written for v2 is mostly wrong by the time v1 ships, and people defend it
-  rather than rewrite it.
-- Flag one-way doors: schemas, public interfaces, data migrations. Defer them when
-  you can, call them out when you cannot.
-- More than four or five increments means the north-star is probably two projects.
+Record one delivery-strategy line and its reason. Consider scope and complexity,
+requirement clarity, technical uncertainty, consequence of failure, reversibility,
+integration breadth and verification difficulty:
 
-See [increment-slicing.md](references/increment-slicing.md) for worked ladders, the
-experiment-versus-increment distinction, and the common bad cuts.
+- **Direct Build:** the complete solution fits one bounded, reversible, verifiable
+  increment. Emit that one increment, with no manufactured MVP or later ladder.
+- **Incremental Build:** too large for one increment, major assumptions understood.
+  Shape a North Star, the smallest useful outcome, then later outcome hypotheses.
+- **Experimental Build:** a load-bearing assumption is uncertain. The first
+  increment is a bounded experiment whose useful result is reproducible evidence;
+  a prototype or MVP follows only if that evidence justifies it.
+
+Every emitted increment carries an appetite, including an experiment or later
+outcome sketch. State how each fits the agreed bound; tentative later allocations
+are hypotheses, not an expansion of the current appetite. If a cut does not fit,
+report **needs a smaller cut**, naming what does not fit. Offer a split, reduction,
+investigation or reconsideration for agreement; never silently drop required
+behavior or propose a longer estimate to make it fit. Unagreed scope stays pending.
+
+Slice by independently valuable outcome, never by layer. A product increment must
+ship usefully alone; an experiment must answer a decision-relevant question alone.
+Detail only the next increment; later outcomes stay brief. Sequence by risk and
+flag one-way doors. More than four or five increments may mean two projects.
+See [increment-slicing.md](references/increment-slicing.md) for examples and bad cuts.
 
 ## 6. Define good for every step
 
 **Per pass:** each pass has an exit condition above. That is its definition of
 good. Do not move on by declaring it met; state how it is met.
 
-**Per increment:** every increment spec carries a definition of good with five
-parts. Outcome, evidence, quality bar, out of scope, and reversibility. Evidence
+**Per increment:** the record carries a definition of good as a hypothesis with five
+parts: outcome, evidence, quality bar, out of scope, and reversibility. Evidence
 must be reproducible or independently checkable rather than resting on your word,
 and the quality bar names only the dimensions that apply, each with a threshold.
 
+It becomes acceptance criteria only when `write-spec` promotes it. Do not
+present the record as a specification or its hypotheses as accepted requirements.
 A definition of good that would pass for any increment is not one. See
 [definition-of-good.md](references/definition-of-good.md) for the rubric and a
 strong and weak example side by side.
 
-## 7. Write the specs, proportionally
+## 7. Write the shaping record, proportionally
 
-Write files only after the person approves the design, and only what the work
-warrants. Name the location when you ask for that approval, so writing to their
-repository is part of what they agree to rather than a surprise. If they would
-rather keep it in the conversation, do that.
+Write after the person approves the direction and writing location; reuse approval
+already given. At Standard and Deep depth, write one `docs/ideas/<slug>.md` in the
+standard's idea shape: `id: IDEA-NNNN`, `title`, `type: idea`, `status: candidate`,
+`created: YYYY-MM-DD`. Check existing identifiers before choosing the next number.
+Project convention wins within the idea surface. At Quick depth the record may
+stay in conversation. If files are declined, keep the conversation and report that
+the Standard/Deep record remains unwritten.
 
-- One increment: write the increment spec alone.
-- More than one increment, or real architectural breadth: write the north-star
-  spec plus one spec per increment.
-- Quick depth: write nothing unless asked.
+Before a project repository exists, use `docs/ideas/` of the repository holding its
+planning; move the record into the new repository when it is scaffolded.
 
-Default location is `docs/design/<slug>/`, with `north-star.md`, `v0-mvp.md`,
-`v1.md`, and so on. Project convention wins; look for an existing specs or design
-directory before creating a new one.
+Use [north-star.md](assets/north-star.md) for the record and its North Star section,
+and [increment.md](assets/increment.md) as a section inside it, not separate specs.
+Record the strategy, appetite, hypotheses, alternatives, assumptions and risks.
+Direct Build has one increment; later outcomes, if warranted, remain brief intent.
+Register the record in the repository's ideas index where one exists.
 
-Use [north-star.md](assets/north-star.md) and [increment.md](assets/increment.md)
-as the starting shapes. Drop sections that do not apply rather than filling them
-with "N/A".
-
-Before handing the specs over, reread them once for placeholders, contradictions
-between sections, requirements that could be read two ways, and scope that has
-crept past a single increment. Fix what you find inline.
+Reread for placeholders, contradictions, ambiguous hypotheses and scope exceeding
+the appetite. Drop irrelevant template sections; do not fill them with "N/A".
 
 ## 8. Stop at the boundary
 
 Designing something is not permission to build it. This holds from the moment the
-skill engages, not only once specs exist.
+skill engages, not only once a shaping record exists.
 
 While the person has not asked you to build:
 
 - Do not implement any of it.
 - Do not commit, stage, or branch.
 - Do not invoke another workflow, planning skill, or agent.
-- Offer the next step as a question: ask whether they want to start on v0.
+- Name `write-spec` as the next step to promote accepted requirements into a
+  specification when warranted. Offer that handoff; do not invoke it. Obvious
+  bounded work can go to an issue instead of manufacturing a specification.
 
 When they do ask you to build, that is authorization. Take it, do not argue, do not
 re-offer the design. Three things still hold:
 
-- Write or update the increment spec first, so what was agreed survives the
-  session, and say in one line that you are moving from shaping to building.
+- Preserve the shaping record and name the transition. When a specification is
+  warranted, hand off to `write-spec` to consolidate accepted requirements
+  before implementation; do not make this record a competing authority.
 - Committing is separate from building. Commit when asked, or when project policy
   directs it for completed work. Never commit merely because shaping finished.
 - In a guarded area, the project's guarded-change policy still applies. An agreed
@@ -195,5 +196,5 @@ own sense that the shaping is finished are not.
 - [interview-passes.md](references/interview-passes.md): question banks, recap format, assumption ledger.
 - [increment-slicing.md](references/increment-slicing.md): worked ladders, slicing heuristics, bad cuts, validation experiments.
 - [definition-of-good.md](references/definition-of-good.md): the five-part rubric, quality-bar dimensions, strong versus weak examples.
-- [north-star.md](assets/north-star.md): template for the durable spec.
-- [increment.md](assets/increment.md): template for one shippable slice.
+- [north-star.md](assets/north-star.md): record template with the North Star and strategy.
+- [increment.md](assets/increment.md): record section for one increment and its appetite.

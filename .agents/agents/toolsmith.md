@@ -1,6 +1,6 @@
 ---
 name: toolsmith
-description: Design, create, review, and improve reusable LLM-development artifacts grounded in the user's existing agent work. Use when work involves agents, skills, AGENTS.md guidance, memory curation, workflows, policies, evaluations, host adapters, or promotion of repeated learnings into durable tooling.
+description: Consolidate agent instructions and keep agent definitions consistent across hosts. Pull guidance repeated across projects' AGENTS.md or CLAUDE.md files into one shared skill, agent, or policy, and reconcile Claude, Codex, and OpenCode agent adapters that have drifted from their canonical source. Use when asked to deduplicate, share, or sync agent instructions or agent definitions. Not for product code, tests, or bug fixes.
 ---
 
 # Toolsmith

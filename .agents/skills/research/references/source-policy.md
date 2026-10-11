@@ -102,6 +102,18 @@ coexist), NIST SSDF, and CIS Benchmarks.
 
 **Never report a draft as "the latest" without naming it a draft.**
 
+Beware a platform's own labels. A releases page may mark a rolling preview as
+"latest" while the project's text says the previous stable release is still
+normative. The project's word wins over the platform's badge.
+
+Worked example: "What is the latest OWASP guidance on authentication?"
+
+- **Wrong:** name a Top 10 edition from memory and summarise it.
+- **Right:** OWASP is not one versioned artifact. Resolve which project governs
+  the question, retrieve *that* project's current release and its status, and
+  report its version rather than an "OWASP version" that does not exist. Report
+  any newer draft separately.
+
 ### Cloud and infrastructure
 
 Prefer vendor release notes and change feeds over articles. AWS, Azure, and
@@ -135,6 +147,37 @@ current syntax to an older release or the reverse.
 For "when did this change" or "is this fixed in version N", go to the repository.
 Releases, changelogs, merge commits, and issues answer that precisely; articles
 do not.
+
+### Misbehaving software
+
+When the question is "why is this software misbehaving", search for an existing
+diagnosis first. Check the project's issue tracker and the web *before*
+investigating, not after testing several hypotheses. Measuring your way to a
+conclusion someone already published is competent and wasted. A closed issue is
+still a finding: "closed as not planned" means known, unfixed upstream, and to
+be designed around.
+
+## When a fetch is not a read
+
+A fetch that returned bytes has not necessarily returned the source. Treat each
+of these as `unretrievable`, never as evidence:
+
+- A bot challenge or interstitial ("checking your browser", "attention
+  required"), which often arrives with a success status.
+- A login wall, paywall, or cookie gate standing in for the content.
+- A JavaScript shell whose body is empty until a script runs.
+- A body that is empty or visibly truncated before the part you need.
+- A search engine's snippet or summary returned in place of the page.
+
+Before recording it as `unretrievable`, try **one** other canonical route to the
+same artifact: the raw file in the repository, the repository or vendor API,
+the release record, or a PDF or plain-text rendition the project publishes. Do
+not substitute an archived snapshot as evidence of what is current: an archive
+proves what a page once said, not what it says now.
+
+An empty search is a different case. It shows only that these queries on these
+surfaces returned nothing. Say which queries and surfaces, rather than claiming
+nothing exists.
 
 ## Following through
 
