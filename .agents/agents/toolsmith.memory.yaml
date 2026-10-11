@@ -1,5 +1,5 @@
 enabled: true
-scope: user
+scope: project
 promotion: review
 categories:
   - artifact-patterns

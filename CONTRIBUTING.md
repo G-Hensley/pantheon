@@ -39,6 +39,9 @@ pnpm install
 ./dev.sh         # Linux
 ```
 
+Agent contributors: see the [Lexicon lifecycle setup](docs/guides/lexicon-lifecycle.md)
+for the repository's skills, schemas, and local host rendering.
+
 ## Building
 
 Run `.\build.cmd` on Windows or `./build.sh` on Linux. Artifacts land in

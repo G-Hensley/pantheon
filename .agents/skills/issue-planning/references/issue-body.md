@@ -2,32 +2,10 @@
 
 ## The body shape
 
-```markdown
-## Specification
-
-SPEC-0012
-
-## Requirements
-
-- FR-002
-- FR-004
-
-## Design
-
-docs/specs/0012-authentication/design.md
-
-## Acceptance Criteria
-
-Observable conditions that must hold before this closes.
-
-## Verification
-
-How they were shown to hold: the command, the test, the output.
-```
-
-`Design` is omitted where the specification has none. `Verification` is filled in as the work
-finishes rather than at filing time, and an empty heading is better than no heading, because it is
-the section most often skipped once the code works.
+The receiving repository's contract decides the sections. Where it has one, write that
+([repository-contract.md](repository-contract.md)); where it states none, use the five-section body
+in [contractless-body.md](contractless-body.md). The finished condition below applies to either, as
+`Done when` in a repository's contract or `Acceptance Criteria` in the fallback.
 
 ## The finished condition
 

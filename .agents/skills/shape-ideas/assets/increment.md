@@ -1,45 +1,36 @@
-# <vN>: <short name>
+### <Increment name>
 
-One shippable, independently valuable slice. If this shipped and nothing followed
-it, someone is better off.
+A section of the shaping record, not a separate specification. For Direct Build,
+this is the only increment; do not invent later rungs.
 
-## Outcome
+**Appetite:** <number> agent sessions, optional <$amount> cost ceiling.
+**Strategy:** <the record's strategy>; <why this cut serves it>.
+**Fit:** <how the bounded work fits; if it does not, name the smaller-cut decision
+still needed, preserving required behavior until the owner agrees a change>.
 
-One sentence. What someone can do after this ships that they could not do before,
-in their language rather than the system's.
+#### Outcome hypothesis
 
-## Scope
+What someone gains if only this increment lands. For an experiment, state the
+question answered and the decision it enables, not a fictional shipped feature.
 
-What this increment includes, at the level of user-visible behavior. Enough for
-someone to build it without reopening the design conversation.
+#### Scope and exclusions
 
-## Out of scope
+The outcome included, and what a reasonable person might expect but will not get.
+Later candidates stay hypotheses rather than accepted requirements.
 
-What this deliberately does not do, so it can ship. Name the things a reasonable
-person would expect and will not get here, so nobody has to guess whether they were
-forgotten or excluded.
+#### Definition of good (hypothesis)
 
-## Definition of good
+These five parts become acceptance criteria only when `write-spec` promotes
+them; this record does not assert requirements or completed verification.
 
-**Evidence:** the specific observation that proves the outcome is real, observable
-by someone other than the author. A demo path, named tests, or a metric with a
-threshold.
+- **Outcome:** <the concrete benefit or decision-relevant knowledge>.
+- **Evidence:** <reproducible observation, named fixtures or measurement; for an
+  experiment include the threshold and what either result changes>.
+- **Quality bar:** <only relevant dimensions, each with a specific threshold>.
+- **Out of scope:** <explicit exclusions, consistent with the scope above>.
+- **Reversibility:** <rollback or disposal path, migration cost, one-way doors>.
 
-**Quality bar:** only the dimensions that genuinely apply, each with a threshold.
-Two or three real ones beat seven generic ones.
+#### Dependencies and assumptions
 
-- <dimension>: <threshold>
-- <dimension>: <threshold>
-
-**Reversibility:** how to back this out, the migration cost if any, and whether it
-opens a one-way door.
-
-## Dependencies
-
-What must exist before this starts, and what is deliberately stubbed, flagged, or
-done manually for now.
-
-## Notes
-
-Design decisions specific to this slice, and anything learned while building it
-that should reshape the increments after it.
+What must exist, which assumptions could invalidate the cut, and what remains
+manual or deferred. Flag any proposed scope reduction awaiting agreement.
