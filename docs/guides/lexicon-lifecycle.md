@@ -101,3 +101,14 @@ Known upstream limitation: the PR-feedback helper's viewer lookup can fail with
 the worker App's authentication ([Lexicon #260](https://github.com/G-Hensley/lexicon/issues/260)).
 Use the skill's manual fallback with the same worker identity when affected;
 installing this catalog does not resolve that upstream issue.
+
+Archify's bundled preview also uses a synchronous browser launcher, which can
+briefly block its HTTP/SSE loop while the opener runs. Use `preview --no-open`
+with the usual diagram arguments and open the printed URL manually when this
+matters. [Lexicon #282](https://github.com/G-Hensley/lexicon/issues/282) tracks the
+catalog follow-up; this proposal keeps the pinned renderer unchanged.
+
+`pnpm test:skills` checks the installed opener's URL rejection and process-result
+handling without launching a browser. It runs in frontend CI and as part of
+`pnpm test`. These consumer checks live outside `.agents/`, so catalog updates
+preserve them. They do not replace Archify's complete upstream preview suite.

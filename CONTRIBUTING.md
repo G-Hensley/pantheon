@@ -62,8 +62,11 @@ exercised manually with `dev.cmd` or `dev.sh` and checked with:
 
 ```bash
 pnpm build   # runs `tsc` in strict mode, then the Vite build
-pnpm test    # Vitest
+pnpm test    # Vitest and installed-skill regression checks
 ```
+
+Run `pnpm test:skills` for the installed-skill checks alone. These checks use
+injected process launchers; they do not open a browser or start the app.
 
 ## Branching and commits
 
