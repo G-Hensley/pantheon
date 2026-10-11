@@ -123,8 +123,8 @@ Rules:
   wrong, say so, because that is worth the person's attention.
 - Promote a load-bearing assumption to an actual question when its answer would
   change the increment boundaries.
-- Move each entry into the north-star spec when the design is approved. Untracked
-  assumptions are how specs quietly become wrong.
+- Move each entry into the shaping record when the design is approved. Untracked
+  assumptions are how a direction quietly becomes wrong.
 
 ```markdown
 | Assumption | Load-bearing | If wrong |
@@ -144,3 +144,16 @@ Rules:
 | Asking what does not change the design | Produces detail nobody uses | Drop it |
 | Asking for a decision with no options | Offloads your job onto them | Bring two to four options and a recommendation |
 | Interviewing past the point of value | The design stops improving and the person disengages | Present a concrete draft and let them react |
+
+## Question discipline
+
+- Ask the question whose answer most changes the design. If an answer would not
+  change the design, the boundaries, or the definition of good, do not ask it.
+- **Assume, do not interrogate.** Anything you can reasonably infer becomes a
+  stated assumption the person corrects, not a question they answer. Keep a running
+  assumption ledger and show it at each recap. Correcting is far cheaper than
+  answering.
+- Batch independent questions, up to three or four at a time. Ask serially only
+  when the answer genuinely determines the next question.
+- Stop when no unknown would change the design. Past roughly six questions in a
+  pass, present a best-effort design with assumptions flagged instead.

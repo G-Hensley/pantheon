@@ -34,8 +34,14 @@ Create only the resource directories the skill actually needs.
 |---|---:|---|
 | `name` | Yes | Lowercase letters, digits, and hyphens; max 64 characters; matches the parent folder |
 | `description` | Yes | States capability and triggering conditions; max 1024 characters |
+| `license` | No | String |
+| `compatibility` | No | String, max 500 characters; environment requirements |
+| `metadata` | No | Map of string keys to string values, for your own tooling |
+| `allowed-tools` | No | String or list. Experimental, and not a permission boundary |
 
-For the portable core, do not add other top-level fields. Unknown fields may be ignored, rejected, or interpreted differently across hosts.
+Those six are the whole set. A field outside them is rejected rather than ignored: packaging and upload fail with an error naming it, so an invented field is a distribution failure and not a harmless extra.
+
+Being in the set is not the same as being acted on. `name` and `description` are read by every host. The other four survive packaging, and whether a host does anything with them varies, so never rely on `allowed-tools` to restrict what a skill can do. State the restriction in the body and enforce it in a host adapter.
 
 ## Host adapters
 
