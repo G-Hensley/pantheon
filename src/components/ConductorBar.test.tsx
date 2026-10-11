@@ -119,3 +119,34 @@ describe("<ConductorBar> dispatch budget", () => {
     expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
   });
 });
+
+describe("<ConductorBar> fleet attention", () => {
+  const pending: ConductorTask = { id: "task-1", from: "sess-1", target: "sess-2",
+    task: "Inspect parser", status: "pending", result: "", ts_ms: 0, done_ms: null,
+    reviewer: "sess-3", findings: "", exchanges: [] };
+
+  it.each([
+    ["pending work", pending, false],
+    ["ordinary review", { ...pending, status: "in_review" }, false],
+    ["interrupted review", { ...pending, status: "in_review", recovery_reason: "App restarted" }, true],
+    ["unavailable reviewer", { ...pending, status: "in_review", reviewer_gone: true }, true],
+  ])("shows attention only when needed for %s", (_name, task, attention) => {
+    const props = baseProps({ tasks: [task] });
+    render(<ConductorBar {...props} />);
+    const button = screen.getByRole("button", { name: "Tasks · 1" });
+    if (attention) expect(button).toHaveClass("attention");
+    else expect(button).not.toHaveClass("attention");
+    fireEvent.click(button);
+    expect(props.onOpenTasks).toHaveBeenCalledOnce();
+  });
+
+  it("clears quiet attention on fresh activity without changing the task", () => {
+    const activity = { task_id: pending.id, actor: pending.target, state: "quiet", quiet_ms: 300000, waiting_on: null };
+    const props = baseProps({ tasks: [pending] });
+    const { rerender } = render(<ConductorBar {...props} activity={[activity]} />);
+    expect(screen.getByRole("button", { name: "Tasks · 1" })).toHaveClass("attention");
+    rerender(<ConductorBar {...props} activity={[{ ...activity, state: "pending", quiet_ms: 0 }]} />);
+    expect(screen.getByRole("button", { name: "Tasks · 1" })).not.toHaveClass("attention");
+    expect(pending.status).toBe("pending");
+  });
+});

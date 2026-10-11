@@ -180,6 +180,7 @@ function App() {
   const [persistenceFrozen, setPersistenceFrozen] = useState(false);
   // Which pane (if any) is the conductor. Owned by the app, never self-claimed.
   const [conductor, setConductorName] = useState<string | null>(null);
+  const [taskActivity, setTaskActivity] = useState<import("./lib/ipc").TaskActivity[]>([]);
   const [conductorTasks, setConductorTasks] = useState<import("./lib/ipc").ConductorTask[]>([]);
   const [conductorHalted, setConductorHalted] = useState(false);
   // budget stays null until the first successful conductor_state read, and
@@ -354,6 +355,7 @@ function App() {
         if (alive) {
           setConductorName(s.conductor);
           setConductorTasks(s.tasks);
+          setTaskActivity(s.activity ?? []);
           setConductorHalted(s.halted);
           dispatchBudget.applySnapshot(s.dispatch_budget, budgetTicket);
         }
@@ -822,6 +824,7 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
         <ConductorBar
           conductor={conductor}
           tasks={conductorTasks}
+          activity={taskActivity}
           halted={conductorHalted}
           onDemote={() => toggleConductor(conductor)}
           onHaltChange={haltConductor}
@@ -1007,6 +1010,9 @@ const colorMap = useMemo(() => brainColorMap(brainList), [brainList]);
       {tasksOpen && (
         <TaskDrawer
           tasks={conductorTasks}
+          activity={taskActivity}
+          requests={sessionRequests.list.requests}
+          onOpenRequests={() => { setTasksOpen(false); setSessionRequestsOpen(true); }}
           panes={panes}
           onClose={() => setTasksOpen(false)}
           onFocusPane={(id) => {

@@ -321,8 +321,21 @@ exchange is kept on the task, so an answer given once is not asked again.
   whose *process* has exited is now handled: its open tasks reach a terminal
   `abandoned` status and `list_sessions` marks it `DEAD`, so nothing waits on
   work nobody is doing. A pane that is alive but has quietly stopped answering
-  is still indistinguishable from one that is thinking hard, and deliberately
-  so: silence is not evidence, and guessing would discard real work.
+  can now be flagged after five minutes without observed output or MCP activity,
+  with its task and quiet duration in the roster, wait response and task drawer.
+  The task stays open: silence cannot distinguish thinking, a native CLI approval
+  prompt, or forgotten completion. Pantheon does not type automatic reminders
+  into that unknown terminal state.
+- **Restarted panes do not inherit old task assignments.** First loading a
+  project's journal retires prior pane tasks, including queued briefs, with an
+  interruption reason. Results remain available. Submitted pane reviews remain
+  open but require explicit reviewer reassignment before resuming; old notices
+  are not replayed into a fresh process merely because its pane ID matches.
+- **Known waits are visible; native CLI approval waits remain unknown.** The task
+  drawer shows queued work, the conductor responsible for a question, the reviewer
+  responsible for a submission, and pending Pantheon session approvals. Review
+  feedback is delivered in full when it fits; longer feedback explicitly directs
+  the worker to the complete findings through `get_task_result`.
 - **Dirty worktree recovery is manual.** Closing a session refuses to remove
   its dirty worktree, preserving uncommitted edits on disk, but the UI does
   not yet show the preserved path or offer a recovery workflow.

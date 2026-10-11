@@ -1,3 +1,4 @@
+mod fleet;
 // Pantheon — multi-session PTY engine.
 //
 // Each live agent runs on its own pseudo-terminal (ConPTY). Sessions are keyed
@@ -508,6 +509,10 @@ pub struct SessionManager {
     /// prove the ordering of a code path that does not exist.
     #[cfg(test)]
     pub(crate) test_live_panes: Mutex<std::collections::HashSet<String>>,
+    // Per-engine observation seam: exercise long quiet periods without sleeping
+    // or changing the global monotonic clock used by concurrent tests.
+    #[cfg(test)]
+    pub(crate) test_output_ages: Mutex<HashMap<String, u64>>,
 }
 
 fn report_worktree_cleanup(worktree: &worktree::Worktree) {
@@ -763,6 +768,10 @@ impl SessionManager {
     /// for every session, and the startup admission check for a
     /// request-created interactive pane needs exactly this number.
     pub(crate) fn output_age_ms(&self, id: &str) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(age) = self.test_output_ages.lock().unwrap().get(id).copied() {
+            return Some(age);
+        }
         self.sessions
             .lock()
             .unwrap()
@@ -2201,15 +2210,19 @@ struct ConductorState {
     conductor: Option<String>,
     halted: bool,
     tasks: Vec<mcp::Task>,
+    activity: Vec<fleet::TaskActivity>,
     dispatch_budget: mcp::DispatchBudget,
 }
 
 #[tauri::command]
 fn conductor_state(shared: State<'_, Arc<mcp::Shared>>) -> ConductorState {
+    let tasks = shared.observed_tasks_snapshot();
+    let activity = shared.task_activity_snapshot(&tasks);
     ConductorState {
         conductor: shared.conductor(),
         halted: shared.is_halted(),
-        tasks: shared.tasks_snapshot(),
+        tasks,
+        activity,
         dispatch_budget: shared.dispatch_budget(),
     }
 }

@@ -148,7 +148,17 @@ export type TaskUsage = {
   duration_api_ms: number | null;
 };
 
+export type TaskActivity = {
+  task_id: string;
+  actor: string;
+  state: string;
+  quiet_ms: number | null;
+  waiting_on: string | null;
+};
+
 export type ConductorTask = {
+  recovery_reason?: string;
+  reviewer_gone?: boolean;
   mode?: "pane" | "headless";
   exit_code?: number | null;
   cli_session?: string;
@@ -198,6 +208,7 @@ export type ConductorState = {
   conductor: string | null;
   halted: boolean;
   tasks: ConductorTask[];
+  activity?: TaskActivity[];
   dispatch_budget: DispatchBudget;
 };
 

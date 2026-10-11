@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { TaskDrawer } from "./TaskDrawer";
 import { type ConductorTask, type SessionType } from "../lib/ipc";
 
@@ -35,6 +35,79 @@ function makePane(id: string) {
 }
 
 describe("<TaskDrawer>", () => {
+  it("retains queued work in the open section", () => {
+    const task = makeTask({ status: "queued", task: "Run after the parser task" });
+    render(<TaskDrawer tasks={[task]} panes={[]} onClose={() => {}} onFocusPane={() => {}} />);
+    expect(screen.getByText("Run after the parser task")).toBeInTheDocument();
+    expect(screen.getByText("Queued")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing open.")).not.toBeInTheDocument();
+  });
+
+  it("opens a different-CLI reviewer without relabelling the worker", () => {
+    const task = makeTask({ target: "worker", reviewer: "reviewer", status: "in_review" });
+    const reviewer = { id: "reviewer", type: { ...CLAUDE, id: "codex", label: "Codex" }, status: "running" };
+    const onFocusPane = vi.fn();
+    const { rerender } = render(<TaskDrawer tasks={[task]} panes={[makePane("worker"), reviewer]}
+      onClose={() => {}} onFocusPane={onFocusPane} />);
+    const row = screen.getByTitle("Focus Codex reviewer");
+    expect(row.querySelector(".taskitem-agent")).toHaveTextContent("Claude Code");
+    expect(row.querySelector(".taskitem-target")).toHaveTextContent("worker");
+    fireEvent.click(row);
+    expect(onFocusPane).toHaveBeenCalledWith("reviewer");
+    rerender(<TaskDrawer tasks={[task]} panes={[reviewer]} onClose={() => {}} onFocusPane={onFocusPane} />);
+    expect(screen.getByTitle("Focus Codex reviewer")).toBeEnabled();
+    expect(screen.getByText("worker pane closed")).toBeInTheDocument();
+  });
+
+  it("shows interrupted results and routes a suspended review to its conductor", () => {
+    const task = makeTask({ status: "in_review", from: "conductor", reviewer: "reviewer",
+      recovery_reason: "App restarted. Reassign review.", result: "Preserved implementation report" });
+    const onFocusPane = vi.fn();
+    render(<TaskDrawer tasks={[task]} panes={[makePane("conductor")]}
+      onClose={() => {}} onFocusPane={onFocusPane} />);
+    expect(screen.getByText("App restarted. Reassign review.")).toBeInTheDocument();
+    expect(screen.getByText("Preserved implementation report")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Focus Claude Code conductor"));
+    expect(onFocusPane).toHaveBeenCalledWith("conductor");
+  });
+
+  it("shows quiet activity on the matching task row and clears it on fresh activity", () => {
+    const task = makeTask({ target: "worker" });
+    const other = makeTask({ target: "other" });
+    const props = { tasks: [task, other], panes: [makePane("worker"), makePane("other")],
+      onClose: () => {}, onFocusPane: vi.fn() };
+    const activity = { task_id: task.id, actor: "worker", state: "quiet", quiet_ms: 360000, waiting_on: null };
+    const { rerender } = render(<TaskDrawer {...props} activity={[activity]} />);
+    const notice = "No observed activity for 6m; task still open";
+    const row = screen.getByTitle("Focus Claude Code worker");
+    expect(within(row).getByText(notice)).toBeInTheDocument();
+    expect(screen.getByTitle("Focus Claude Code other")).not.toHaveTextContent(notice);
+    fireEvent.click(row);
+    expect(props.onFocusPane).toHaveBeenCalledWith("worker");
+    rerender(<TaskDrawer {...props} activity={[{ ...activity, state: "pending", quiet_ms: 0 }]} />);
+    expect(screen.getByTitle("Focus Claude Code worker")).not.toHaveTextContent(notice);
+    expect(task.status).toBe("pending");
+  });
+
+  it("shows reviewer unavailability unless a restart reason explains the interruption", () => {
+    const task = makeTask({ status: "in_review", reviewer: "reviewer", reviewer_gone: true });
+    const props = { panes: [], onClose: () => {}, onFocusPane: () => {} };
+    const { rerender } = render(<TaskDrawer {...props} tasks={[task]} />);
+    const notice = "Reviewer unavailable; reassignment needed.";
+    expect(screen.getByText(notice)).toBeInTheDocument();
+    rerender(<TaskDrawer {...props} tasks={[{ ...task, recovery_reason: "App restarted. Reassign review." }]} />);
+    expect(screen.queryByText(notice)).not.toBeInTheDocument();
+    expect(screen.getByText("App restarted. Reassign review.")).toBeInTheDocument();
+  });
+
+  it("shows retained work after abandonment", () => {
+    const task = makeTask({ status: "abandoned", result: "Work committed before interruption",
+      recovery_reason: "App restarted. Inspect work before redispatch." });
+    render(<TaskDrawer tasks={[task]} panes={[]} onClose={() => {}} onFocusPane={() => {}} />);
+    expect(screen.getByText(task.result)).toBeInTheDocument();
+    expect(screen.getByText(task.recovery_reason!)).toBeInTheDocument();
+  });
+
   it("shows headless mode and a zero exit code", () => {
     const task = makeTask({ mode: "headless", status: "done", exit_code: 0 });
     render(<TaskDrawer tasks={[task]} panes={[]} onClose={() => {}} onFocusPane={() => {}} />);
@@ -103,14 +176,14 @@ describe("<TaskDrawer>", () => {
     render(
       <TaskDrawer
         tasks={[pending, blocked]}
-        panes={[makePane("sess-b"), makePane("sess-p")]}
+        panes={[makePane("conductor"), makePane("sess-b"), makePane("sess-p")]}
         onClose={() => {}}
         onFocusPane={() => {}}
       />,
     );
     const focusButtons = screen.getAllByTitle(/^Focus Claude Code/);
-    expect(focusButtons[0]).toHaveAttribute("title", "Focus Claude Code sess-b");
-    expect(screen.getByText(/Which schema\?/)).toBeInTheDocument();
+    expect(focusButtons[0]).toHaveAttribute("title", "Focus Claude Code conductor");
+    expect(screen.getByText("Waiting for conductor to answer: Which schema?")).toBeInTheDocument();
   });
 
   it("bounds the Recent section and says how many finished tasks are hidden", () => {
