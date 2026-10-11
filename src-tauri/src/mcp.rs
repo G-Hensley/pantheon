@@ -1965,7 +1965,13 @@ impl Shared {
         // the cheapest honest signal available here.
         let tasks = self.tasks_snapshot();
         let (open_for, in_review_for) = attribute_open_tasks(&tasks, now);
-        let activity = self.task_activity_snapshot(&tasks);
+        let mut observations_by_actor: HashMap<String, Vec<String>> = HashMap::new();
+        for activity in self.task_activity_snapshot(&tasks) {
+            observations_by_actor
+                .entry(activity.actor.clone())
+                .or_default()
+                .push(crate::fleet::describe(&activity));
+        }
         // Held sessions, not live ones: a pane whose process has died is still
         // worth a line, marked dead, because a conductor that simply stops
         // seeing it cannot tell a pane that died from one that was never there,
@@ -2028,8 +2034,8 @@ impl Shared {
                     )
                 };
                 let headless = if tasks.iter().any(|t| t.target == *id && t.mode == "headless" && is_open(&t.status)) { " [headless]" } else { "" };
-                let observations = activity.iter().filter(|a| &a.actor == id)
-                    .map(crate::fleet::describe).collect::<Vec<_>>().join("; ");
+                let observations = observations_by_actor.get(id)
+                    .map(|entries| entries.join("; ")).unwrap_or_default();
                 let observations = if observations.is_empty() { String::new() }
                     else { format!(" [{observations}]") };
                 format!(
@@ -11545,7 +11551,9 @@ mod tests {
         let mut task = task_at("review", "in_review", 10);
         task.reviewer = "sess-3".into();
         task.recovery_reason = "App restarted".into();
-        shared.tasks.lock().unwrap().push(task);
+        let mut another = task.clone();
+        another.id = "another-review".into();
+        shared.tasks.lock().unwrap().extend([task, another]);
         let lines = shared.roster_lines();
         assert_eq!(lines.len(), 2);
         let reviewer = lines
@@ -11561,7 +11569,14 @@ mod tests {
                 .contains("task review: assignment interrupted; explicit reassignment required"),
             "{reviewer}"
         );
+        assert!(
+            reviewer.contains(
+                "task another-review: assignment interrupted; explicit reassignment required"
+            ),
+            "{reviewer}"
+        );
         assert!(!worker.contains("task review"), "{worker}");
+        assert!(!worker.contains("task another-review"), "{worker}");
         shared.tasks.lock().unwrap().clear();
         assert!(shared
             .roster_lines()

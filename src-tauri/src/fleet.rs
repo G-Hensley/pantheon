@@ -195,9 +195,20 @@ mod tests {
             observe(&t, Some(900_000), None, 900_100).state,
             "interrupted"
         );
+        assert_eq!(
+            describe(&observe(&t, Some(900_000), None, 900_100)),
+            "task task-1: assignment interrupted; explicit reassignment required"
+        );
         t.recovery_reason.clear();
         t.status = "pending".into();
         t.mode = "headless".into();
         assert_eq!(observe(&t, Some(900_000), None, 900_100).state, "headless");
+        for (status, actor) in [("rework", "worker"), ("in_review", "reviewer")] {
+            t.status = status.into();
+            let observation = observe(&t, Some(900_000), None, 900_100);
+            assert_eq!(observation.state, "quiet");
+            assert_eq!(observation.actor, actor);
+            assert_eq!(observation.quiet_ms, Some(900_000));
+        }
     }
 }

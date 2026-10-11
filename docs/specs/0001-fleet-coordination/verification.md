@@ -22,7 +22,7 @@ The running Pantheon application, its panes and journal were not used for verifi
 
 ## Local checks
 
-- Rust tests: 467 unit tests and 2 integration tests passed; 1 measurement harness ignored.
+- Rust tests: 468 unit tests and 2 integration tests passed; 1 measurement harness ignored.
 - Frontend tests: 221 tests in 18 files passed.
 - `pnpm build`, Rust formatting, Clippy with warnings denied, and `git diff --check` passed.
 - `cargo audit` exited successfully with 9 dependency warnings, including unmaintained and unsoundness advisories and a yanked dependency.
@@ -91,3 +91,11 @@ CI for `caad646` passed frontend, Windows, CodeQL and secret scanning. Linux rep
 A failed-job rerun was denied to the worker App. This evidence does not establish
 the cause or make that CI run successful; the subsequent review-fix commit needs
 its own CI results.
+
+
+CI for `2600733` subsequently passed on Linux and Windows, including frontend,
+CodeQL and secret scanning. Three further review comments were addressed by
+indexing roster observations by actor, checking multiple observations survive
+that grouping, and extending headless review/rework and interrupted-message
+assertions. GPT-6 Astra approved the delta. The full local Rust suite passed
+468 unit tests and 2 integration tests, and Clippy passed again.
