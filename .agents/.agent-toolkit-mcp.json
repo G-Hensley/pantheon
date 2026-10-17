@@ -28,6 +28,37 @@
       "server": "github",
       "target": "C:/Users/Gavin Hensley/Projects/applications/pantheon/.mcp.json"
     },
+    "codex|project|.codex/config.toml|agent-memory-toolsmith": {
+      "entry": {
+        "args": [
+          "--agent",
+          "toolsmith"
+        ],
+        "command": "lexicon-memory-mcp",
+        "enabled": true,
+        "enabled_tools": [
+          "memory_search",
+          "memory_read",
+          "memory_append"
+        ],
+        "tools": {
+          "memory_append": {
+            "approval_mode": "approve"
+          },
+          "memory_read": {
+            "approval_mode": "approve"
+          },
+          "memory_search": {
+            "approval_mode": "approve"
+          }
+        }
+      },
+      "hash": "eba8c844c1074e3fb8b1a017fa0af3722c7709648c492bff59df5f0c09c9b2dc",
+      "host": "codex",
+      "scope": "project",
+      "server": "agent-memory-toolsmith",
+      "target": "/home/gavin/Projects/applications/pantheon/.codex/config.toml"
+    },
     "codex|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml|context7": {
       "entry": {
         "bearer_token_env_var": "CONTEXT7_API_KEY",
