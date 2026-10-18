@@ -106,7 +106,7 @@ the shared skill. Skills are portable; their internal links must be too.
 
 ### Bloated SKILL.md
 
-Keep SKILL.md at or under **200 lines**, enforced by `agent-toolkit validate`. Split sooner when detail can be loaded selectively:
+Keep SKILL.md at or under **200 lines**, enforced by `lexicon validate`. Split sooner when detail can be loaded selectively:
 
 - Heavy reference material (>100 lines) → its own file
 - Reusable templates / scripts → its own file
@@ -114,9 +114,11 @@ Keep SKILL.md at or under **200 lines**, enforced by `agent-toolkit validate`. S
 
 The SKILL.md itself stays a process or dispatcher. References hold the depth.
 
-### Nonportable Freshness Metadata
+### Invented Top-Level Fields
 
-Skills decay, but arbitrary top-level fields are not portable. Track verification dates in repository metadata, release automation, or a host-specific adapter instead of adding `last_verified` to a shared `SKILL.md`.
+Skills decay, and the instinct is to add `last_verified` to the frontmatter. A field outside the format's six is rejected rather than ignored, so the invented field is a packaging failure rather than a harmless note.
+
+The format's `metadata` map is the sanctioned home for data that must travel with the skill. Prefer repository metadata, release automation, or a host adapter when the fact is about the repository rather than about the skill, which a verification date usually is.
 
 ### Missing Reference Files Section
 
@@ -157,4 +159,4 @@ Edits to discipline skills can introduce loopholes the original test surfaced. R
 - `./description-discipline.md` — description-specific anti-patterns in depth
 - `./testing-skills.md` — how to catch these failure modes before deploying
 - `./bulletproofing-discipline-skills.md` — discipline-skill-specific anti-patterns and counters
-- `./skill-template.md` — frontmatter table, three template variants
+- `./skill-template.md` — the portable template, the six-field frontmatter table, and the host-adapter boundary

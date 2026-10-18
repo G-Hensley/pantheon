@@ -9,12 +9,12 @@
 // `src-tauri/src/mcp.rs` sets it explicitly, through `ask_conductor` /
 // `answer_question`. This module must never grow a timing- or output-based
 // signal of its own; it only reads `status`.
-import { type ConductorTask, type Exchange } from "./ipc";
+import { type ConductorTask, type Exchange, type TaskActivity } from "./ipc";
 
 // Mirrors `is_open` at src-tauri/src/mcp.rs:1454-1466, minus "in_review",
 // which gets its own group below (BACKLOG.md: "grouped into open, awaiting
 // review, and terminal work").
-export const OPEN_STATUSES = ["blocked", "rework", "overdue", "pending"] as const;
+export const OPEN_STATUSES = ["blocked", "rework", "overdue", "pending", "queued"] as const;
 export const REVIEW_STATUS = "in_review";
 // Mirrors `is_terminal` at src-tauri/src/mcp.rs:224-232.
 export const TERMINAL_STATUSES = ["done", "error", "cancelled", "abandoned"] as const;
@@ -71,6 +71,7 @@ export function groupTasks(tasks: ConductorTask[]): TaskGroups {
 // Shared wording so the drawer (and anything built on top of it later) agree
 // on what each status is called.
 export const STATUS_LABEL: Record<string, string> = {
+  queued: "Queued",
   pending: "Pending",
   overdue: "Overdue",
   rework: "Rework",
@@ -94,4 +95,28 @@ export function openQuestion(task: ConductorTask): Exchange | undefined {
     if (task.exchanges[i].answer === "") return task.exchanges[i];
   }
   return undefined;
+}
+
+// The actor doing the work differs from the pane responsible for the next
+// decision. A blocked worker waits for its dispatcher; review belongs to the
+// reviewer, even when the implementing pane has closed.
+export function taskActor(task: ConductorTask): string {
+  return task.status === "in_review" ? task.reviewer : task.target;
+}
+
+export function taskActionPane(task: ConductorTask): string {
+  if (task.status === "blocked" || (task.status === "in_review" && task.recovery_reason)) return task.from;
+  return taskActor(task);
+}
+
+export function activityLabel(activity: TaskActivity): string {
+  if (activity.state === "quiet") {
+    const minutes = Math.floor((activity.quiet_ms ?? 0) / 60000);
+    return `No observed activity for ${minutes}m; task still open`;
+  }
+  if (activity.state === "waiting_on_conductor") return `Waiting for ${activity.waiting_on ?? "conductor"} to answer`;
+  if (activity.state === "interrupted") return "Assignment interrupted; reassignment required";
+  if (activity.state === "reviewer_unavailable") return "Reviewer unavailable";
+  if (activity.state === "headless") return "Headless task open";
+  return statusLabel(activity.state);
 }

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/G-Hensley/lexicon/policy-library/schemas/research/schema.json",
+  "title": "Research frontmatter",
+  "description": "Frontmatter for a research document under a specification directory. Research is a child of the specification it sits under: it carries `spec` naming its parent and has no `id` and no `status` of its own, because its lifecycle is its parent's.",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable title."
+    },
+    "type": {
+      "const": "research",
+      "description": "Document category, from the standard's closed set."
+    },
+    "spec": {
+      "$ref": "#/$defs/identifier",
+      "description": "The parent specification's identifier. A child's identity is this plus its filename, written SPEC-0004/design where a cross-reference needs one."
+    },
+    "created": {
+      "$ref": "#/$defs/date",
+      "description": "Date the document was created."
+    },
+    "updated": {
+      "$ref": "#/$defs/date",
+      "description": "Optional. Git already knows when the file changed; set this only where the document's own sense of currency differs from its last commit."
+    },
+    "reviewed": {
+      "$ref": "#/$defs/date",
+      "description": "Date a person or agent deliberately checked the document against reality and found it still true. Set it only where a review cadence has been declared."
+    },
+    "owners": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/person"
+      },
+      "description": "Who is answerable for the content. The first entry is the one answerable."
+    },
+    "related": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relatedEntry"
+      },
+      "description": "Declared relationships. Optional, so an absent relation proves nothing."
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/target"
+      },
+      "description": "Documents this one depends on. A separate field from `related`, not a relation within it."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      }
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Canonical location, for a document that gets copied out of the repository."
+    },
+    "discussion": {
+      "type": "string",
+      "format": "uri",
+      "description": "Where the argument happened: the pull request, issue or thread. Carried on the types that are argued before they are settled."
+    }
+  },
+  "required": [
+    "title",
+    "type",
+    "spec",
+    "created"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$",
+      "description": "A document identifier such as SPEC-0012, ADR-0017 or ARCH-SECURITY."
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "A date as YYYY-MM-DD."
+    },
+    "person": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "description": "A reference resolvable from outside this document: an identifier (SPEC-0004), a qualified identifier (lexicon:SPEC-0004), an issue or pull request (argus#142), or a repository-relative path to a document that has no identifier (docs/plans/2026-09-11-project-doc-template.md). A path target is never qualified with a repository prefix.",
+      "anyOf": [
+        {
+          "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$"
+        },
+        {
+          "pattern": "^[a-z0-9][a-z0-9-]*:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*$"
+        },
+        {
+          "pattern": "^[a-z0-9][a-z0-9-]*#[0-9]+$"
+        },
+        {
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$"
+        }
+      ]
+    },
+    "relatedEntry": {
+      "type": "object",
+      "description": "One declared relationship, as a predicate and what it points at.",
+      "properties": {
+        "relation": {
+          "enum": [
+            "promotes-to",
+            "contains",
+            "implemented-by",
+            "informed-by",
+            "realizes",
+            "produces",
+            "constrained-by",
+            "governs",
+            "references",
+            "rendered-by",
+            "satisfies",
+            "changes",
+            "verified-by"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      },
+      "required": [
+        "relation",
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$comment": "A child of a specification, per the standard's metadata.md: \"`design`, `research` and `verification` are children of a specification. A child document carries `spec:` holding its parent's identifier, for instance `spec: SPEC-0004`, and no `id` and no `status` of its own.\" The three child schemas are identical apart from the `type` const; nothing distinguishes them at the frontmatter level, and inventing a difference to justify three files would be worse than the repetition. They are three because `type` is a closed set and a validator resolves a schema by the type it finds. `supersedes` and `superseded_by` are absent rather than optional: both name an identifier, and a child has none. A child is referenced as SPEC-0004/design, which the standard names, and superseding one is a change to its parent."
+}

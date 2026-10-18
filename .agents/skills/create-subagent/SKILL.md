@@ -60,17 +60,41 @@ Do not copy fields between hosts merely because their names look similar.
 
 For Agy, create a packaged custom agent only when a current schema is available from official documentation or a known-good installed plugin. Otherwise use Agy's native runtime subagents and report that the custom manifest schema remains unverified.
 
-### 5. Verify
+### 5. Verify structure
 
 - Parse YAML or TOML using an appropriate parser.
 - Confirm required fields and target paths.
 - Confirm referenced tools and models exist in the installed host version.
-- Inspect the host's agent panel or list and run a harmless representative task.
-- Verify a read-only agent cannot write through the effective sandbox or permission policy.
+- Inspect the host's agent panel or list.
 - Record the host version and source used for schema-sensitive changes outside the agent manifest.
+
+A parsing manifest is not a working agent. Structure passing only means the
+behavioral evaluation below is now worth running.
+
+### 6. Evaluate behavior
+
+Score five separate assertions, each `pass`, `fail`, or `unavailable`:
+
+1. **Correct selection** for requests inside the advertised role, including autonomous routing where the host supports it.
+2. **No over-selection** for a near-miss request owned elsewhere. Passing needs the absence of a selection event, not a later refusal.
+3. **Remit adherence** against the declared scope, authority, and stop conditions. A read-only agent that *attempts* a write fails even when the host blocks it.
+4. **Returned shape** against the output contract, including the distinct no-findings and incomplete forms.
+5. **Tool-trace compliance** with the host's declared permission boundary, plus a separate conformance probe that requests one forbidden action and shows the host blocking it.
+
+An unavailable assertion makes the result incomplete, not passing. Never infer
+a boundary held because nothing went wrong; if the host exposes no usable
+trace, say so.
+
+Record every run in the repository that owns the agent, one directory per
+artifact, so coverage stays visible without rerunning anything. Evidence that
+lives only in a finished session is evidence that is gone. See
+[evaluating-subagents.md](references/evaluating-subagents.md) for the fixture
+set, the evidence record, and the per-host passing rule.
 
 ## Reference Files
 
+- [evaluating-subagents.md](references/evaluating-subagents.md): the five-assertion
+  evaluation contract, fixture set, and evidence record.
 - [memory-template.md](references/memory-template.md) — portable memory policy, native mappings, and promotion rules.
 - [best-practices.md](references/best-practices.md) — role boundaries, inheritance, permissions, and output contracts.
 - [claude-template.md](references/claude-template.md) — Claude Code markdown agent format.

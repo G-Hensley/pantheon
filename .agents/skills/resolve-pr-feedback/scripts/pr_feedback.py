@@ -34,10 +34,26 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           isOutdated
           path
           line
-          comments(first: 50) {
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
             nodes { id databaseId body author { login } createdAt url }
           }
         }
+      }
+    }
+  }
+}
+"""
+
+# Follows one thread's comments past the first page of THREADS_QUERY, so a
+# long thread is never judged on a partial conversation.
+THREAD_COMMENTS_QUERY = """
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id databaseId body author { login } createdAt url }
       }
     }
   }
@@ -53,10 +69,21 @@ mutation($id: ID!) {
 """
 
 
+# Upper bound on one gh call, so a stalled network or TLS handshake fails
+# loudly instead of blocking the calling agent indefinitely. Generous because
+# `--paginate` on a busy PR makes many requests under one call.
+GH_TIMEOUT_SECONDS = 300
+
+
 def run(args: list[str]) -> str:
     # check=False because the returncode is handled explicitly below; letting
     # subprocess raise would lose the stderr this writes out first.
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Name the subcommand only: later arguments can carry a whole comment body.
+        sys.stderr.write(f"{' '.join(args[:3])} timed out after {GH_TIMEOUT_SECONDS}s\n")
+        raise SystemExit(124) from None
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
@@ -67,11 +94,24 @@ def gh_json(args: list[str]):
     return json.loads(run(["gh", *args]))
 
 
-def graphql(query: str, **fields: str):
+def graphql(query: str, **fields: str | int):
     args = ["api", "graphql", "-f", f"query={query}"]
     for key, value in fields.items():
-        args += ["-F", f"{key}={value}"]
+        # -F reads "@path" as a file and coerces true/false/numbers, which only
+        # an Int variable needs; strings go raw with -f.
+        flag = "-F" if isinstance(value, int) else "-f"
+        args += [flag, f"{key}={value}"]
     return gh_json(args)
+
+
+def thread_comments(thread: dict) -> list[dict]:
+    connection = thread["comments"]
+    comments = list(connection["nodes"])
+    while connection["pageInfo"]["hasNextPage"]:
+        data = graphql(THREAD_COMMENTS_QUERY, id=thread["id"], cursor=connection["pageInfo"]["endCursor"])
+        connection = data["data"]["node"]["comments"]
+        comments += connection["nodes"]
+    return comments
 
 
 def resolve_body(args: argparse.Namespace) -> str:
@@ -102,7 +142,7 @@ def fetch(repo: str, pr: int) -> None:
         for node in review_threads["nodes"]:
             if node["isResolved"]:
                 continue
-            comments = node["comments"]["nodes"]
+            comments = thread_comments(node)
             threads.append(
                 {
                     "thread_id": node["id"],

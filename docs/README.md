@@ -8,6 +8,7 @@ something from this file has found a defect in this file.
 | [`specs/`](specs/README.md) | Specifications: what is required and why, one directory per specification, requirements routed to issues. |
 | [`decisions/`](decisions/README.md) | Architecture Decision Records, one per file, superseded rather than edited. |
 | [`ideas/`](ideas/README.md) | Candidates, not requirements. Nothing here is implemented until it is promoted. |
+| [`guides/lexicon-lifecycle.md`](guides/lexicon-lifecycle.md) | Installed lifecycle skills and schemas, catalog provenance, and local host setup. |
 | [`archive/`](archive/README.md) | Dated records no longer acted on. Historical evidence, never current instruction. |
 | [`design/`](design/) | Design arguments that outgrew a single file, one directory per subject: `conductor-task-surface/`, `context-window/`, `headless-dispatch/`, `model-routing/`, `openrouter-free-tier/`, `session-restore/`. The last three arrived from `BACKLOG.md` in the 2026-09-16 triage. They predate `specs/` and stay here until the work they describe has a specification to sit under. |
 | [`plans/`](plans/) | Dated plans routed here from `G-Hensley/projects`. Still to empty: a plan is read, audited into issues, and then archived. One file today. |
@@ -15,7 +16,7 @@ something from this file has found a defect in this file.
 | [`github-issues.md`](github-issues.md) | The issue workflow and the tracker cutover's activation checkpoint. |
 | [`github-tracking-migration.md`](github-tracking-migration.md) | Provenance: every reviewed source identity mapped to its owning issue or historical disposition. Not a second tracker. |
 
-`architecture/`, `guides/`, `reference/`, `security/` and `diagrams/` are created when there is
+`architecture/`, `reference/`, `security/` and `diagrams/` are created when there is
 something to put in them, and each gets a row here when it appears. The layout and its rules are the
 Repository Documentation Standard in `G-Hensley/projects` at `docs/templates/repo-docs-template/`.
 

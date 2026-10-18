@@ -1,12 +1,12 @@
 # Increment Slicing
 
 How to cut a design into versions that ship one at a time. The test for every cut:
-if this shipped alone and nothing followed it, would someone be better off?
+if only this landed, would someone gain a useful capability or decision evidence?
 
 ## The two rules that decide most cuts
 
-**Independently shippable.** The increment can go to a real user without waiting on
-anything after it.
+**Independently deliverable.** A product increment can go to a real user without
+waiting on a later increment. An experiment delivers evidence that stands alone.
 
 **Independently valuable.** Someone is better off once it lands. If v1 is useless
 without v2, they are one increment and you have cut in the wrong place.
@@ -61,24 +61,37 @@ Note what v0 is not. It is not "the sharing infrastructure." It is a thing one
 person can do end to end, chosen because it puts the riskiest assumption in front
 of a real user in the least work.
 
-## Experiments are not increments
+## Experiments are increments whose good is evidence
 
-Sometimes the most useful first step is not shippable: a throwaway spike against an
-unfamiliar API, a load test, five user interviews, a prototype nobody will keep.
-These reduce uncertainty without delivering anything to a user, and forcing them to
-look like a product increment corrupts both ideas.
+A throwaway spike, a load test, interviews or a disposable prototype can be a valid
+increment. It earns its place by retiring a load-bearing uncertainty, not by
+pretending to ship a product. Its definition of good names the question, repeatable
+evidence, threshold, and the decision each result enables. Include quality,
+exclusions and a disposal or rollback path, just as for a product increment.
 
-Keep them separate:
+Choose **Experimental Build** when that uncertainty could invalidate the direction.
+For example: within one agent session, measure local transcription on ten agreed
+recordings against reference transcripts. Good might be error below the agreed
+threshold at the required speed. A pass permits shaping a prototype; a failure
+reopens engine choice or stops investment. Neither outcome authorizes building it.
 
-- **Validation experiment.** Reduces a specific uncertainty. Often disposable. Its
-  definition of good is what you will know afterward and what decision it unblocks,
-  not what a user can do.
-- **Product increment.** Independently shippable and independently valuable, with
-  the five-part definition of good.
+An experiment has an appetite in agent sessions, optionally a cost ceiling. If it
+cannot answer the question within that bound, report that it needs a smaller cut;
+do not stretch the estimate. An experiment with no decision it could change is
+not a useful increment.
 
-An experiment can come before v0. Name it as an experiment, say what question it
-answers, say what you will do with either answer, and time-box it. If you cannot
-say what a result would change, it is procrastination wearing a lab coat.
+## Direct Build does not need a ladder
+
+Use **Direct Build** when the whole solution is one bounded, reversible, verifiable
+increment. A JSON-to-CSV CLI command using an existing parser, with no integrations,
+can be the complete first delivery within one agent session. Its quoting fixtures
+and refusal to overwrite a destination on invalid input are its evidence. Do not
+invent a partial exporter followed by polish to make an MVP ladder.
+
+Use **Incremental Build** when one bound cannot contain the full understood work.
+The report-sharing ladder above is an example, not a required shape for every idea.
+Record the strategy and reason before slicing, considering scope, clarity,
+uncertainty, consequence of failure, reversibility, integration and verification.
 
 ## Sequence by risk, not by ease
 
@@ -113,25 +126,30 @@ Flag anything expensive to reverse, and place it as late as the design allows:
 - Anything that writes data you cannot recompute
 - Pricing, billing, and anything a customer signs
 
-When a one-way door has to come early, say so in the increment spec's reversibility
+When a one-way door has to come early, say so in the increment section's reversibility
 section and name the cost of getting it wrong. When it can wait, keep the early
 increments behind a flag, a manual step, or a smaller surface until the shape is
 proven.
 
-## Sizing
+## Sizing against appetite
 
-Keep an increment small enough to complete within one feedback cycle for this team
-and project. What that means in calendar time varies enormously: a solo maintainer,
-a six-person team, and a safety-critical system with a release board do not share a
-number, so do not import one.
+Resolve the appetite with the owner before slicing. Use bounded sessions of one
+agent worker, with an optional dollar ceiling where cost is reported. Reuse a
+stated bound; if none exists, ask before cutting. Record it on every increment,
+including evidence work and later sketches; mark tentative later bounds as such.
+Do not substitute wall-clock availability, tokens or model tiers for this unit.
 
-The test is feedback, not duration. If real feedback only arrives after several
-unrelated capabilities are finished, the slice is too big regardless of how long it
-takes. If you cannot see how to cut it smaller, the design is still unclear: go
-back to the Shape pass rather than committing to a large slice.
+Compare scope with the bound. If preview and confirmation consume the one agreed
+session while presets and rollback each need another, the cut does not fit.
+Say which behaviors need a smaller cut. Offer a separately useful read-only preview
+or a decision experiment, clearly awaiting agreement to the changed scope. Preserve
+the excluded behaviors as unaccepted later possibilities, not hidden omissions from
+an otherwise unchanged definition of good. Do not recommend more sessions as the
+way to fit. If no safe useful cut remains, report that and reconsider the direction.
 
-More than four or five increments in a ladder usually means the north-star is two
-projects. Split it, shape the first, and leave the second as a named idea.
+Feedback remains the test of the cut: if it arrives only after unrelated
+capabilities finish, return to Shape. More than four or five increments may mean
+two projects; keep the second as a named idea.
 
 ## Bad cuts, and what they usually mean
 

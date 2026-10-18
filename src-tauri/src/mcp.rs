@@ -130,12 +130,27 @@ fn review_request_notice(id: &str, target: &str, brief: &str) -> String {
 
 /// What a target's terminal receives when its reviewer sends a task back.
 fn rework_notice(id: &str, reviewer: &str, findings: &str) -> String {
-    let findings = single_line(&truncate_chars(findings, TASK_ECHO_CHARS));
+    let findings = single_line(findings);
+    let build = |text: &str| {
+        format!(
+            "[pantheon] Task {id} sent back by {reviewer}: {text} Fix, then call the \
+         pantheon complete_task tool again with task_id \"{id}\"."
+        )
+    };
+    let complete = build(&findings);
+    if injection_overage(&complete).is_none() {
+        return complete;
+    }
+    // Reserve the retrieval instruction before fitting the preview. The worker
+    // must never mistake a shortened preview for the complete findings.
     fit_injection(
-        |v| {
+        |preview| {
             format!(
-                "[pantheon] Task {id} sent back by {reviewer}: {v} Fix, then call the \
-                 pantheon complete_task tool again with task_id \"{id}\"."
+                "[pantheon] Task {id} sent back by {reviewer}. Findings truncated \
+             ({} bytes after line normalization). Before editing, call pantheon \
+             get_task_result with task_id \"{id}\" for the complete findings. \
+             Preview: {preview} Then fix and call complete_task with task_id \"{id}\".",
+                findings.len()
             )
         },
         &findings,
@@ -308,6 +323,11 @@ pub struct Task {
     /// never had anywhere to go.
     #[serde(default)]
     pub notice_delivered: bool,
+    /// First-load recovery never attaches a prior process's assignment to a
+    /// restored pane ID. For in_review this suspends assignment until an
+    /// explicit reassignment; for abandoned work it explains the interruption.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recovery_reason: String,
 }
 
 fn headless_ready(activity_age_ms: Option<u64>, connected: bool) -> bool {
@@ -328,6 +348,41 @@ fn abandon_headless_on_load(tasks: &mut [Task]) -> Vec<Task> {
         changed.push(t.clone());
     }
     changed
+}
+
+/// Recover pane assignments once per app run, before any restored pane can
+/// drain them. A session ID identifies a pane, not its previous process.
+fn recover_pane_tasks_on_load(tasks: &mut [Task], now_ms: u64) -> Vec<Task> {
+    let mut changed = Vec::new();
+    for task in tasks
+        .iter_mut()
+        .filter(|t| t.mode == "pane" && is_open(&t.status))
+    {
+        if !task.recovery_reason.is_empty() {
+            continue;
+        }
+        task.recovery_reason = if task.status == "in_review" {
+            "App restarted. Submitted work is preserved; explicitly reassign the review before proceeding."
+        } else {
+            "App restarted. The previous pane process cannot report this task's completion. Inspect preserved work before explicitly reassigning or dispatching again."
+        }.into();
+        // Neither queued briefs nor unseen review/rework notices may replay
+        // into a new process solely because its pane ID happens to match.
+        task.notice_delivered = true;
+        if task.status == "in_review" {
+            task.reviewer_gone = true;
+        } else {
+            task.status = STATUS_ABANDONED.into();
+            task.done_ms = Some(now_ms);
+            task.reviewer_gone = false;
+        }
+        changed.push(task.clone());
+    }
+    changed
+}
+
+fn review_assignment_interrupted(task: &Task) -> bool {
+    task.status == "in_review" && !task.recovery_reason.is_empty()
 }
 
 /// Append a `permission denials: <n> (<tool names>)` line when the run's
@@ -1315,6 +1370,7 @@ pub struct Shared {
     /// set. Cleared on respawn (`note_session`) so a stale connection from a
     /// prior incarnation of the same pane id cannot mark the new one ready.
     connected: Mutex<HashSet<String>>,
+    pane_contact: Mutex<HashMap<String, Instant>>,
     /// Global kill-switch for all dispatch.
     halted: Mutex<bool>,
     tasks: Mutex<Vec<Task>>,
@@ -1693,6 +1749,9 @@ impl Shared {
             }
         }
         drop(running);
+        if first_load {
+            abandoned.extend(recover_pane_tasks_on_load(&mut brain.tasks, Self::now_ms()));
+        }
         for task in abandoned {
             let _ = append_record(&dir, &StoreRecord::Task(Box::new(task)));
         }
@@ -1870,6 +1929,7 @@ impl Shared {
         // `mark_connected` is what actually notices the pane is back and
         // drains it, once its MCP endpoint hears from it again.
         self.connected.lock().unwrap().remove(name);
+        self.pane_contact.lock().unwrap().remove(name);
         // Restart, not forget. `spawn_session_inner` calls this on the way to
         // creating the PTY, so it runs for the first spawn of a pane the claim
         // has just registered, not only for a respawn. Deleting the record
@@ -1905,6 +1965,13 @@ impl Shared {
         // the cheapest honest signal available here.
         let tasks = self.tasks_snapshot();
         let (open_for, in_review_for) = attribute_open_tasks(&tasks, now);
+        let mut observations_by_actor: HashMap<String, Vec<String>> = HashMap::new();
+        for activity in self.task_activity_snapshot(&tasks) {
+            observations_by_actor
+                .entry(activity.actor.clone())
+                .or_default()
+                .push(crate::fleet::describe(&activity));
+        }
         // Held sessions, not live ones: a pane whose process has died is still
         // worth a line, marked dead, because a conductor that simply stops
         // seeing it cannot tell a pane that died from one that was never there,
@@ -1967,8 +2034,12 @@ impl Shared {
                     )
                 };
                 let headless = if tasks.iter().any(|t| t.target == *id && t.mode == "headless" && is_open(&t.status)) { " [headless]" } else { "" };
+                let observations = observations_by_actor.get(id)
+                    .map(|entries| entries.join("; ")).unwrap_or_default();
+                let observations = if observations.is_empty() { String::new() }
+                    else { format!(" [{observations}]") };
                 format!(
-                    "- {id} ({kind}, {model_display}) brain={room}{role}{busy_str}{reviewing_str}{headless}"
+                    "- {id} ({kind}, {model_display}) brain={room}{role}{busy_str}{reviewing_str}{headless}{observations}"
                 )
             })
             .collect()
@@ -2266,6 +2337,51 @@ impl Shared {
 
     pub fn tasks_snapshot(&self) -> Vec<Task> {
         self.tasks.lock().unwrap().clone()
+    }
+
+    /// UI reads use the same liveness and age reconciliation as agent reads.
+    pub fn observed_tasks_snapshot(&self) -> Vec<Task> {
+        self.reconcile_abandoned();
+        self.mutate_and_journal(|tasks| {
+            let mut changed = Vec::new();
+            for task in tasks.iter_mut() {
+                let previous = task.status.clone();
+                age(task, Self::now_ms());
+                if task.status != previous {
+                    changed.push(task.clone());
+                }
+            }
+            (tasks.to_vec(), changed)
+        })
+    }
+
+    fn note_pane_contact(&self, pane: &str) {
+        if pane != "unknown" {
+            self.pane_contact
+                .lock()
+                .unwrap()
+                .insert(pane.into(), Instant::now());
+        }
+    }
+
+    pub fn task_activity_snapshot(&self, tasks: &[Task]) -> Vec<crate::fleet::TaskActivity> {
+        let now = Self::now_ms();
+        let contacts = self.pane_contact.lock().unwrap().clone();
+        tasks
+            .iter()
+            .filter(|task| is_open(&task.status))
+            .map(|task| {
+                let actor = crate::fleet::actor(task);
+                crate::fleet::observe(
+                    task,
+                    self.engine.output_age_ms(actor),
+                    contacts
+                        .get(actor)
+                        .map(|last| last.elapsed().as_millis() as u64),
+                    now,
+                )
+            })
+            .collect()
     }
 
     pub fn dispatch_budget(&self) -> DispatchBudget {
@@ -3423,6 +3539,7 @@ impl Shared {
             reviewer_gone: false,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: if headless {
                 "headless".into()
             } else {
@@ -3490,6 +3607,7 @@ impl Shared {
             // The startup gate is a gate on the *first* dispatch, and only a
             // delivered one counts. A refused or undelivered attempt leaves
             // the pane where it was, still waiting to prove itself.
+            self.note_pane_contact(target);
             self.mark_request_pane_admitted(target);
         } else {
             self.mark_delivery_failed(&id);
@@ -3700,6 +3818,13 @@ impl Shared {
         self.app.emit("conductor-changed");
 
         if !retargeting {
+            // Recovered reviews owe the newly assigned process its brief.
+            // Release the read guard before drain takes it: a waiting Stop
+            // writer must not deadlock a recursive read on this thread.
+            drop(delivery_gate);
+            if task.status == "in_review" && !task.notice_delivered {
+                self.drain_pane(&task.reviewer);
+            }
             return Ok((task, true));
         }
 
@@ -3760,6 +3885,9 @@ impl Shared {
             // just journaled it pending.
             let injection = dispatch_prompt(&task.from, &task.id, &task.task);
             let delivered = self.engine.submit_to(&task.target, &injection);
+            if delivered {
+                self.note_pane_contact(&task.target);
+            }
             drop(pane_gate);
             drop(delivery_gate);
             let result = if delivered {
@@ -3869,6 +3997,9 @@ impl Shared {
             review_request_notice(&task.id, &task.target, &task.task)
         };
         let delivered = self.engine.submit_to(pane, &text);
+        if delivered {
+            self.note_pane_contact(pane);
+        }
         let now = Self::now_ms();
 
         self.mutate_and_journal(|tasks| {
@@ -3914,6 +4045,7 @@ impl Shared {
     /// engine handle exist and is not evidence of anything reachable.
     pub fn mark_connected(&self, pane: &str) {
         self.connected.lock().unwrap().insert(pane.to_string());
+        self.note_pane_contact(pane);
         self.note_request_pane_connected(pane);
         self.drain_pane(pane);
     }
@@ -4015,7 +4147,7 @@ fn occupies_pane(t: &Task, pane: &str) -> bool {
             t.status.as_str(),
             "pending" | "overdue" | "rework" | STATUS_BLOCKED
         ))
-        || (t.reviewer == pane && t.status == "in_review")
+        || (t.reviewer == pane && t.status == "in_review" && !review_assignment_interrupted(t))
 }
 
 fn is_occupied(tasks: &[Task], pane: &str) -> bool {
@@ -4091,6 +4223,7 @@ fn next_delivery_for<'a>(tasks: &'a [Task], pane: &str) -> Option<&'a Task> {
 /// never disagree about what counts as unseen.
 fn undelivered_notice_for(t: &Task, pane: &str) -> bool {
     !t.notice_delivered
+        && !review_assignment_interrupted(t)
         && ((t.status == "rework" && t.target == pane)
             || (t.status == "in_review" && t.reviewer == pane))
 }
@@ -4124,7 +4257,9 @@ fn attribute_open_tasks(tasks: &[Task], now_ms: u64) -> (AgeBySession, AgeBySess
     {
         let age_ms = now_ms.saturating_sub(t.ts_ms);
         if t.status == "in_review" {
-            reviewing.push((t.reviewer.clone(), age_ms));
+            if !review_assignment_interrupted(t) {
+                reviewing.push((t.reviewer.clone(), age_ms));
+            }
         } else {
             busy.push((t.target.clone(), age_ms));
         }
@@ -4249,7 +4384,8 @@ fn abandon_lost(tasks: &mut [Task], live: &[String], now_ms: u64) -> Vec<Task> {
             // these statuses in practice (see `finish_pending` and
             // `choose_reviewer`), but treating it as "not gone" is the safe
             // reading if it ever does.
-            let reviewer_gone = !t.reviewer.is_empty() && !live.iter().any(|id| id == &t.reviewer);
+            let reviewer_gone = review_assignment_interrupted(t)
+                || (!t.reviewer.is_empty() && !live.iter().any(|id| id == &t.reviewer));
             if t.reviewer_gone != reviewer_gone {
                 t.reviewer_gone = reviewer_gone;
                 touched = true;
@@ -4496,7 +4632,9 @@ fn review_pending(
         // Only the named reviewer. Not the implementer, who would be
         // self-certifying by another route, and not a bystander.
         Some(t) if t.reviewer != caller => Err(TaskAccessError::Forbidden),
-        Some(t) if t.status != "in_review" => Err(TaskAccessError::NotPending),
+        Some(t) if t.status != "in_review" || review_assignment_interrupted(t) => {
+            Err(TaskAccessError::NotPending)
+        }
         Some(t) => {
             t.findings = findings.to_string();
             // Rejection returns it to the implementer rather than killing it.
@@ -4759,7 +4897,7 @@ fn reassign_pending(
         ) {
             return Err(ReassignError::NotOpenForRetarget);
         }
-        if target == t.target {
+        if target == t.target && t.recovery_reason.is_empty() {
             return Err(ReassignError::SameTarget);
         }
         if target == t.reviewer {
@@ -4783,6 +4921,7 @@ fn reassign_pending(
             t.from = caller.to_string();
         }
         t.target = target.to_string();
+        t.recovery_reason.clear();
         // Fresh delivery, fresh clock: the old dispatch time would otherwise
         // read as though the new target had already been sitting on it.
         t.status = "pending".to_string();
@@ -4797,7 +4936,7 @@ fn reassign_pending(
     if !matches!(t.status.as_str(), "in_review" | "rework") {
         return Err(ReassignError::NotOpenForReview);
     }
-    if reviewer == t.reviewer {
+    if reviewer == t.reviewer && !review_assignment_interrupted(t) {
         return Err(ReassignError::SameReviewer);
     }
     if reviewer == t.target {
@@ -4815,7 +4954,11 @@ fn reassign_pending(
         t,
         &format!("[reassigned by conductor: reviewer {previous} -> {reviewer}]"),
     );
+    if review_assignment_interrupted(t) {
+        t.notice_delivered = false;
+    }
     t.reviewer = reviewer.to_string();
+    t.recovery_reason.clear();
     // The reviewer named here was just checked live, by the call above.
     t.reviewer_gone = false;
     Ok(t.clone())
@@ -4883,7 +5026,9 @@ fn mark_pending_error(tasks: &mut [Task], id: &str, now_ms: u64) -> bool {
 /// be rendered without it. Shared by `render_task` and `render_task_summary`
 /// so the full view and the abbreviated one never disagree about it.
 fn status_tag(t: &Task) -> String {
-    if t.reviewer_gone {
+    if review_assignment_interrupted(t) {
+        format!("{}, review assignment interrupted", t.status)
+    } else if t.reviewer_gone {
         format!("{}, reviewer gone", t.status)
     } else {
         t.status.clone()
@@ -4937,8 +5082,8 @@ fn render_task(t: &Task) -> String {
     // call. A conductor that has to go looking for the question will not.
     let asked = match open_question(t) {
         Some(e) => format!(
-            "\n--- waiting on you ---\n{}\nAnswer with answer_question(\"{}\", ...)",
-            e.question, t.id
+            "\n--- waiting on conductor {} ---\n{}\nAnswer with answer_question(\"{}\", ...)",
+            t.from, e.question, t.id
         ),
         None => String::new(),
     };
@@ -4947,7 +5092,9 @@ fn render_task(t: &Task) -> String {
     // going to sign this off until the conductor does something about it.
     // Named explicitly rather than left to the status tag alone, because
     // "in_review, reviewer gone" reads as a fact and this is a call to act.
-    let reviewer_gone = if t.reviewer_gone {
+    let reviewer_gone = if review_assignment_interrupted(t) {
+        format!("\n--- interrupted ---\n{}", t.recovery_reason)
+    } else if t.reviewer_gone {
         format!(
             "\n--- reviewer gone ---\n'{}' is no longer live, so this cannot be signed off as \
              is. reassign_task to hand review to someone else, or review it yourself if that \
@@ -4960,14 +5107,19 @@ fn render_task(t: &Task) -> String {
 
     let status = status_tag(t);
     let execution = render_execution(t);
+    let recovery = if !t.recovery_reason.is_empty() && !review_assignment_interrupted(t) {
+        format!("\n--- interrupted ---\n{}", t.recovery_reason)
+    } else {
+        String::new()
+    };
     if t.result.is_empty() {
         format!(
-            "[{status}]{sign_off} ({execution}) {} â†’ {}{asked}{reviewer_gone}",
+            "[{status}]{sign_off} ({execution}) {} â†’ {}{findings}{asked}{reviewer_gone}{recovery}",
             t.target, t.task
         )
     } else {
         format!(
-            "[{status}]{sign_off} ({execution}) {} â†’ {}\n{}{findings}{asked}{reviewer_gone}",
+            "[{status}]{sign_off} ({execution}) {} â†’ {}\n{}{findings}{asked}{reviewer_gone}{recovery}",
             t.target, t.task, t.result
         )
     }
@@ -5156,15 +5308,16 @@ impl BrainHandler {
     }
 
     fn author(&self) -> String {
-        if let Some(b) = &self.bound {
-            return b.clone();
-        }
-        self.identity
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "unknown".to_string())
+        let author = self.bound.clone().unwrap_or_else(|| {
+            self.identity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+        self.shared.note_pane_contact(&author);
+        author
     }
 
     /// The gate `dispatch`, `cancel_task`, and `reassign_task` all share:
@@ -5564,9 +5717,10 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their CLI kind, model (if one was set at launch), brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so re-dispatch that work to a live pane rather than waiting on it."
+        description = "List the other AI agents live in this workspace right now, with their CLI kind, model (if one was set at launch), brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it. A pane marked DEAD has had its process exit: dispatch to it will be refused, and any task it was holding has already been marked abandoned, so inspect retained work before explicitly reassigning it. Quiet observations name the task and duration but do not establish failure, completion, or an approval wait."
     )]
     fn list_sessions(&self) -> String {
+        let me = self.author();
         let lines = self.shared.roster_lines();
         let budget = self.shared.dispatch_budget();
         let mut out = format!(
@@ -5578,7 +5732,6 @@ impl BrainHandler {
             out.push_str("\nNo live sessions.");
             return out;
         }
-        let me = self.author();
         for l in &lines {
             out.push_str(l);
             out.push('\n');
@@ -5711,7 +5864,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, queued, or already-abandoned task to a different live session: this resets its dispatch clock, the same as a fresh dispatch, and either types the brief into the new target's terminal or, if that pane is occupied, queues it there instead. Refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, which requires no redelivery since a reviewer's assignment lives entirely in the task record. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, that is the same as what is already there, or that would let one session both do the work and sign off on it, naming why."
+        description = "Conductor only: move a task off a target or reviewer that is stuck or gone, rather than leaving it stranded. Set target to redeliver a pending, overdue, queued, or already-abandoned task to a different live session: this resets its dispatch clock, the same as a fresh dispatch, and either types the brief into the new target's terminal or, if that pane is occupied, queues it there instead. Refused while dispatch is halted (Stop) for the same reason dispatch itself is. Set reviewer to hand an in_review or rework task to a different live reviewer instead, preserving the submitted result. An interrupted review sends a fresh review notice through the normal queue after explicit reassignment. Set exactly one of the two, never both: which field a task accepts depends on its current status, and get_task_result will say which. Refuses a target or reviewer that is not live, that is the same as what is already there unless its assignment was interrupted by restart, or that would let one session both do the work and sign off on it, naming why."
     )]
     fn reassign_task(&self, Parameters(p): Parameters<ReassignArgs>) -> String {
         let target = (!p.target.is_empty()).then_some(p.target.as_str());
@@ -5816,7 +5969,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work. With a task_id, the dispatcher, the target, and the named reviewer may all read that one task in full: a review request or rework notice you receive points you back here. With no task_id, this returns every task YOU dispatched (open ones plus the most recently finished) in one call, so do that instead of polling ids one by one; that listing stays dispatcher-only. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned is the opposite and is final: the pane holding that work no longer exists, so no result is ever coming, and re-dispatching to a live session is the only way to get it done. queued means it is recorded but has not been typed into its target's terminal yet, because that pane was occupied when it was dispatched; it will be delivered automatically. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work. With a task_id, the dispatcher, the target, and the named reviewer may all read that one task in full: a review request or rework notice you receive points you back here. With no task_id, this returns every task YOU dispatched (open ones plus the most recently finished) in one call, so do that instead of polling ids one by one; that listing stays dispatcher-only. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled, abandoned), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. abandoned means its previous process cannot report completion. Inspect any retained result and work before explicitly reassigning or dispatching again; work may already have landed. An interrupted review preserves its submission but requires explicit reviewer reassignment. queued means it is recorded but has not been typed into its target's terminal yet, because that pane was occupied when it was dispatched; it will be delivered automatically. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -5878,7 +6031,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, at the timeout with a note of what is still running, or within about 45-55 seconds either way: this host's own MCP transport does not reliably survive a longer single call, so a wait this size is one call in a short series, not the whole wait. A timeout is not a failure and does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so simply call this again with the same task_ids to keep waiting. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open."
+        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in a single call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing: waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, at the timeout with a note of what is still running, or within about 45-55 seconds either way: this host's own MCP transport does not reliably survive a longer single call, so a wait this size is one call in a short series, not the whole wait. A timeout is not a failure and does NOT cancel anything: the agents keep working and their results are still accepted afterwards, so simply call this again with the same task_ids to keep waiting. A task whose pane dies while you wait comes back as abandoned rather than holding the wait open. A task with five minutes of no observed activity returns an attention notice without resolving it; silence does not prove failure or an approval wait."
     )]
     async fn wait_for_tasks(&self, Parameters(p): Parameters<WaitArgs>) -> String {
         let me = self.author();
@@ -5963,6 +6116,34 @@ impl BrainHandler {
                 return out;
             }
 
+            let attention: Vec<_> = self
+                .shared
+                .task_activity_snapshot(&mine)
+                .into_iter()
+                .filter(|a| {
+                    wanted.contains(&a.task_id)
+                        && matches!(
+                            a.state.as_str(),
+                            "quiet" | "interrupted" | "reviewer_unavailable"
+                        )
+                })
+                .collect();
+            if !attention.is_empty() {
+                return format!(
+                    "Attention: {} task(s) need inspection or reassignment.\n{}\n\
+                     These tasks remain open. Silence does not establish completion, failure, \
+                     or an approval wait. Inspect the named pane before prompting it; do not \
+                     automatically type into a possible approval dialog. Use get_task_result \
+                     for stored results and questions.",
+                    attention.len(),
+                    attention
+                        .iter()
+                        .map(crate::fleet::describe)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+
             let open = still_open(&mine, &wanted);
             if open.is_empty() {
                 let finished: Vec<Task> = mine
@@ -5988,9 +6169,9 @@ impl BrainHandler {
                 let summaries = render_open_task_summaries(&mine, &open);
                 let mut out = format!(
                     "Timed out with {} of {waited_on} task(s) still running:\n{}\n\
-                     They have NOT been cancelled: the agents are still working and their \
-                     results are still accepted. Wait again, or collect what landed with \
-                     get_task_result.\n",
+                     They have NOT been cancelled. These tasks remain open; this does not prove \
+                     the agents are making progress. Inspect the states above, wait again, or \
+                     collect what landed with get_task_result.\n",
                     open.len(),
                     summaries.join("\n")
                 );
@@ -6345,6 +6526,9 @@ pub fn start(
     for task in abandon_headless_on_load(&mut brain.tasks) {
         let _ = append_record(&dir, &StoreRecord::Task(Box::new(task)));
     }
+    for task in recover_pane_tasks_on_load(&mut brain.tasks, Shared::now_ms()) {
+        let _ = append_record(&dir, &StoreRecord::Task(Box::new(task)));
+    }
     let shared = Arc::new(Shared {
         app: Notifier::to_app(app),
         loaded_dirs: Mutex::new(HashSet::from([dir.clone()])),
@@ -6360,6 +6544,7 @@ pub fn start(
         engine,
         conductor: Mutex::new(None),
         connected: Mutex::new(HashSet::new()),
+        pane_contact: Mutex::new(HashMap::new()),
         halted: Mutex::new(false),
         tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
@@ -7184,6 +7369,7 @@ mod tests {
             reviewer_gone: false,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -7318,6 +7504,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -7480,6 +7667,7 @@ mod tests {
             engine: Arc::new(crate::SessionManager::default()),
             conductor: Mutex::new(Some("sess-1".to_string())),
             connected: Mutex::new(HashSet::new()),
+            pane_contact: Mutex::new(HashMap::new()),
             halted: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             dispatches: Mutex::new(0),
@@ -7978,6 +8166,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8012,6 +8201,7 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8065,6 +8255,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8104,6 +8295,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8138,6 +8330,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8237,6 +8430,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8266,6 +8460,7 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8292,6 +8487,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8331,6 +8527,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8369,6 +8566,7 @@ mod tests {
                 ts_ms: 0,
                 done_ms: None,
                 notice_delivered: true,
+                recovery_reason: String::new(),
                 mode: pane_mode(),
                 exit_code: None,
                 cli_session: String::new(),
@@ -8400,6 +8598,7 @@ mod tests {
             ts_ms: 0,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8444,6 +8643,7 @@ mod tests {
             ts_ms: 2,
             done_ms: None,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -8486,6 +8686,7 @@ mod tests {
             exchanges: Vec::new(),
             reviewer_gone: false,
             notice_delivered: true,
+            recovery_reason: String::new(),
             mode: pane_mode(),
             exit_code: None,
             cli_session: String::new(),
@@ -10526,6 +10727,13 @@ mod tests {
         )
         .unwrap();
 
+        // This test is an in-run round trip. First-ever loads deliberately
+        // retire old queued assignments rather than replaying them.
+        shared
+            .loaded_dirs
+            .lock()
+            .unwrap()
+            .insert(new_dir.path().canonicalize().unwrap());
         shared.set_dir(new_dir.path().to_path_buf());
 
         assert_eq!(shared.tasks_snapshot()[0].status, "error");
@@ -11030,6 +11238,399 @@ mod tests {
         let truncated = truncate_bytes(&s, 10);
         assert!(truncated.len() <= 10);
         assert!(s.is_char_boundary(truncated.len() - 3) || truncated.len() < 3);
+    }
+
+    #[test]
+    fn pane_restart_retires_every_unfinished_assignment_without_losing_evidence() {
+        for status in ["queued", "pending", "overdue", "blocked", "rework"] {
+            let mut t = task_at("old-task", status, 10);
+            t.result = "work already on disk".into();
+            t.findings = "keep the regression test".into();
+            t.notice_delivered = false;
+            t.exchanges.push(super::Exchange {
+                question: "which branch?".into(),
+                answer: "".into(),
+                asked_ms: 11,
+            });
+            let changed = super::recover_pane_tasks_on_load(std::slice::from_mut(&mut t), 99);
+            assert_eq!(changed.len(), 1);
+            assert_eq!(t.status, "abandoned");
+            assert_eq!(t.done_ms, Some(99));
+            assert_eq!(t.ts_ms, 10);
+            assert_eq!(t.result, "work already on disk");
+            assert_eq!(t.findings, "keep the regression test");
+            assert_eq!(t.exchanges.len(), 1);
+            assert!(t.notice_delivered);
+            assert!(!super::is_occupied(std::slice::from_ref(&t), "sess-2"));
+            assert!(super::next_delivery_for(std::slice::from_ref(&t), "sess-2").is_none());
+            assert!(render_task(&t).contains("App restarted"));
+            assert!(
+                super::recover_pane_tasks_on_load(std::slice::from_mut(&mut t), 100).is_empty()
+            );
+        }
+        for status in ["done", "error", "cancelled", "abandoned"] {
+            let mut t = task_at("history", status, 10);
+            let before = t.clone();
+            assert!(super::recover_pane_tasks_on_load(std::slice::from_mut(&mut t), 99).is_empty());
+            assert_eq!(t, before);
+        }
+    }
+
+    #[test]
+    fn restarted_review_cannot_replay_or_be_signed_off_by_a_reused_pane_id() {
+        let mut t = task_at("review", "in_review", 10);
+        t.reviewer = "sess-3".into();
+        t.result = "submitted result".into();
+        t.notice_delivered = false;
+        let mut tasks = vec![t];
+        super::recover_pane_tasks_on_load(&mut tasks, 99);
+        let live = vec!["sess-2".into(), "sess-3".into()];
+        abandon_lost(&mut tasks, &live, 100);
+        assert_eq!(tasks[0].status, "in_review");
+        assert!(tasks[0].reviewer_gone);
+        assert_eq!(tasks[0].done_ms, None);
+        assert_eq!(tasks[0].result, "submitted result");
+        assert!(!super::is_occupied(&tasks, "sess-3"));
+        assert!(super::next_delivery_for(&tasks, "sess-3").is_none());
+        assert_eq!(
+            review_pending(&mut tasks, "sess-3", "review", true, "looks good", 101),
+            Err(TaskAccessError::NotPending)
+        );
+        let updated = reassign_pending(
+            &mut tasks,
+            "review",
+            "sess-1",
+            None,
+            Some("sess-3"),
+            &live,
+            102,
+        )
+        .unwrap();
+        assert!(updated.recovery_reason.is_empty());
+        assert!(!updated.reviewer_gone);
+        review_pending(&mut tasks, "sess-3", "review", true, "verified again", 103).unwrap();
+        assert_eq!(tasks[0].status, "done");
+    }
+
+    #[test]
+    fn restart_reassignment_to_the_same_pane_requires_an_explicit_action() {
+        let mut tasks = vec![task_at("old", "pending", 10)];
+        super::recover_pane_tasks_on_load(&mut tasks, 99);
+        let updated = reassign_pending(
+            &mut tasks,
+            "old",
+            "sess-1",
+            Some("sess-2"),
+            None,
+            &["sess-2".into()],
+            102,
+        )
+        .unwrap();
+        assert_eq!(updated.status, "pending");
+        assert!(updated.recovery_reason.is_empty());
+        assert_eq!(updated.done_ms, None);
+    }
+
+    #[test]
+    fn first_project_load_recovers_once_before_any_connected_pane_can_drain() {
+        let (shared, _) = shared_for_test();
+        let project = tempfile::tempdir().unwrap();
+        for status in ["queued", "pending", "in_review"] {
+            let mut t = task_at(status, status, 10);
+            t.reviewer = "sess-3".into();
+            t.notice_delivered = false;
+            t.result = "retained work".into();
+            append_record(project.path(), &StoreRecord::Task(Box::new(t))).unwrap();
+        }
+        shared
+            .connected
+            .lock()
+            .unwrap()
+            .extend(["sess-2".into(), "sess-3".into()]);
+        shared.set_dir(project.path().into());
+        let tasks = shared.tasks_snapshot();
+        assert_eq!(
+            tasks.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(),
+            ["abandoned", "abandoned", "in_review"]
+        );
+        assert!(tasks.iter().all(|t| !t.recovery_reason.is_empty()));
+        let bytes = std::fs::read(project.path().join(super::STORE_FILE)).unwrap();
+        shared.set_dir(project.path().into());
+        assert_eq!(
+            std::fs::read(project.path().join(super::STORE_FILE)).unwrap(),
+            bytes
+        );
+        assert_eq!(load_brain(project.path()).tasks, tasks);
+    }
+
+    #[test]
+    fn project_round_trip_preserves_work_created_during_this_app_run() {
+        let (shared, original) = shared_for_test();
+        let other = tempfile::tempdir().unwrap();
+        let task = task_at("current", "pending", 10);
+        append_record(original.path(), &StoreRecord::Task(Box::new(task.clone()))).unwrap();
+        shared.set_dir(other.path().into());
+        shared.set_dir(original.path().into());
+        assert_eq!(shared.tasks_snapshot(), vec![task]);
+    }
+
+    #[test]
+    fn rework_notice_delivers_medium_findings_in_full() {
+        let findings = "Complete finding. ".repeat(30);
+        let notice = rework_notice("abc123", "sess-3", &findings);
+        assert!(notice.contains(&findings));
+        assert!(!notice.contains("truncated"));
+        assert!(injection_overage(&notice).is_none());
+    }
+
+    #[test]
+    fn long_utf8_rework_notice_requires_fetching_the_complete_stored_findings() {
+        let findings = "修正 parser\r\n追加 test\n".repeat(100);
+        let mut tasks = vec![task_at("abc123", "in_review", 0)];
+        tasks[0].reviewer = "sess-3".into();
+        review_pending(&mut tasks, "sess-3", "abc123", false, &findings, 100).unwrap();
+        let notice = rework_notice("abc123", "sess-3", &tasks[0].findings);
+        assert!(notice.contains("Findings truncated"));
+        assert!(notice.contains("get_task_result with task_id \"abc123\""));
+        assert!(!notice.contains(['\r', '\n']));
+        assert!(
+            injection_overage(&notice).is_none(),
+            "{} bytes",
+            notice.len()
+        );
+        assert_eq!(tasks[0].findings, findings);
+        assert!(render_task(&tasks[0]).contains(&findings));
+    }
+
+    #[test]
+    fn agent_activity_is_refreshed_by_a_tool_call_and_reset_at_respawn() {
+        let (shared, _) = shared_for_test();
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-2".into());
+        assert_eq!(handler.author(), "sess-2");
+        assert!(shared.pane_contact.lock().unwrap().contains_key("sess-2"));
+        shared.note_session("sess-2", "codex", "");
+        assert!(!shared.pane_contact.lock().unwrap().contains_key("sess-2"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_recovered_review_reassignment_delivers_or_waits_for_busy_and_stop() {
+        use crate::tests::RecordingPane;
+        for condition in ["free", "busy", "stopped"] {
+            let (shared, _dir) = shared_for_test();
+            let pane = RecordingPane::new(&shared.engine, "sess-3", "codex");
+            shared.connected.lock().unwrap().insert("sess-3".into());
+            let mut task = task_at("recover-review", "in_review", 10);
+            task.reviewer = "sess-3".into();
+            task.result = "submitted result".into();
+            super::recover_pane_tasks_on_load(std::slice::from_mut(&mut task), 99);
+            shared.tasks.lock().unwrap().push(task);
+            if condition == "busy" {
+                let mut busy = task_at("existing-work", "pending", 100);
+                busy.target = "sess-3".into();
+                shared.tasks.lock().unwrap().push(busy);
+            }
+            if condition == "stopped" {
+                shared.set_halted(true);
+            }
+            shared
+                .reassign_task("sess-1", "recover-review", None, Some("sess-3"))
+                .unwrap();
+            let snapshot = shared.tasks_snapshot();
+            let review = snapshot.iter().find(|t| t.id == "recover-review").unwrap();
+            assert!(review.recovery_reason.is_empty());
+            if condition == "free" {
+                assert!(review.notice_delivered);
+                assert!(String::from_utf8_lossy(&pane.bytes.lock().unwrap())
+                    .contains("Review task recover-review"));
+            } else {
+                assert!(!review.notice_delivered);
+                assert!(pane.bytes.lock().unwrap().is_empty());
+                if condition == "busy" {
+                    shared.cancel_tasks(&["existing-work".into()], "fixture completes");
+                } else {
+                    shared.set_halted(false);
+                }
+                shared.drain_pane("sess-3");
+                assert!(
+                    shared
+                        .tasks_snapshot()
+                        .iter()
+                        .find(|t| t.id == "recover-review")
+                        .unwrap()
+                        .notice_delivered
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_on_an_interrupted_review_returns_reassignment_guidance() {
+        let (shared, _dir) = shared_for_test();
+        let mut task = task_at("review", "in_review", 10);
+        task.reviewer = "sess-3".into();
+        task.result = "retained submission".into();
+        super::recover_pane_tasks_on_load(std::slice::from_mut(&mut task), 99);
+        shared.tasks.lock().unwrap().push(task);
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-1".into());
+        let response = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "review".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(response.contains("assignment interrupted"), "{response}");
+        assert!(
+            response.contains("explicit reassignment required"),
+            "{response}"
+        );
+        assert!(!response.contains("agents are still working"));
+        assert_eq!(shared.tasks_snapshot()[0].result, "retained submission");
+    }
+
+    #[tokio::test]
+    async fn waiting_on_an_unavailable_reviewer_returns_reassignment_guidance() {
+        let (shared, _dir) = shared_for_test();
+        let mut task = task_at("review", "in_review", 10);
+        task.reviewer = "sess-3".into();
+        task.reviewer_gone = true;
+        task.result = "submitted work".into();
+        assert!(task.recovery_reason.is_empty());
+        shared.tasks.lock().unwrap().push(task);
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-1".into());
+        let response = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "review".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(
+            response.contains("reviewer sess-3 unavailable; reassign review"),
+            "{response}"
+        );
+        let snapshot = shared.tasks_snapshot();
+        assert_eq!(snapshot[0].status, "in_review");
+        assert_eq!(snapshot[0].result, "submitted work");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_snapshot_journals_aging_once_and_observes_only_open_tasks() {
+        let (shared, dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let old = Shared::now_ms() - TASK_OVERDUE_MS - 1;
+        shared.tasks.lock().unwrap().extend([
+            task_at("aged", "pending", old),
+            task_at("queued", STATUS_QUEUED, old),
+            task_at("finished", "done", old),
+        ]);
+        let snapshot = shared.observed_tasks_snapshot();
+        assert_eq!(snapshot[0].status, "overdue");
+        let journaled = load_brain(dir.path()).tasks;
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].id, "aged");
+        assert_eq!(journaled[0].status, "overdue");
+        let path = dir.path().join("brain.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+        shared.observed_tasks_snapshot();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        let observations = shared.task_activity_snapshot(&snapshot);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].task_id, "aged");
+        assert_eq!(observations[0].state, "overdue");
+        assert_eq!(observations[1].task_id, "queued");
+        assert_eq!(observations[1].state, "queued");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn roster_attributes_interrupted_review_observations_only_to_the_reviewer() {
+        let (shared, _dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let _reviewer = crate::tests::RecordingPane::new(&shared.engine, "sess-3", "claude");
+        let mut task = task_at("review", "in_review", 10);
+        task.reviewer = "sess-3".into();
+        task.recovery_reason = "App restarted".into();
+        let mut another = task.clone();
+        another.id = "another-review".into();
+        shared.tasks.lock().unwrap().extend([task, another]);
+        let lines = shared.roster_lines();
+        assert_eq!(lines.len(), 2);
+        let reviewer = lines
+            .iter()
+            .find(|line| line.starts_with("- sess-3 "))
+            .unwrap();
+        let worker = lines
+            .iter()
+            .find(|line| line.starts_with("- sess-2 "))
+            .unwrap();
+        assert!(
+            reviewer
+                .contains("task review: assignment interrupted; explicit reassignment required"),
+            "{reviewer}"
+        );
+        assert!(
+            reviewer.contains(
+                "task another-review: assignment interrupted; explicit reassignment required"
+            ),
+            "{reviewer}"
+        );
+        assert!(!worker.contains("task review"), "{worker}");
+        assert!(!worker.contains("task another-review"), "{worker}");
+        shared.tasks.lock().unwrap().clear();
+        assert!(shared
+            .roster_lines()
+            .iter()
+            .all(|line| !line.contains("assignment interrupted")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn quiet_wait_attention_is_scoped_to_requested_tasks_and_preserves_work() {
+        let (shared, _dir) = shared_for_test();
+        let _worker = crate::tests::RecordingPane::new(&shared.engine, "sess-2", "codex");
+        let quiet_ms = crate::fleet::QUIET_WARNING_MS + 1000;
+        shared
+            .engine
+            .test_output_ages
+            .lock()
+            .unwrap()
+            .insert("sess-2".into(), quiet_ms);
+        shared.pane_contact.lock().unwrap().insert(
+            "sess-2".into(),
+            std::time::Instant::now() - std::time::Duration::from_millis(quiet_ms),
+        );
+        let old = Shared::now_ms() - quiet_ms;
+        shared.tasks.lock().unwrap().extend([
+            task_at("quiet", "pending", old),
+            task_at("finished", "done", old),
+        ]);
+        let handler = BrainHandler::bound_to(shared.clone(), "sess-1".into());
+        let response = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "quiet".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(response.starts_with("Attention:"), "{response}");
+        assert!(
+            response.contains("task quiet on sess-2: no observed activity"),
+            "{response}"
+        );
+        assert_eq!(shared.tasks_snapshot()[0].status, "pending");
+        let unrelated = handler
+            .wait_for_tasks(Parameters(super::WaitArgs {
+                task_ids: "finished".into(),
+                timeout_seconds: 1,
+            }))
+            .await;
+        assert!(unrelated.contains("1 task(s) finished"), "{unrelated}");
+        assert!(!unrelated.contains("Attention:"), "{unrelated}");
+        shared.note_pane_contact("sess-2");
+        assert_eq!(
+            shared.task_activity_snapshot(&shared.tasks_snapshot())[0].state,
+            "pending"
+        );
     }
 
     // ---- review_request_notice / rework_notice: delivered message shape ----
