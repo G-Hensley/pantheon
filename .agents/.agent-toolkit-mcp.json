@@ -57,7 +57,7 @@
       "host": "codex",
       "scope": "project",
       "server": "agent-memory-toolsmith",
-      "target": "/home/gavin/Projects/applications/pantheon/.codex/config.toml"
+      "target": "/home/gavin/Projects/orion/pantheon/.codex/config.toml"
     },
     "codex|project|C:/Users/Gavin Hensley/Projects/applications/pantheon/.codex/config.toml|context7": {
       "entry": {
