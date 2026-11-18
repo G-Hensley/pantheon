@@ -1,4 +1,6 @@
 mod fleet;
+#[cfg(all(target_os = "linux", feature = "herdr-experiment"))]
+mod herdr_experiment;
 // Pantheon — multi-session PTY engine.
 //
 // Each live agent runs on its own pseudo-terminal (ConPTY). Sessions are keyed
@@ -2292,6 +2294,16 @@ fn human_dispatch(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(all(not(target_os = "linux"), feature = "herdr-experiment"))]
+    if std::env::var_os("PANTHEON_HERDR_ROOT").is_some() {
+        eprintln!("The isolated Herdr experiment currently supports Linux only");
+        return;
+    }
+    #[cfg(all(target_os = "linux", feature = "herdr-experiment"))]
+    if std::env::var_os("PANTHEON_HERDR_ROOT").is_some() {
+        herdr_experiment::run();
+        return;
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

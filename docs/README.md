@@ -15,8 +15,9 @@ something from this file has found a defect in this file.
 | [`dispatch-composer-evidence.md`](dispatch-composer-evidence.md) | Measured evidence for the dispatch prompt limits, kept beside the design it justifies. |
 | [`github-issues.md`](github-issues.md) | The issue workflow and the tracker cutover's activation checkpoint. |
 | [`github-tracking-migration.md`](github-tracking-migration.md) | Provenance: every reviewed source identity mapped to its owning issue or historical disposition. Not a second tracker. |
+| [`reference/`](reference/README.md) | Technical reference and measured experiments, including the Herdr terminal-runtime investigation. |
 
-`architecture/`, `reference/`, `security/` and `diagrams/` are created when there is
+`architecture/`, `security/` and `diagrams/` are created when there is
 something to put in them, and each gets a row here when it appears. The layout and its rules are the
 Repository Documentation Standard in `G-Hensley/projects` at `docs/templates/repo-docs-template/`.
 

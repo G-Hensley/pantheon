@@ -1,0 +1,36 @@
+{
+  "schema_version": "pantheon.daedalus-view.v0-proposal",
+  "synthetic": true,
+  "source": "fixture-only, not an existing Daedalus API",
+  "observed_at": "2026-11-18T15:00:00Z",
+  "jobs": [
+    {
+      "job_id": "fixture-review-1",
+      "state": "running",
+      "attempt": 2,
+      "route": {"provider": "fixture-provider", "model": "fixture-model", "reasoning_effort": null},
+      "failure_reason": null,
+      "human_decision": null,
+      "review_findings": [],
+      "verification": null,
+      "patch_ref": null,
+      "pr_url": null,
+      "usage": {"input_tokens": null, "output_tokens": null},
+      "herdr_terminal": null
+    },
+    {
+      "job_id": "fixture-review-2",
+      "state": "failed",
+      "attempt": 1,
+      "route": null,
+      "failure_reason": "Synthetic isolated-runner timeout",
+      "human_decision": {"reason": "Synthetic operator review requested", "derived": true},
+      "review_findings": [],
+      "verification": {"status": "unavailable", "reason": "Attempt did not finish"},
+      "patch_ref": null,
+      "pr_url": null,
+      "usage": {"input_tokens": null, "output_tokens": null},
+      "herdr_terminal": null
+    }
+  ]
+}

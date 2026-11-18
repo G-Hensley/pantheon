@@ -1,0 +1,9 @@
+{
+  "shell_pid": 2381873,
+  "shell_created_ms": 1795033451941,
+  "codex_pid": 2382249,
+  "codex_created_ms": 1795033458435,
+  "desktop_restart_identity": "passed",
+  "input": "synthetic DOM paste and Enter",
+  "agent_execution": "unauthenticated TUI only"
+}

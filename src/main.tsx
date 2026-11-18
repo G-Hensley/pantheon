@@ -1,5 +1,6 @@
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { HerdrExperiment } from "./HerdrExperiment";
 import { AppearanceProvider, applyAppearance, loadAppearance } from "./lib/appearance";
 
 // Apply the saved theme before first paint so there's no flash of the default.
@@ -9,6 +10,6 @@ applyAppearance(loadAppearance());
 // each xterm Terminal twice on mount, racing the FitAddon.
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <AppearanceProvider>
-    <App />
+    {import.meta.env.VITE_HERDR_EXPERIMENT === "1" ? <HerdrExperiment /> : <App />}
   </AppearanceProvider>,
 );
