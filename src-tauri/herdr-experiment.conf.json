@@ -1,0 +1,7 @@
+{
+  "productName": "Pantheon Herdr Experiment",
+  "identifier": "com.gavinhensley.pantheon.herdr-experiment",
+  "build": { "beforeBuildCommand": "VITE_HERDR_EXPERIMENT=1 pnpm build", "beforeDevCommand": "VITE_HERDR_EXPERIMENT=1 pnpm dev" },
+  "app": { "windows": [{ "label": "main", "title": "Pantheon | Herdr experiment", "width": 1100, "height": 800 }] },
+  "bundle": { "active": false }
+}
